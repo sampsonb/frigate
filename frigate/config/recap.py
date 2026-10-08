@@ -160,9 +160,10 @@ class RecapConfig(FrigateBaseModel):
         default=True,
         title="Replace an older recap of the same kind when a new one is ready.",
         description=(
-            "On-demand recaps group by window length, such as last 6 hours. "
-            "Nightly and backfill recaps group by the calendar day in "
-            "ui.timezone. Running, failed, and archive copies are kept."
+            "Last-N-hours buttons group by that length. An explicit range "
+            "that is one local midnight-to-midnight day groups with the "
+            "nightly recap for that date. Any other explicit range is kept "
+            "on its own. Running, failed, and archive copies are kept."
         ),
     )
     output_fps: int = Field(

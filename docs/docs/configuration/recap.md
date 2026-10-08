@@ -34,7 +34,7 @@ Useful knobs:
 | `max_labels` | 8 | Most labels on screen at once. |
 | `fade_seconds` | 0.35 | Fade for the ghost, the leader line, and the label. |
 | `retain_days` | 14 | Delete local recaps after this many days. `0` keeps them. |
-| `replace_superseded` | true | When a recap is Ready, delete older completed recaps of the same camera and kind. On-demand kinds are the window length (another Last 6 hours). Nightly and backfill kinds are the calendar day in `ui.timezone`. Running, failed, and archive copies are kept. |
+| `replace_superseded` | true | When a recap is Ready, delete older completed recaps of the same camera and kind. Last-N-hours buttons group by that length. An explicit range that is one local midnight-to-midnight day groups with the nightly recap for that date (`day:<date>`, including older `backfill-day:<date>` copies). Any other explicit range is kept on its own and is not treated as last-N hours. Running, failed, and archive copies are kept. |
 | `min_show_seconds` | 2.5 | Shortest time a ghost stays readable. |
 | `output_fps` | 12 | Synopsis frame rate. |
 | `max_width` | 1280 | Frames are scaled down to this. |

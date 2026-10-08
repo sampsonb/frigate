@@ -101,8 +101,14 @@ class RecapManager:
         before: float,
         *,
         reason: str = "manual",
+        explicit_range: bool = False,
     ) -> dict[str, Any]:
-        """Queue a recap. Raises ValueError when the camera or range is unusable."""
+        """Queue a recap. Raises ValueError when the camera or range is unusable.
+
+        ``explicit_range`` is set when the caller passed after and before,
+        rather than a last-N-hours button. Those windows are not grouped
+        as last-Nh.
+        """
         camera_config = self.config.cameras.get(camera)
         if camera_config is None:
             raise ValueError(f"{camera} is not a camera")
@@ -130,7 +136,14 @@ class RecapManager:
             "after": after,
             "before": before,
             "reason": reason,
-            "kind": recap_kind(reason, after, before, resolve_zone(self.config)),
+            "kind": recap_kind(
+                reason,
+                after,
+                before,
+                resolve_zone(self.config),
+                explicit=explicit_range,
+            ),
+            "explicit_range": explicit_range,
             "tracks": [],
             "event_count": 0,
         }
@@ -332,6 +345,7 @@ class RecapJob(threading.Thread):
                 current["before"] if current.get("before") is not None else self.before
             ),
             resolve_zone(config),
+            explicit=bool(current.get("explicit_range")),
         )
         write_manifest(self.directory, current)
         logger.info(

@@ -1985,7 +1985,10 @@ paths:
       summary: Start a recap
       description: >-
         Queues a synopsis. Pass hours (1, 6, 12, 24) or after and before
-        as epoch seconds. One recap runs at a time.
+        as epoch seconds. An explicit after and before that is one local
+        midnight-to-midnight day is the same kind as that day's nightly
+        recap. Any other explicit range is its own kind and is not grouped
+        as last-N hours. One recap runs at a time.
       operationId: recap_start_recap__camera_name__start_post
       parameters:
         - name: camera_name

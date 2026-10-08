@@ -249,7 +249,10 @@ async def recap_event_snapshot(request: Request, event_id: str):
     summary="Start a recap",
     description=(
         "Queues a synopsis for the camera. Pass hours (1, 6, 12, 24) or an "
-        "after/before epoch range. One recap runs at a time. Others wait."
+        "after/before epoch range. An explicit after and before that is one "
+        "local midnight-to-midnight day uses the same kind as that day's "
+        "nightly recap. Any other explicit range is its own kind and is not "
+        "grouped as last-N hours. One recap runs at a time. Others wait."
     ),
 )
 def recap_start(request: Request, camera_name: str, body: RecapStartBody):
@@ -266,8 +269,17 @@ def recap_start(request: Request, camera_name: str, body: RecapStartBody):
             status_code=400,
         )
     after, before = window
+    # hours becomes a last-N window. A caller-supplied after and before
+    # stays an explicit range even when the span is 1, 6, 12, or 24 hours.
+    explicit_range = body.after is not None and body.before is not None
     try:
-        manifest = manager.start(camera_name, after, before, reason="manual")
+        manifest = manager.start(
+            camera_name,
+            after,
+            before,
+            reason="manual",
+            explicit_range=explicit_range,
+        )
     except ValueError as err:
         return JSONResponse(
             content={"success": False, "message": str(err)},

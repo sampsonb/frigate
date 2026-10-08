@@ -827,8 +827,9 @@ recap:
   # Optional: Days to keep generated recaps. 0 keeps them until deleted (default: shown below)
   retain_days: 14
   # Optional: Delete older completed recaps of the same camera and kind once
-  # a new one is Ready (default: shown below). On-demand kinds are the window
-  # length. Nightly and backfill kinds are the calendar day in ui.timezone.
+  # a new one is Ready (default: shown below). Last-N-hours buttons group by
+  # that length. An explicit midnight-to-midnight day groups with the nightly
+  # recap for that date. Any other explicit range is its own kind.
   # Running, failed, and archive copies are kept.
   replace_superseded: True
   # Optional: External archive. Leave unset to disable.

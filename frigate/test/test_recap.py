@@ -1468,6 +1468,195 @@ class TestSupersededRecaps(unittest.TestCase):
                 )
                 self.assertIn("day:2026-10-07", "\n".join(logs.output))
 
+    def test_explicit_range_is_never_a_last_n_kind(self):
+        zone = ZoneInfo("America/New_York")
+        day_start = datetime(2026, 10, 7, 0, 0, tzinfo=zone).timestamp()
+        day_end = datetime(2026, 10, 8, 0, 0, tzinfo=zone).timestamp()
+        self.assertEqual(
+            recap_kind("manual", day_start, day_end, zone, explicit=True),
+            "day:2026-10-07",
+        )
+        self.assertEqual(recap_kind("manual", day_start, day_end, zone), "last-24h")
+        spring_start = datetime(2026, 3, 8, 0, 0, tzinfo=zone).timestamp()
+        spring_end = datetime(2026, 3, 9, 0, 0, tzinfo=zone).timestamp()
+        self.assertEqual(spring_end - spring_start, 23 * 3600)
+        self.assertEqual(
+            recap_kind("manual", spring_start, spring_end, zone, explicit=True),
+            "day:2026-03-08",
+        )
+        fall_start = datetime(2026, 11, 1, 0, 0, tzinfo=zone).timestamp()
+        fall_end = datetime(2026, 11, 2, 0, 0, tzinfo=zone).timestamp()
+        self.assertEqual(fall_end - fall_start, 25 * 3600)
+        self.assertEqual(
+            recap_kind("manual", fall_start, fall_end, zone, explicit=True),
+            "day:2026-11-01",
+        )
+        before = datetime(2026, 10, 8, 3, 0, tzinfo=timezone.utc).timestamp()
+        after = before - 24 * 3600
+        shifted = recap_kind("manual", after, before, zone, explicit=True)
+        self.assertTrue(shifted.startswith("range:"))
+        self.assertNotIn("last-", shifted)
+        self.assertEqual(
+            recap_kind("manual", 0, 6 * 3600, zone, explicit=True),
+            "range:0-21600",
+        )
+        two_days = recap_kind(
+            "manual",
+            day_start,
+            datetime(2026, 10, 9, 0, 0, tzinfo=zone).timestamp(),
+            zone,
+            explicit=True,
+        )
+        self.assertTrue(two_days.startswith("range:"))
+        utc_start = datetime(2026, 10, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+        utc_end = datetime(2026, 10, 9, 0, 0, tzinfo=timezone.utc).timestamp()
+        self.assertTrue(
+            recap_kind("manual", utc_start, utc_end, zone, explicit=True).startswith(
+                "range:"
+            )
+        )
+        self.assertEqual(
+            recap_kind("manual", utc_start, utc_end, timezone.utc, explicit=True),
+            "day:2026-10-08",
+        )
+        self.assertTrue(
+            recap_kind(
+                "manual", day_start + 1, day_end, zone, explicit=True
+            ).startswith("range:")
+        )
+
+    def test_backfill_day_groups_with_the_calendar_day(self):
+        zone = ZoneInfo("America/New_York")
+        start = datetime(2026, 10, 7, 0, 0, tzinfo=zone).timestamp()
+        end = datetime(2026, 10, 8, 0, 0, tzinfo=zone).timestamp()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(
+                    root,
+                    "front",
+                    "front_day",
+                    created=40,
+                    reason="manual",
+                    explicit_range=True,
+                    after=start,
+                    before=end,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_hand",
+                    created=10,
+                    kind="backfill-day:2026-10-07",
+                    after=start,
+                    before=end,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_other_day",
+                    created=9,
+                    kind="backfill-day:2026-10-06",
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_last",
+                    created=8,
+                    kind="last-24h",
+                    after=end - 24 * 3600,
+                    before=end,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_partial",
+                    created=7,
+                    kind="range:1-21601",
+                    after=1,
+                    before=21601,
+                    explicit_range=True,
+                )
+                with self.assertLogs("frigate.recap.storage", level="INFO") as logs:
+                    removed = remove_superseded("front", "front_day", zone)
+                self.assertEqual(removed, ["front_hand"])
+                self.assertFalse((root / "front" / "front_hand").exists())
+                for recap_id in (
+                    "front_day",
+                    "front_other_day",
+                    "front_last",
+                    "front_partial",
+                ):
+                    self.assertTrue(
+                        (root / "front" / recap_id / "manifest.json").is_file(),
+                        recap_id,
+                    )
+                self.assertIn(
+                    "Removed superseded recap front_hand for front (day:2026-10-07)",
+                    "\n".join(logs.output),
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_night",
+                    created=60,
+                    reason="schedule",
+                    after=end - 24 * 3600,
+                    before=datetime(2026, 10, 7, 23, 0, tzinfo=zone).timestamp(),
+                )
+                removed = remove_superseded("front", "front_night", zone)
+                self.assertEqual(removed, ["front_day"])
+                self.assertTrue(
+                    (root / "front" / "front_last" / "manifest.json").is_file()
+                )
+
+    def test_explicit_range_does_not_replace_last_n_hours(self):
+        zone = ZoneInfo("UTC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(
+                    root,
+                    "front",
+                    "front_range",
+                    created=20,
+                    reason="manual",
+                    explicit_range=True,
+                    after=100,
+                    before=100 + 6 * 3600,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_last",
+                    created=5,
+                    kind="last-6h",
+                    after=0,
+                    before=6 * 3600,
+                )
+                self.assertEqual(
+                    remove_superseded("front", "front_range", zone),
+                    [],
+                )
+                self.assertTrue(
+                    (root / "front" / "front_last" / "manifest.json").is_file()
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_again",
+                    created=30,
+                    kind="range:100-21700",
+                    after=100,
+                    before=100 + 6 * 3600,
+                    explicit_range=True,
+                )
+                removed = remove_superseded("front", "front_again", zone)
+                self.assertEqual(removed, ["front_range"])
+                self.assertTrue(
+                    (root / "front" / "front_last" / "manifest.json").is_file()
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

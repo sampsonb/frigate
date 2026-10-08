@@ -12,7 +12,7 @@ import logging
 import os
 import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -171,6 +171,7 @@ def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
         "height": manifest.get("height"),
         "reason": manifest.get("reason") or "",
         "kind": manifest.get("kind") or "",
+        "explicit_range": bool(manifest.get("explicit_range")),
         "source": manifest.get("source") or "",
         "categories": summary_categories(manifest.get("categories")),
     }
@@ -230,13 +231,61 @@ def purge_expired(retain_days_for: dict[str, int], now: float | None = None) -> 
     return removed
 
 
-def recap_kind(reason: str, after: float, before: float, zone) -> str:
+def _epoch_token(value: float) -> str:
+    """Stable text for a range kind so the same window always matches."""
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return format(number, "f").rstrip("0").rstrip(".")
+
+
+def _at_local_midnight(moment: datetime) -> bool:
+    return (
+        moment.hour == 0
+        and moment.minute == 0
+        and moment.second == 0
+        and moment.microsecond == 0
+    )
+
+
+def calendar_day(after: float, before: float, zone) -> str | None:
+    """Local date when the window is exactly one midnight-to-midnight day.
+
+    The date is the day that starts at ``after``. A 23-hour or 25-hour
+    civil day still counts, because daylight saving changes the length
+    and not the midnights. Any other window is not a calendar day.
+    """
+    start = datetime.fromtimestamp(float(after), tz=zone)
+    end = datetime.fromtimestamp(float(before), tz=zone)
+    if not _at_local_midnight(start) or not _at_local_midnight(end):
+        return None
+    if end.date() != start.date() + timedelta(days=1):
+        return None
+    return start.date().isoformat()
+
+
+def recap_kind(
+    reason: str,
+    after: float,
+    before: float,
+    zone,
+    *,
+    explicit: bool = False,
+) -> str:
     """Group key for duplicate recaps of one camera.
 
-    On-demand recaps group by window length (``last-6h``, ``last-90m``).
-    Nightly and backfill recaps group by the calendar day of the window
-    end in the UI timezone, not by how many hours the window covers.
+    Last-N-hours buttons group by window length (``last-6h``, ``last-90m``).
+    An explicit after/before range never uses that grouping. One local
+    midnight-to-midnight day is ``day:<date>``, the same kind as the
+    nightly recap for that date. Any other explicit range is
+    ``range:<after>-<before>``. Nightly jobs group by the calendar day
+    of the window end in the UI timezone.
     """
+    if explicit:
+        day = calendar_day(after, before, zone)
+        if day:
+            return f"day:{day}"
+        return f"range:{_epoch_token(after)}-{_epoch_token(before)}"
     if reason in {"schedule", "backfill"}:
         end = datetime.fromtimestamp(float(before), tz=zone)
         return f"day:{end.date().isoformat()}"
@@ -248,16 +297,31 @@ def recap_kind(reason: str, after: float, before: float, zone) -> str:
     return f"last-{minutes}m"
 
 
+def group_kind(kind: str) -> str:
+    """Kind used when deciding which completed recap replaces another.
+
+    Live backfills were labeled ``backfill-day:<date>``. That is the
+    same group as ``day:<date>``.
+    """
+    prefix = "backfill-day:"
+    if kind.startswith(prefix):
+        return f"day:{kind[len(prefix) :]}"
+    return kind
+
+
 def kind_of(manifest: dict[str, Any], zone) -> str:
     """Stored kind, or the kind implied by reason and the window."""
     stored = str(manifest.get("kind") or "")
     if stored:
-        return stored
-    return recap_kind(
-        str(manifest.get("reason") or ""),
-        float(manifest.get("after") or 0),
-        float(manifest.get("before") or 0),
-        zone,
+        return group_kind(stored)
+    return group_kind(
+        recap_kind(
+            str(manifest.get("reason") or ""),
+            float(manifest.get("after") or 0),
+            float(manifest.get("before") or 0),
+            zone,
+            explicit=bool(manifest.get("explicit_range")),
+        )
     )
 
 
