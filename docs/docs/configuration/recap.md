@@ -25,7 +25,7 @@ Useful knobs:
 
 | Field | Default | Purpose |
 | --- | --- | --- |
-| `schedule` | none | Daily `HH:MM` in the UI timezone, or the container timezone when that is unset. Frigate has to be running within about 90 seconds of this time. |
+| `schedule` | none | Daily `HH:MM` in `ui.timezone`. The container clock is often UTC, and this time is not UTC unless that setting is unset. Frigate has to be running within about 90 seconds of this time. |
 | `window_hours` | 24 | How far back a scheduled recap looks. |
 | `max_window_hours` | 48 | Longest on-demand range. |
 | `labels` | people, vehicles, animals, delivery names | Tracked labels to consider. |
@@ -104,11 +104,47 @@ An index row needs the event id, camera, label, start, end, and archive-relative
 
 `event_id`, `start_time`, `end_time`, `files`, and `clip` are accepted names for the same fields. CSV uses a header row, with several paths separated by `|`.
 
-When the index does not list files, recap looks up the event in a dated database and then the UTC recording tree. One file is served directly. Several files are joined the same way Frigate builds an event clip. If only the snapshot is left (recordings aged out, the event did not), the player shows the snapshot.
+The nightly index at `index/YYYY-MM-DD.json` is a list of rows. Each row has `id`, `camera`, `label`, `start`, `end` (epoch seconds), `paths` (for example `events/<review id>.mp4`), and `snapshot`. Frigate-built recaps copied to `recap/` use Frigate's own `<camera>/<id>/manifest.json` layout.
+
+When the index does not list files, recap looks up the event in a dated database and then the UTC recording tree. One file is served directly. Several files are joined the same way Frigate builds an event clip. Every file is checked again immediately before it is opened. If one was deleted after the index was read, the player gets "This clip is no longer archived" instead of a server error. If only the snapshot is left, the player shows the snapshot.
 
 Archived recaps show in the Recap list with an Archive badge. They are not deleted from the UI. The local `retain_days` cleanup does not touch the archive.
 
 If you only set `url`, clip fallback reads `index/YYYY-MM-DD.json` from that host, and the list reads `recap/index.json`. Playing a recording that spans multiple files needs `path`, because Frigate has to join them.
+
+## Install on an existing 0.17.2 container
+
+Build the overlay on the host. The repository is public, so this does not need a GitHub login. It starts from stock `ghcr.io/blakeblackshear/frigate:0.17.2` (pinned by digest) and does not compile Frigate. On a Beelink that already has that image, expect about 15 to 25 minutes. Most of that is `npm install` and the web UI production build. The first run also downloads the `node:20` image used only for that build.
+
+```bash
+docker build -t frigate:recap-0.17.2 -f docker/recap/Dockerfile https://github.com/sampsonb/frigate.git#cursor/recap-3a01
+```
+
+In `docker-compose.yml`, point the service at the local tag. Leave the config volume, media volume, and `/dev/dri` device (OpenVINO on `/dev/dri/renderD128`) as they are. Do not `docker compose pull` this tag. It is not in a registry.
+
+```yaml
+image: frigate:recap-0.17.2
+```
+
+```bash
+docker compose up -d
+```
+
+Add `recap:` to `config.yml`, including `ui.timezone`, and restart once more. Until `recap.enabled` is true, behavior matches stock 0.17.2.
+
+Roll back by restoring the stock image and recreating the container:
+
+```yaml
+image: ghcr.io/blakeblackshear/frigate:0.17.2
+```
+
+```bash
+docker compose up -d
+```
+
+Recap files under `/media/frigate/recap` are left in place and are ignored by the stock image.
+
+A GitHub Actions workflow on this fork can also push `ghcr.io/sampsonb/frigate:recap-0.17.2`. A new GHCR package is private by default, so `docker pull` of that tag fails until the package is made public. The `docker build` command above does not depend on that.
 
 ## Performance
 
@@ -122,6 +158,6 @@ Semantic search, when enabled, only looks at the nearest thumbnails Frigate alre
 - A parked car is shown only when Frigate tracked that stationary vehicle. A car the detector never saw cannot be labeled.
 - Cutouts are weaker than a segmentation model on a cluttered background. A connected moving object is included. A shadow or a full-frame lighting change is not.
 - The schedule is a single daily time, not a cron expression. If Frigate is down at that minute, that day's recap is skipped.
-- Times use `ui.timezone` when it is set, otherwise the container's local time.
+- Label times and the nightly schedule use `ui.timezone`. The container clock is often UTC. If `ui.timezone` is unset, both fall back to the container's local time.
 - At most `max_events` events are processed (default 400), oldest first after parked vehicles are set aside.
 - An archive URL alone cannot join multiple recording files. Mount `archive.path` for that.

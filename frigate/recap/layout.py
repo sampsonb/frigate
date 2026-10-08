@@ -64,10 +64,31 @@ def format_clock(timestamp: float, zone: tzinfo, *, seconds: bool) -> str:
     """Local clock time. Seconds are included only when requested.
 
     ``5:50 PM`` or ``5:50:12 PM``. The hour has no leading zero.
+    ``zone`` is ``ui.timezone``. Do not pass the container zone when that
+    setting is set: the container clock is often UTC.
     """
     moment = datetime.fromtimestamp(timestamp, zone)
     pattern = "%-I:%M:%S %p" if seconds else "%-I:%M %p"
     return moment.strftime(pattern)
+
+
+def schedule_due(now: datetime, schedule: str, *, window_seconds: float = 90) -> bool:
+    """Whether ``HH:MM`` should fire for ``now``.
+
+    ``now`` has to already be in ``ui.timezone``. ``02:00`` means 2 AM in
+    that zone, not 02:00 UTC, even when the container clock is UTC.
+    The job is due from that minute through ``window_seconds``.
+    """
+    hour_text, minute_text = schedule.split(":")
+    scheduled = now.replace(
+        hour=int(hour_text),
+        minute=int(minute_text),
+        second=0,
+        microsecond=0,
+    )
+    if now < scheduled:
+        return False
+    return (now - scheduled).total_seconds() <= window_seconds
 
 
 def assign_label_texts(

@@ -41,6 +41,7 @@ from frigate.recap.generate import (
     plate_timestamps,
     sample_times,
 )
+from frigate.recap.layout import schedule_due
 from frigate.recap.storage import (
     ensure_tree,
     purge_expired,
@@ -53,7 +54,12 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_zone(config: FrigateConfig):
-    """UI timezone when one is set, otherwise the container's local zone."""
+    """Timezone for label clocks and the nightly ``HH:MM`` schedule.
+
+    This is ``ui.timezone``. The container clock is often UTC, so a
+    schedule of 02:00 is 02:00 in the UI zone, not 02:00 UTC. An empty
+    or unknown name falls back to the container's local zone.
+    """
     name = config.ui.timezone
     if name:
         try:
@@ -413,9 +419,8 @@ class RecapMaintainer(threading.Thread):
             settings = camera.recap
             if not settings.enabled or not settings.schedule or not camera.enabled:
                 continue
-            hour, minute = (int(part) for part in settings.schedule.split(":"))
-            scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if now < scheduled or (now - scheduled).total_seconds() > 90:
+            # settings.schedule is wall time in ui.timezone (``now``).
+            if not schedule_due(now, settings.schedule):
                 continue
             key = f"{name}:{now.date().isoformat()}:{settings.schedule}"
             if state.get(key):

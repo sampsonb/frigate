@@ -25,10 +25,12 @@ from frigate.api.defs.tags import Tags
 from frigate.const import RECAP_DIR
 from frigate.models import Event, Recordings
 from frigate.recap.archive import (
+    CLIP_GONE,
     ArchivePlayback,
     archive_locations,
     archive_recap_dirs,
     lookup_playback,
+    present_local_segments,
     remote_manifest,
     remote_recap_summaries,
 )
@@ -154,6 +156,9 @@ async def recap_event_source(request: Request, event_id: str):
             content={"success": False, "message": "This event is no longer available"},
             status_code=404,
         )
+    if playback.segments and present_local_segments(playback.segments) is None:
+        playback.segments = []
+        playback.message = CLIP_GONE
     if playback.camera and playback.camera != camera:
         await require_camera_access(playback.camera, request=request)
     return JSONResponse(content=_playback_body(event_id, playback))
@@ -170,18 +175,25 @@ async def recap_event_clip(request: Request, event_id: str):
         return denied
     assert isinstance(playback, ArchivePlayback)
     if not playback.segments:
-        return JSONResponse(
-            content={
-                "success": False,
-                "message": playback.message or "Recording is not in the archive",
-            },
-            status_code=404,
-        )
+        return _gone(playback.message)
+    # Check again immediately before opening. A file can be removed after
+    # the index lookup, and a missing segment must not become a 500.
+    local = present_local_segments(playback.segments)
+    if local is None:
+        return _gone()
     remote = [segment.url for segment in playback.segments if segment.url]
-    local = [segment for segment in playback.segments if segment.path is not None]
     if len(local) == 1:
-        return FileResponse(local[0].path, media_type="video/mp4", filename="clip.mp4")
+        path = local[0].path
+        assert path is not None
+        if not path.is_file():
+            return _gone()
+        try:
+            return FileResponse(path, media_type="video/mp4", filename="clip.mp4")
+        except FileNotFoundError:
+            return _gone()
     if len(local) > 1:
+        if any(segment.path is None or not segment.path.is_file() for segment in local):
+            return _gone()
         return _concat_response(request, local, playback.start, playback.end)
     if len(remote) == 1:
         return RedirectResponse(remote[0])
@@ -204,11 +216,16 @@ async def recap_event_snapshot(request: Request, event_id: str):
     if isinstance(denied, JSONResponse):
         return denied
     assert isinstance(playback, ArchivePlayback)
-    if playback.snapshot is not None and playback.snapshot.is_file():
+    if playback.snapshot is not None:
+        if not playback.snapshot.is_file():
+            return _gone()
         media_type = (
             "image/webp" if playback.snapshot.suffix == ".webp" else "image/jpeg"
         )
-        return FileResponse(playback.snapshot, media_type=media_type)
+        try:
+            return FileResponse(playback.snapshot, media_type=media_type)
+        except FileNotFoundError:
+            return _gone()
     if playback.snapshot_url:
         return RedirectResponse(playback.snapshot_url)
     return JSONResponse(
@@ -424,6 +441,14 @@ async def _playback(
     return playback, None
 
 
+def _gone(message: str | None = None) -> JSONResponse:
+    """410 when an archived clip was listed and the file is now gone."""
+    return JSONResponse(
+        content={"success": False, "message": message or CLIP_GONE},
+        status_code=410,
+    )
+
+
 def _playback_body(event_id: str, playback: ArchivePlayback) -> dict[str, Any]:
     clip: str | None = None
     if playback.segments:
@@ -479,6 +504,10 @@ def _concat_response(
     start: float | None,
     end: float | None,
 ) -> StreamingResponse | JSONResponse:
+    for segment in segments:
+        path = getattr(segment, "path", None)
+        if path is None or not path.is_file():
+            return _gone()
     config = getattr(request.app, "frigate_config", None)
     ffmpeg = "ffmpeg"
     if config is not None:

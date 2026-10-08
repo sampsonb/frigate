@@ -13,11 +13,13 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from frigate.recap.archive import (
+    CLIP_GONE,
     ArchiveLocation,
     clear_archive_cache,
     event_start_from_id,
     lookup_playback,
     parse_index_text,
+    present_local_segments,
     recordings_covering,
     rewrite_media_path,
     safe_archive_path,
@@ -29,10 +31,12 @@ from frigate.recap.layout import (
     _rects_hit,
     assign_label_texts,
     dedupe_tracks,
+    format_clock,
     is_stationary,
     link_parked_cars,
     plan_label_rects,
     repeat_for_min_show,
+    schedule_due,
     schedule_units,
 )
 from frigate.recap.storage import list_visible_recaps
@@ -519,6 +523,94 @@ class TestArchive(unittest.TestCase):
             match = [item for item in listed if item["id"] == "front_20261007_abcd"]
             self.assertEqual(len(match), 1)
             self.assertEqual(match[0]["source"], "archive")
+
+    def test_events_index_and_missing_files(self):
+        moment = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc).timestamp()
+        event_id = f"{moment}-abc123"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events = root / "events"
+            events.mkdir()
+            first = events / "review-1.mp4"
+            second = events / "review-1b.mp4"
+            first.write_bytes(b"a")
+            second.write_bytes(b"b")
+            (events / "review-1.jpg").write_bytes(b"jpg")
+            index = root / "index"
+            index.mkdir()
+            (index / "2026-10-07.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": event_id,
+                            "camera": "front",
+                            "label": "person",
+                            "start": moment,
+                            "end": moment + 20,
+                            "paths": ["events/review-1.mp4", "events/review-1b.mp4"],
+                            "snapshot": "events/review-1.jpg",
+                        }
+                    ]
+                )
+            )
+            location = ArchiveLocation(path=root, url=None)
+            playback = lookup_playback([location], event_id)
+            self.assertIsNotNone(playback)
+            assert playback is not None
+            names = [segment.path.name for segment in playback.segments if segment.path]
+            self.assertEqual(names, ["review-1.mp4", "review-1b.mp4"])
+            ready = present_local_segments(playback.segments)
+            self.assertIsNotNone(ready)
+            assert ready is not None
+            self.assertEqual(len(ready), 2)
+            second.unlink()
+            self.assertIsNone(present_local_segments(playback.segments))
+            first.unlink()
+            gone = lookup_playback([location], event_id)
+            self.assertIsNotNone(gone)
+            assert gone is not None
+            self.assertEqual(gone.segments, [])
+            self.assertEqual(gone.message, CLIP_GONE)
+            self.assertEqual(
+                rewrite_media_path("/media/frigate/events/review-1.mp4"),
+                "events/review-1.mp4",
+            )
+
+    def test_unreadable_index_does_not_raise(self):
+        moment = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc).timestamp()
+        event_id = f"{moment}-abc123"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index = root / "index"
+            index.mkdir()
+            (index / "2026-10-07.json").write_bytes(b"\xff\xfe not utf-8")
+            playback = lookup_playback([ArchiveLocation(path=root, url=None)], event_id)
+            self.assertIsNone(playback)
+            (index / "2026-10-07.json").write_text("{not json", encoding="utf-8")
+            clear_archive_cache()
+            playback = lookup_playback([ArchiveLocation(path=root, url=None)], event_id)
+            self.assertIsNone(playback)
+            rows = parse_index_text("{not json")
+            self.assertEqual(rows, [])
+
+
+class TestTimezone(unittest.TestCase):
+    def test_labels_and_schedule_use_ui_timezone_not_utc(self):
+        zone = ZoneInfo("America/New_York")
+        instant = datetime(2026, 7, 15, 6, 0, 30, tzinfo=timezone.utc)
+        local = instant.astimezone(zone)
+        self.assertEqual(local.hour, 2)
+        self.assertEqual(
+            format_clock(instant.timestamp(), zone, seconds=False), "2:00 AM"
+        )
+        self.assertEqual(
+            format_clock(instant.timestamp(), timezone.utc, seconds=False), "6:00 AM"
+        )
+        self.assertTrue(schedule_due(local, "02:00"))
+        self.assertFalse(schedule_due(instant, "02:00"))
+        later = local.replace(minute=1, second=31)
+        self.assertFalse(schedule_due(later, "02:00"))
+        self.assertTrue(schedule_due(local.replace(minute=1, second=30), "02:00"))
 
 
 if __name__ == "__main__":

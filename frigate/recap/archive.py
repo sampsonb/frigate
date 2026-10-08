@@ -2,8 +2,10 @@
 
 The owner's nightly job copies ``/media/frigate`` onto another disk and
 keeps that layout: ``recordings/YYYY-MM-DD/HH/<camera>/MM.SS.mp4`` (UTC),
-``clips/<camera>-<event id>.jpg``, and ``recap/<camera>/<id>/``. It also
-writes a per-day index and a dated copy of the Frigate database.
+``clips/<camera>-<event id>.jpg``, and ``recap/<camera>/<id>/`` for
+Frigate-built recaps. It also writes ``index/YYYY-MM-DD.json`` (rows with
+id, camera, label, start, end, ``paths`` such as ``events/<review id>.mp4``,
+and a snapshot) plus a dated copy of the Frigate database.
 
 Recap uses the archive only when ``recap.archive.path`` or
 ``recap.archive.url`` is set. Live files win when they are still present.
@@ -24,6 +26,10 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Shown when an index row exists but the file is gone, including when it
+# disappears between lookup and the moment we open it.
+CLIP_GONE = "This clip is no longer archived"
 
 # A recording file is included when it starts before the event ends and
 # its start is within this many seconds of the event. Frigate segments
@@ -184,15 +190,11 @@ def rewrite_media_path(stored: str) -> str | None:
     ``/media/frigate/recordings/2026-10-07/15/front/50.00.mp4``.
     """
     text = stored.replace("\\", "/")
-    for marker in ("/recordings/", "/clips/", "/recap/", "/snapshots/"):
+    for marker in ("/recordings/", "/clips/", "/recap/", "/snapshots/", "/events/"):
         index = text.find(marker)
         if index >= 0:
             return text[index + 1 :]
-    if (
-        text.startswith("recordings/")
-        or text.startswith("clips/")
-        or text.startswith("recap/")
-    ):
+    if text.startswith(("recordings/", "clips/", "recap/", "snapshots/", "events/")):
         return text
     return None
 
@@ -239,6 +241,28 @@ def lookup_playback(
         if hit is not None:
             return hit
     return None
+
+
+def present_local_segments(
+    segments: list[ArchiveSegment],
+) -> list[ArchiveSegment] | None:
+    """Local segments whose files still exist, checked at call time.
+
+    Returns None when any local file is missing, including a file deleted
+    after lookup. Callers should answer 410 with ``CLIP_GONE`` and must
+    not open the path. URL-only segments are omitted. An empty list means
+    there is nothing on disk to stream.
+    """
+    local = [segment for segment in segments if segment.path is not None]
+    for segment in local:
+        path = segment.path
+        try:
+            ready = path is not None and path.is_file()
+        except OSError:
+            ready = False
+        if not ready:
+            return None
+    return local
 
 
 def remote_recap_summaries(locations: list[ArchiveLocation]) -> list[dict[str, Any]]:
@@ -387,11 +411,11 @@ def _lookup_one(location: ArchiveLocation, event_id: str) -> ArchivePlayback | N
             label=label or None,
             start=start,
             end=end,
-            message="The recording has aged out of the archive",
+            message=CLIP_GONE,
         )
     message = ""
     if not segments:
-        message = "The recording has aged out of the archive. The snapshot is still available."
+        message = CLIP_GONE
     return ArchivePlayback(
         camera=camera or None,
         label=label or None,
@@ -509,9 +533,14 @@ def _cached_file(file: Path) -> list[dict[str, Any]] | None:
     if cached is not None and cached[0] == modified:
         return cached[1]
     try:
-        rows = _normalize_rows(parse_index_text(file.read_text(encoding="utf-8")))
-    except OSError:
-        return None
+        text = file.read_text(encoding="utf-8")
+        rows = _normalize_rows(parse_index_text(text))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        # Remember the failure until the file changes so a bad index
+        # does not raise, and does not get re-read on every clip.
+        logger.warning("Could not read archive index %s", file)
+        _cache[key] = (modified, [])
+        return []
     _cache[key] = (modified, rows)
     return rows
 
