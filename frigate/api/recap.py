@@ -1,8 +1,8 @@
 """Recap APIs: list, start, cancel, play, and fall back to the archive."""
 
+import asyncio
 import logging
-import subprocess as sp
-import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +11,6 @@ from fastapi.responses import (
     FileResponse,
     JSONResponse,
     RedirectResponse,
-    StreamingResponse,
 )
 from peewee import DoesNotExist
 from pydantic import BaseModel, Field
@@ -33,6 +32,11 @@ from frigate.recap.archive import (
     present_local_segments,
     remote_manifest,
     remote_recap_summaries,
+)
+from frigate.recap.clips import (
+    live_clip_urls,
+    playable_mp4_response,
+    render_faststart_mp4,
 )
 from frigate.recap.queries import live_recordings_exist
 from frigate.recap.storage import (
@@ -127,9 +131,9 @@ def recap_list(
     dependencies=[Depends(allow_any_authenticated())],
     summary="Resolve an event clip",
     description=(
-        "Tells the recap player where a time label's clip lives. Live Frigate "
-        "recordings are used while they still exist. Otherwise the configured "
-        "archive is searched by event id."
+        "Tells the recap player where a time label's clip lives. Live "
+        "recordings use the HLS VOD playlist Safari can play. Otherwise the "
+        "configured archive is searched by event id."
     ),
 )
 async def recap_event_source(request: Request, event_id: str):
@@ -141,13 +145,15 @@ async def recap_event_source(request: Request, event_id: str):
     live, camera = _live_clip(event_id)
     if camera:
         await require_camera_access(camera, request=request)
-    if live:
+    if live is not None:
+        urls = live_clip_urls(live[0], live[1], live[2], event_id)
         return JSONResponse(
             content={
                 "source": "frigate",
-                "camera": camera,
-                "clip": f"events/{event_id}/clip.mp4",
-                "snapshot": f"events/{event_id}/snapshot.jpg",
+                "camera": live[0],
+                "clip": urls["clip"],
+                "download": urls["download"],
+                "snapshot": urls["snapshot"],
                 "message": "",
             }
         )
@@ -183,19 +189,21 @@ async def recap_event_clip(request: Request, event_id: str):
     if local is None:
         return _gone()
     remote = [segment.url for segment in playback.segments if segment.url]
-    if len(local) == 1:
-        path = local[0].path
-        assert path is not None
-        if not path.is_file():
-            return _gone()
-        try:
-            return FileResponse(path, media_type="video/mp4", filename="clip.mp4")
-        except FileNotFoundError:
-            return _gone()
-    if len(local) > 1:
+    if local:
         if any(segment.path is None or not segment.path.is_file() for segment in local):
             return _gone()
-        return _concat_response(request, local, playback.start, playback.end)
+        config = getattr(request.app, "frigate_config", None)
+        ffmpeg = "ffmpeg"
+        if config is not None:
+            ffmpeg = config.ffmpeg.ffmpeg_path or ffmpeg
+        try:
+            rendered = await asyncio.to_thread(
+                render_faststart_mp4, ffmpeg, local, playback.start, playback.end
+            )
+        except (RuntimeError, FileNotFoundError, OSError):
+            logger.exception("Archived clip could not be prepared for playback")
+            return _gone()
+        return playable_mp4_response(rendered, "clip.mp4", delete_after=True)
     if len(remote) == 1:
         return RedirectResponse(remote[0])
     return JSONResponse(
@@ -353,7 +361,7 @@ async def recap_video(request: Request, recap_id: str):
     if directory is not None:
         path = directory / "video.mp4"
         if path.is_file():
-            return FileResponse(path, media_type="video/mp4", filename="recap.mp4")
+            return playable_mp4_response(path, "recap.mp4")
     if remote:
         camera = str(manifest.get("camera") or "")
         return RedirectResponse(f"{remote}/recap/{camera}/{recap_id}/video.mp4")
@@ -473,15 +481,22 @@ def _playback_body(event_id: str, playback: ArchivePlayback) -> dict[str, Any]:
     }
 
 
-def _live_clip(event_id: str) -> tuple[bool, str | None]:
-    """True when Frigate still has recordings for this event."""
+def _live_clip(
+    event_id: str,
+) -> tuple[tuple[str, float, float] | None, str | None]:
+    """Recordings still on disk, as ``(camera, start, end)``, plus the camera.
+
+    The camera is returned even when the recordings are gone so the caller
+    can enforce access before searching the archive. ``end`` is the wall
+    clock when the event is still open.
+    """
     try:
         event = Event.get(Event.id == event_id)
     except DoesNotExist:
-        return False, None
+        return None, None
     except Exception:
         logger.debug("Live event lookup failed for %s", event_id)
-        return False, None
+        return None, None
     camera = str(event.camera) if event.camera else None
     # NULL has_clip was never written. NULL end_time is still in progress.
     # Both used to look like "no clip" and skip the recordings table.
@@ -489,79 +504,8 @@ def _live_clip(event_id: str) -> tuple[bool, str | None]:
         exists = live_recordings_exist(event)
     except Exception:
         logger.debug("Live recording lookup failed for %s", event_id)
-        return False, camera
-    return bool(exists), camera
-
-
-def _concat_response(
-    request: Request,
-    segments: list[Any],
-    start: float | None,
-    end: float | None,
-) -> StreamingResponse | JSONResponse:
-    for segment in segments:
-        path = getattr(segment, "path", None)
-        if path is None or not path.is_file():
-            return _gone()
-    config = getattr(request.app, "frigate_config", None)
-    ffmpeg = "ffmpeg"
-    if config is not None:
-        ffmpeg = config.ffmpeg.ffmpeg_path or ffmpeg
-    playlist = tempfile.NamedTemporaryFile(
-        "w", suffix=".txt", delete=False, encoding="utf-8"
-    )
-    try:
-        for segment in segments:
-            playlist.write(f"file '{segment.path}'\n")
-            if (
-                start is not None
-                and segment.start is not None
-                and segment.start < start
-            ):
-                playlist.write(f"inpoint {int(start - segment.start)}\n")
-            if (
-                end is not None
-                and segment.start is not None
-                and segment.end is not None
-                and segment.end > end
-            ):
-                playlist.write(f"outpoint {max(1, int(end - segment.start))}\n")
-    finally:
-        playlist.close()
-    playlist_path = playlist.name
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-y",
-        "-protocol_whitelist",
-        "pipe,file",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        playlist_path,
-        "-c",
-        "copy",
-        "-movflags",
-        "frag_keyframe+empty_moov",
-        "-f",
-        "mp4",
-        "pipe:",
-    ]
-
-    def stream():
-        try:
-            with sp.Popen(command, stdout=sp.PIPE, stderr=sp.DEVNULL) as process:
-                assert process.stdout is not None
-                while True:
-                    chunk = process.stdout.read(8192)
-                    if not chunk:
-                        break
-                    yield chunk
-                if process.wait() not in (0, None):
-                    logger.error("Archived clip concat failed")
-        finally:
-            Path(playlist_path).unlink(missing_ok=True)
-
-    return StreamingResponse(stream(), media_type="video/mp4")
+        return None, camera
+    if not exists or not camera or event.start_time is None:
+        return None, camera
+    end = time.time() if event.end_time is None else float(event.end_time)
+    return (camera, float(event.start_time), end), camera

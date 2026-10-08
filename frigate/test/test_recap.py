@@ -1,7 +1,9 @@
 """Recap layout, time labels, parked cars, cutouts, and archive lookup."""
 
+import asyncio
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import types
@@ -15,6 +17,7 @@ import numpy as np
 from frigate.recap.archive import (
     CLIP_GONE,
     ArchiveLocation,
+    ArchiveSegment,
     clear_archive_cache,
     event_start_from_id,
     lookup_playback,
@@ -23,6 +26,11 @@ from frigate.recap.archive import (
     recordings_covering,
     rewrite_media_path,
     safe_archive_path,
+)
+from frigate.recap.clips import (
+    live_clip_urls,
+    playable_mp4_response,
+    render_faststart_mp4,
 )
 from frigate.recap.cutout import attach_motion, build_cutouts
 from frigate.recap.layout import (
@@ -1065,6 +1073,99 @@ def _insert(db, table: str, values: dict) -> None:
         f'INSERT INTO "{table}" ({names}) VALUES ({placeholders})',
         list(values.values()),
     )
+
+
+class TestClipPlayback(unittest.TestCase):
+    def test_live_clip_uses_the_vod_playlist(self):
+        urls = live_clip_urls("front", 1728330612.5, 1728330640.0, "evt-1")
+        self.assertEqual(
+            urls["clip"],
+            "vod/front/start/1728330612.5/end/1728330640/index.m3u8",
+        )
+        self.assertEqual(urls["download"], "events/evt-1/clip.mp4")
+
+    def test_archive_clip_is_faststart_h264_and_ranged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "camera.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=red:s=160x120:d=1:r=12",
+                    "-c:v",
+                    "mpeg4",
+                    str(source),
+                ],
+                check=True,
+            )
+            rendered = render_faststart_mp4(
+                "ffmpeg",
+                [ArchiveSegment(path=source, url=None, start=0, end=1)],
+                None,
+                None,
+            )
+            self.addCleanup(rendered.unlink, missing_ok=True)
+            data = rendered.read_bytes()
+            self.assertLess(data.find(b"moov"), data.find(b"mdat"))
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "csv=p=0",
+                    str(rendered),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(probe.stdout.strip(), "h264")
+            response = playable_mp4_response(rendered, "clip.mp4")
+            self.assertEqual(response.media_type, "video/mp4")
+            self.assertIn("inline", response.headers["content-disposition"])
+            messages: list[dict] = []
+
+            async def receive():
+                return {"type": "http.request"}
+
+            async def send(message):
+                messages.append(message)
+
+            asyncio.run(
+                response(
+                    {
+                        "type": "http",
+                        "http_version": "1.1",
+                        "method": "GET",
+                        "scheme": "http",
+                        "path": "/clip.mp4",
+                        "raw_path": b"/clip.mp4",
+                        "query_string": b"",
+                        "headers": [(b"range", b"bytes=0-7")],
+                        "client": ("127.0.0.1", 123),
+                        "server": ("127.0.0.1", 80),
+                    },
+                    receive,
+                    send,
+                )
+            )
+            self.assertEqual(messages[0]["status"], 206)
+            headers = {
+                key.decode().lower(): value.decode()
+                for key, value in messages[0]["headers"]
+            }
+            self.assertTrue(headers["content-type"].startswith("video/mp4"))
+            self.assertTrue(headers["content-range"].startswith("bytes 0-7/"))
 
 
 if __name__ == "__main__":

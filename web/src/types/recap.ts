@@ -61,6 +61,7 @@ export type RecapClipSource = {
   source: "frigate" | "archive";
   camera?: string | null;
   clip?: string | null;
+  download?: string | null;
   snapshot?: string | null;
   message?: string;
 };

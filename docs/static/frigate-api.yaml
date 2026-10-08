@@ -2019,8 +2019,9 @@ paths:
         - Recap
       summary: Resolve an event clip
       description: >-
-        Returns a Frigate clip URL while the recording still exists, or an
-        archived clip or snapshot for the same event.
+        Live recordings return a /vod/<camera>/start/<ts>/end/<ts>/index.m3u8
+        playlist plus a download path. Archived events return a faststart
+        MP4 or a snapshot.
       operationId: recap_event_source_recap_event__event_id__get
       parameters:
         - name: event_id

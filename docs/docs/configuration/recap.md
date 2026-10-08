@@ -54,7 +54,7 @@ Files are stored at `/media/frigate/recap/<camera>/<id>/` (`manifest.json`, `vid
 - Anything that moves with a person, and is connected to them against a clean background, is part of their cutout. That includes a golf cart, bicycle, scooter, or stroller the detector does not know as its own object.
 - Times are local, without seconds (`5:50 PM`). If two labels fall in the same clock minute, those labels show seconds (`5:50:12 PM`, `5:50:47 PM`). Labels are not grouped with a count.
 
-Click a time label to jump the synopsis. Double-click it to open that event's clip, with download and previous/next through the events that match the legend. If Frigate has already deleted the recording, and `recap.archive` is set, the player uses the archived file for the same event.
+Tap a time on the video, or a row in the event list, to pause and open that clip. The dialog has download, previous, and next, and a link to Frigate review at that time. While the synopsis is paused, every time on screen can be tapped. Live clips play from the camera's HLS VOD playlist (`/vod/<camera>/start/<ts>/end/<ts>/index.m3u8`), which Safari plays natively. Archived files are served as a faststart H.264 MP4 with range requests. If Frigate has already deleted the recording, and `recap.archive` is set, the player uses the archived file for the same event.
 
 ## Archive
 

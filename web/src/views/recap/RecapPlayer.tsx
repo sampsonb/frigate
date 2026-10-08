@@ -4,6 +4,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { RecapClipSource, RecapManifest, RecapTrack } from "@/types/recap";
 import axios from "axios";
+import Hls from "hls.js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
@@ -18,6 +19,8 @@ type ContentRect = { x: number; y: number; w: number; h: number };
 type OpenClip = {
   track: RecapTrack;
   clip?: string;
+  download?: string;
+  hls?: boolean;
   snapshot?: string;
   source?: string;
   message?: string;
@@ -38,7 +41,62 @@ function mediaUrl(value?: string | null) {
   if (value.startsWith("http://") || value.startsWith("https://")) {
     return value;
   }
-  return `${baseUrl}api/${value.replace(/^\//, "")}`;
+  const path = value.replace(/^\//, "");
+  // VOD playlists are served by nginx, not the /api router.
+  if (path.startsWith("vod/")) {
+    return `${baseUrl}${path}`;
+  }
+  return `${baseUrl}api/${path}`;
+}
+
+function isHls(value?: string | null) {
+  return Boolean(value && (value.includes(".m3u8") || value.includes("/vod/")));
+}
+
+function RecapClipVideo({ src, hls }: { src: string; hls: boolean }) {
+  const ref = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    const video = ref.current;
+    if (!video) {
+      return;
+    }
+    let player: Hls | undefined;
+    const nativeHls =
+      hls && video.canPlayType("application/vnd.apple.mpegurl") !== "";
+    if (!hls || nativeHls) {
+      video.src = src;
+      video.load();
+    } else if (Hls.isSupported()) {
+      player = new Hls({ maxBufferLength: 10 });
+      player.loadSource(src);
+      player.attachMedia(video);
+    } else {
+      video.src = src;
+      video.load();
+    }
+    const start = () => {
+      video.play().catch(() => undefined);
+    };
+    video.addEventListener("loadeddata", start);
+    return () => {
+      video.removeEventListener("loadeddata", start);
+      player?.destroy();
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [hls, src]);
+
+  return (
+    <video
+      ref={ref}
+      className="max-h-[70dvh] w-full rounded-lg bg-black"
+      controls
+      autoPlay
+      muted
+      playsInline
+    />
+  );
 }
 
 export default function RecapPlayer({ recap }: RecapPlayerProps) {
@@ -158,9 +216,12 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
         });
         return;
       }
+      const hls = isHls(data.clip);
       setOpen({
         track,
         clip: mediaUrl(data.clip),
+        download: mediaUrl(data.download || (hls ? undefined : data.clip)),
+        hls,
         snapshot: mediaUrl(data.snapshot),
         source: data.source,
         message: data.message,
@@ -338,13 +399,10 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
             </p>
           )}
           {open?.clip ? (
-            <video
+            <RecapClipVideo
               key={open.clip}
-              className="max-h-[70dvh] w-full rounded-lg bg-black"
               src={open.clip}
-              controls
-              autoPlay
-              playsInline
+              hls={Boolean(open.hls)}
             />
           ) : (
             open?.snapshot && (
@@ -359,9 +417,9 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
             <p className="text-sm text-muted-foreground">{t("snapshotOnly")}</p>
           )}
           <div className="flex flex-wrap gap-2">
-            {open?.clip && (
+            {open?.download && (
               <Button variant="select" asChild>
-                <a href={open.clip} download>
+                <a href={open.download} download>
                   {t("download")}
                 </a>
               </Button>
