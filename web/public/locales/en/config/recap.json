@@ -1,0 +1,94 @@
+{
+  "label": "Video synopsis (recap) configuration.",
+  "properties": {
+    "enabled": {
+      "label": "Enable recap generation."
+    },
+    "enabled_in_config": {
+      "label": "Keep track of original state of recap."
+    },
+    "schedule": {
+      "label": "Daily local time to generate a recap automatically (HH:MM).",
+      "description": "24-hour local time. Leave empty to generate recaps only on demand. Frigate must be running within a couple of minutes of this time."
+    },
+    "window_hours": {
+      "label": "Hours of footage each scheduled recap covers."
+    },
+    "max_window_hours": {
+      "label": "Longest time range an on-demand recap may cover."
+    },
+    "labels": {
+      "label": "Tracked labels to include."
+    },
+    "target_length": {
+      "label": "Target synopsis length in seconds."
+    },
+    "label_opacity": {
+      "label": "Opacity of the time-label background."
+    },
+    "max_labels": {
+      "label": "Maximum number of time labels on screen at once."
+    },
+    "min_label_gap": {
+      "label": "Minimum gap between labels, in pixels at 1080p."
+    },
+    "fade_seconds": {
+      "label": "Fade in and out duration for a ghost, its line, and its label."
+    },
+    "retain_days": {
+      "label": "Days to keep generated recaps. 0 keeps them until deleted."
+    },
+    "output_fps": {
+      "label": "Frame rate of the synopsis video."
+    },
+    "sample_fps": {
+      "label": "Frames per second sampled from people and animals."
+    },
+    "vehicle_sample_fps": {
+      "label": "Frames per second sampled from vehicles so they stay readable."
+    },
+    "min_show_seconds": {
+      "label": "Shortest time a ghost stays on screen."
+    },
+    "max_object_seconds": {
+      "label": "Most source time kept for one object (loiterers are trimmed)."
+    },
+    "max_width": {
+      "label": "Maximum synopsis width. Frames are scaled down to this."
+    },
+    "font_scale": {
+      "label": "Label font scale at 1080p."
+    },
+    "max_events": {
+      "label": "Maximum events processed in one recap."
+    },
+    "parked_cars": {
+      "label": "Show a parked car when a person gets in or out of it."
+    },
+    "stationary_path": {
+      "label": "Path movement, as a fraction of the frame, below which a vehicle is parked."
+    },
+    "delivery_search": {
+      "label": "Tag deliveries with semantic search when Frigate+ labels are absent."
+    },
+    "delivery_distance": {
+      "label": "Maximum semantic-search distance to call an event a delivery."
+    },
+    "pause_seconds": {
+      "label": "Pause between events so live detection keeps the CPU."
+    },
+    "archive": {
+      "label": "Optional external archive of recordings, events, and recaps.",
+      "properties": {
+        "path": {
+          "label": "Filesystem path of the media archive mounted into Frigate.",
+          "description": "Root of a nightly copy that keeps Frigate's layout: recordings/YYYY-MM-DD/HH/<camera>/MM.SS.mp4, clips/, and recap/. Empty disables the filesystem archive."
+        },
+        "url": {
+          "label": "Base URL of the media archive.",
+          "description": "Used when the archive is not mounted, or to play a single archived file directly. No trailing slash. Empty disables URL access."
+        }
+      }
+    }
+  }
+}

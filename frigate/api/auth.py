@@ -82,6 +82,7 @@ def require_admin_by_default():
         "/event_ids",
         "/events",
         "/exports",
+        "/recap",
     }
 
     # Path prefixes that should be exempt (for paths with parameters)
@@ -95,6 +96,7 @@ def require_admin_by_default():
         "/users/",  # /users/{username}/password (has own auth)
         "/preview/",  # /preview/{file}/thumbnail.jpg
         "/exports/",  # /exports/{export_id}
+        "/recap/",  # /recap/{camera}/start, /recap/{id}, video and thumb
         "/vod/",  # /vod/{camera_name}/...
         "/notifications/",  # /notifications/pubkey, /notifications/register
     )

@@ -51,6 +51,7 @@ i18n
       "views/settings",
       "views/system",
       "views/exports",
+      "views/recap",
       "views/explore",
     ],
     defaultNS: "common",

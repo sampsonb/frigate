@@ -1960,6 +1960,141 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HTTPValidationError"
+  /recap:
+    get:
+      tags:
+        - Recap
+      summary: List recaps
+      description: >-
+        Lists saved video synopses for cameras the user can view, newest
+        first, including older recaps on recap.archive when that is set.
+      operationId: recap_list_recap_get
+      responses:
+        "200":
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+  /recap/{camera_name}/start:
+    post:
+      tags:
+        - Recap
+      summary: Start a recap
+      description: >-
+        Queues a synopsis. Pass hours (1, 6, 12, 24) or after and before
+        as epoch seconds. One recap runs at a time.
+      operationId: recap_start_recap__camera_name__start_post
+      parameters:
+        - name: camera_name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                hours:
+                  type: number
+                after:
+                  type: number
+                before:
+                  type: number
+      responses:
+        "200":
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+  /recap/event/{event_id}:
+    get:
+      tags:
+        - Recap
+      summary: Resolve an event clip
+      description: >-
+        Returns a Frigate clip URL while the recording still exists, or an
+        archived clip or snapshot for the same event.
+      operationId: recap_event_source_recap_event__event_id__get
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+  /recap/event/{event_id}/clip.mp4:
+    get:
+      tags:
+        - Recap
+      summary: Play an archived event clip
+      operationId: recap_event_clip_recap_event__event_id__clip_mp4_get
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful Response
+          content:
+            video/mp4:
+              schema:
+                type: string
+                format: binary
+  /recap/{recap_id}:
+    get:
+      tags:
+        - Recap
+      summary: Get a recap
+      description: Full manifest, including track timing for clickable time labels.
+      operationId: recap_get_recap__recap_id__get
+      parameters:
+        - name: recap_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+  /recap/{recap_id}/video.mp4:
+    get:
+      tags:
+        - Recap
+      summary: Play a recap
+      operationId: recap_video_recap__recap_id__video_mp4_get
+      parameters:
+        - name: recap_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful Response
+          content:
+            video/mp4:
+              schema:
+                type: string
+                format: binary
   /exports:
     get:
       tags:

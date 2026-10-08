@@ -6,7 +6,7 @@ import { isDesktop } from "react-device-detect";
 import { FaCompactDisc, FaVideo } from "react-icons/fa";
 import { IoSearch } from "react-icons/io5";
 import { LuConstruction } from "react-icons/lu";
-import { MdCategory, MdVideoLibrary } from "react-icons/md";
+import { MdCategory, MdTimelapse, MdVideoLibrary } from "react-icons/md";
 import { TbFaceId } from "react-icons/tb";
 import useSWR from "swr";
 import { useIsAdmin } from "./use-is-admin";
@@ -18,6 +18,7 @@ export const ID_EXPORT = 4;
 export const ID_PLAYGROUND = 5;
 export const ID_FACE_LIBRARY = 6;
 export const ID_CLASSIFICATION = 7;
+export const ID_RECAP = 8;
 
 export default function useNavigation(
   variant: "primary" | "secondary" = "primary",
@@ -57,6 +58,13 @@ export default function useNavigation(
           icon: FaCompactDisc,
           title: "menu.export",
           url: "/export",
+        },
+        {
+          id: ID_RECAP,
+          variant,
+          icon: MdTimelapse,
+          title: "menu.recap",
+          url: "/recap",
         },
         {
           id: ID_PLAYGROUND,

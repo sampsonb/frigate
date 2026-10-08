@@ -800,6 +800,38 @@ timestamp_style:
   #           "shadow" (shadow for font)
   effect: None
 
+# Optional: Video synopsis (recap)
+# NOTE: Can be overridden at the camera level. Off by default.
+recap:
+  # Optional: Enable recap generation (default: shown below)
+  enabled: False
+  # Optional: Daily local time to generate a recap automatically, HH:MM (default: none)
+  # schedule: "02:00"
+  # Optional: Hours of footage each scheduled recap covers (default: shown below)
+  window_hours: 24
+  # Optional: Longest on-demand range, in hours (default: shown below)
+  max_window_hours: 48
+  # Optional: Tracked labels to include (default: person, vehicles, common animals, delivery names)
+  # labels:
+  #   - person
+  #   - car
+  #   - dog
+  # Optional: Target synopsis length in seconds (default: shown below)
+  target_length: 120
+  # Optional: Opacity of the time-label background (default: shown below)
+  label_opacity: 0.5
+  # Optional: Maximum number of time labels on screen at once (default: shown below)
+  max_labels: 8
+  # Optional: Fade in and out, in seconds (default: shown below)
+  fade_seconds: 0.35
+  # Optional: Days to keep generated recaps. 0 keeps them until deleted (default: shown below)
+  retain_days: 14
+  # Optional: External archive. Leave unset to disable.
+  # The path is a mount with Frigate's media layout. The url is an HTTP base.
+  # archive:
+  #   path: /mnt/frigate-archive
+  #   url: https://archive.example/frigate
+
 # Required
 cameras:
   # Required: name of the camera

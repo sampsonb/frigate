@@ -1,0 +1,796 @@
+"""Turn Frigate events into one synopsis video.
+
+Frame loading is injected so this module does not talk to the database.
+The job in ``manager`` loads recordings and calls ``generate_recap``.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Callable, Sequence
+from datetime import datetime, tzinfo
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+
+from frigate.config.recap import RecapConfig
+from frigate.recap.categories import (
+    CAT_COLOR,
+    CAT_NAME,
+    CAT_ORDER,
+    DELIVERY_LABELS,
+    bgr_hex,
+    category_of,
+)
+from frigate.recap.cutout import build_cutouts, parked_car_ghost
+from frigate.recap.layout import (
+    MotionTrack,
+    ScheduledUnit,
+    assign_label_texts,
+    dedupe_tracks,
+    is_stationary,
+    link_parked_cars,
+    repeat_for_min_show,
+    schedule_units,
+)
+from frigate.recap.render import GhostFrame, Tube, encode_video, layout_labels
+
+logger = logging.getLogger(__name__)
+
+LoadClip = Callable[
+    [dict[str, Any], float, int, int],
+    tuple[list[np.ndarray], list[float]] | None,
+]
+
+
+def classify_event(
+    event: dict[str, Any],
+    delivery_ids: set[str],
+    dog_walker_ids: set[str],
+) -> str:
+    """People, vehicles, animals, or deliveries.
+
+    Frigate+ delivery attributes win. Semantic-search hits are the
+    fallback the standalone prototype uses when those labels are absent.
+    A person semantic-matched as walking a dog is shown as an animal.
+    """
+    label = str(event.get("label") or "")
+    category = category_of(label)
+    sub_label = str(event.get("sub_label") or "").lower()
+    if label.lower() in DELIVERY_LABELS or sub_label in DELIVERY_LABELS:
+        return "delivery"
+    for attribute in (event.get("data") or {}).get("attributes") or []:
+        name = str(attribute.get("label") or "").lower()
+        score = float(attribute.get("score") or 0)
+        if name in DELIVERY_LABELS and score >= 0.5:
+            return "delivery"
+    if event.get("id") in delivery_ids and category in ("person", "vehicle"):
+        return "delivery"
+    if label == "person" and event.get("id") in dog_walker_ids:
+        return "animal"
+    return category
+
+
+def _path_points(event: dict[str, Any]) -> list[tuple[float, float, float]]:
+    """Normalized ``(x, bottom_y, timestamp)`` samples, oldest first."""
+    raw = (event.get("data") or {}).get("path_data") or []
+    points: list[tuple[float, float, float]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        point, stamp = item[0], item[1]
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        try:
+            points.append((float(point[0]), float(point[1]), float(stamp)))
+        except (TypeError, ValueError):
+            continue
+    points.sort(key=lambda item: item[2])
+    return points
+
+
+def _snapshot_box(event: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    """Normalized xywh box, or None when the event has no box."""
+    box = (event.get("data") or {}).get("box")
+    if not isinstance(box, (list, tuple)) or len(box) < 4:
+        return None
+    try:
+        return (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+    except (TypeError, ValueError):
+        return None
+
+
+def boxes_at(
+    event: dict[str, Any],
+    times: Sequence[float],
+    width: int,
+    height: int,
+) -> list[tuple[float, float, float, float]] | None:
+    """Pixel xyxy boxes following the Frigate path, sized like the snapshot."""
+    snapshot = _snapshot_box(event)
+    if snapshot is None or not times:
+        return None
+    box_w = max(2.0, snapshot[2] * width)
+    box_h = max(2.0, snapshot[3] * height)
+    path = _path_points(event)
+    boxes: list[tuple[float, float, float, float]] = []
+    if len(path) >= 2:
+        stamps = [item[2] for item in path]
+        xs = [item[0] for item in path]
+        ys = [item[1] for item in path]
+        for moment in times:
+            center_x = float(np.interp(moment, stamps, xs)) * width
+            bottom = float(np.interp(moment, stamps, ys)) * height
+            x0 = center_x - box_w / 2
+            y1 = bottom
+            y0 = bottom - box_h
+            boxes.append(_clamp_box((x0, y0, x0 + box_w, y1), width, height))
+        return boxes
+    x0 = snapshot[0] * width
+    y0 = snapshot[1] * height
+    fixed = _clamp_box((x0, y0, x0 + box_w, y0 + box_h), width, height)
+    return [fixed for _ in times]
+
+
+def _clamp_box(
+    box: tuple[float, float, float, float], width: int, height: int
+) -> tuple[float, float, float, float]:
+    x0 = min(max(0.0, box[0]), width - 2)
+    y0 = min(max(0.0, box[1]), height - 2)
+    x1 = min(max(x0 + 2, box[2]), float(width))
+    y1 = min(max(y0 + 2, box[3]), float(height))
+    return (x0, y0, x1, y1)
+
+
+def preview_track(
+    event: dict[str, Any],
+    category: str,
+    width: int,
+    height: int,
+) -> MotionTrack | None:
+    """A cheap track used to decide parked-versus-moving before any decode."""
+    start = float(event["start_time"])
+    end = float(event["end_time"])
+    if end <= start:
+        end = start + 0.5
+    count = 8
+    times = [start + (end - start) * (index + 0.5) / count for index in range(count)]
+    boxes = boxes_at(event, times, width, height)
+    if not boxes:
+        return None
+    return MotionTrack(
+        id=str(event["id"]),
+        label=str(event["label"]),
+        category=category,
+        start=start,
+        end=float(event["end_time"] or end),
+        boxes=boxes,
+        times=times,
+    )
+
+
+def vehicle_is_parked(
+    event: dict[str, Any],
+    track: MotionTrack,
+    width: int,
+    height: int,
+    threshold: float,
+) -> bool:
+    """Stationary vehicles are skipped unless someone later gets in or out."""
+    duration = max(0.0, track.end - track.start)
+    had_path = len(_path_points(event)) >= 2
+    if not had_path:
+        return duration >= 30
+    return is_stationary(track.boxes, width, height, threshold)
+
+
+def _median_plate(frames: Sequence[np.ndarray]) -> np.ndarray | None:
+    usable = [frame for frame in frames if frame is not None and frame.size]
+    if not usable:
+        return None
+    height, width = usable[0].shape[:2]
+    same = [frame for frame in usable if frame.shape[:2] == (height, width)]
+    if len(same) == 1:
+        return same[0]
+    return np.median(np.stack(same), axis=0).astype(np.uint8)
+
+
+def _overlap_time(left: MotionTrack, right: MotionTrack) -> bool:
+    return left.start <= right.end and right.start <= left.end
+
+
+def _merge_dog_walkers(tracks: list[MotionTrack]) -> set[str]:
+    """A person overlapping a dog or cat is the dog-walker, drawn in green.
+
+    The animal track is dropped when it stays inside the person's boxes,
+    because the person's cutout already includes whatever moves with them.
+    """
+    drop: set[str] = set()
+    people = [track for track in tracks if track.label == "person"]
+    animals = [track for track in tracks if track.category == "animal"]
+    for person in people:
+        for animal in animals:
+            if animal.id in drop or not _overlap_time(person, animal):
+                continue
+            scores: list[float] = []
+            for box, moment in zip(person.boxes, person.times, strict=True):
+                index = min(
+                    range(len(animal.times)),
+                    key=lambda item: abs(animal.times[item] - moment),
+                )
+                if abs(animal.times[index] - moment) > 1.5:
+                    continue
+                animal_box = animal.boxes[index]
+                ix = max(0.0, min(box[2], animal_box[2]) - max(box[0], animal_box[0]))
+                iy = max(0.0, min(box[3], animal_box[3]) - max(box[1], animal_box[1]))
+                area = max(
+                    1.0,
+                    (animal_box[2] - animal_box[0]) * (animal_box[3] - animal_box[1]),
+                )
+                scores.append(ix * iy / area)
+            if scores and float(np.mean(scores)) >= 0.2:
+                person.category = "animal"
+                if float(np.mean(scores)) >= 0.45:
+                    drop.add(animal.id)
+    return drop
+
+
+def _clock_range(after: float, before: float, zone: tzinfo) -> str:
+    start = datetime.fromtimestamp(after, zone)
+    end = datetime.fromtimestamp(before, zone)
+    left = start.strftime("%a %b %-d, %-I:%M %p")
+    if start.strftime("%p") == end.strftime("%p") and start.date() == end.date():
+        right = end.strftime("%-I:%M %p")
+    else:
+        right = end.strftime("%a %b %-d, %-I:%M %p")
+    return f"{left} to {right}"
+
+
+def generate_recap(
+    *,
+    camera: str,
+    after: float,
+    before: float,
+    settings: RecapConfig,
+    zone: tzinfo,
+    events: list[dict[str, Any]],
+    load_clip: LoadClip,
+    plate_frames: list[np.ndarray],
+    out_dir: Path,
+    ffmpeg: str,
+    cancel: Callable[[], bool],
+    progress: Callable[[float, str], None],
+    delivery_ids: set[str] | None = None,
+    dog_walker_ids: set[str] | None = None,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    """Build ``video.mp4`` and return the manifest body (without status)."""
+    delivery_ids = delivery_ids or set()
+    dog_walker_ids = dog_walker_ids or set()
+    progress(8, "Choosing objects")
+    if cancel():
+        raise RecapCancelled()
+
+    classified: list[tuple[dict[str, Any], str, MotionTrack]] = []
+    excluded: list[dict[str, Any]] = []
+    for event in events:
+        if cancel():
+            raise RecapCancelled()
+        category = classify_event(event, delivery_ids, dog_walker_ids)
+        track = preview_track(event, category, width, height)
+        if track is None:
+            excluded.append(
+                {
+                    "id": event.get("id"),
+                    "label": event.get("label"),
+                    "reason": "no box",
+                    "start_time": event.get("start_time"),
+                }
+            )
+            continue
+        if (
+            category == "vehicle"
+            and settings.parked_cars
+            and vehicle_is_parked(event, track, width, height, settings.stationary_path)
+        ):
+            excluded.append(
+                {
+                    "id": event.get("id"),
+                    "label": event.get("label"),
+                    "reason": "parked",
+                    "start_time": event.get("start_time"),
+                    "category": "vehicle",
+                }
+            )
+            # Kept aside so a person getting in or out can still find the car.
+            track.category = "vehicle"
+            classified.append((event, "parked-candidate", track))
+            continue
+        classified.append((event, category, track))
+
+    active = [
+        (event, category, track)
+        for event, category, track in classified
+        if category != "parked-candidate"
+    ]
+    parked_candidates = [
+        track
+        for _event, category, track in classified
+        if category == "parked-candidate"
+    ]
+    if len(active) > settings.max_events:
+        logger.warning(
+            "Recap for %s has %d objects, keeping %d",
+            camera,
+            len(active),
+            settings.max_events,
+        )
+        active.sort(key=lambda item: item[2].start)
+        overflow = active[settings.max_events :]
+        active = active[: settings.max_events]
+        for event, _category, _track in overflow:
+            excluded.append(
+                {
+                    "id": event.get("id"),
+                    "label": event.get("label"),
+                    "reason": "over the event cap",
+                    "start_time": event.get("start_time"),
+                }
+            )
+
+    plate = _median_plate(plate_frames)
+    if plate is None:
+        raise RuntimeError("No recordings to build a background from")
+    if plate.shape[1] != width or plate.shape[0] != height:
+        plate = cv2.resize(plate, (width, height), interpolation=cv2.INTER_AREA)
+
+    tubes: list[Tube] = []
+    tracks: list[MotionTrack] = []
+    total = max(1, len(active))
+    for index, (event, category, preview) in enumerate(active):
+        if cancel():
+            raise RecapCancelled()
+        progress(
+            12 + 60 * index / total,
+            f"Cutting out {event.get('label')} {index + 1} of {total}",
+        )
+        sample_fps = (
+            settings.vehicle_sample_fps
+            if category == "vehicle"
+            else settings.sample_fps
+        )
+        loaded = load_clip(event, sample_fps, width, height)
+        if not loaded:
+            excluded.append(
+                {
+                    "id": event.get("id"),
+                    "label": event.get("label"),
+                    "reason": "no frames",
+                    "start_time": event.get("start_time"),
+                }
+            )
+            continue
+        frames, times = loaded
+        boxes = boxes_at(event, times, width, height)
+        if not boxes:
+            continue
+        limit = max(3, int(settings.max_object_seconds * sample_fps))
+        if len(frames) > limit:
+            chosen = np.linspace(0, len(frames) - 1, limit).round().astype(int)
+            frames = [frames[int(item)] for item in chosen]
+            times = [times[int(item)] for item in chosen]
+            boxes = [boxes[int(item)] for item in chosen]
+        ghosts = build_cutouts(frames, boxes, category)
+        context_first = _jpeg(frames[0])
+        context_last = _jpeg(frames[-1])
+        if not ghosts:
+            excluded.append(
+                {
+                    "id": event.get("id"),
+                    "label": event.get("label"),
+                    "reason": "could not separate from the background",
+                    "start_time": event.get("start_time"),
+                }
+            )
+            continue
+        ghost_frames = [
+            GhostFrame(
+                x=int(ghost["x"]),
+                y=int(ghost["y"]),
+                box=ghost["box"],  # type: ignore[arg-type]
+                crop=ghost["crop"],  # type: ignore[arg-type]
+                alpha=ghost["alpha"],  # type: ignore[arg-type]
+            )
+            for ghost in ghosts
+        ]
+        for ghost_frame in ghost_frames:
+            ghost_frame.pack()
+        count = min(len(ghost_frames), len(boxes), len(times))
+        ghost_frames = ghost_frames[:count]
+        boxes = boxes[:count]
+        times = times[:count]
+        track = MotionTrack(
+            id=str(event["id"]),
+            label=str(event["label"]),
+            category=category,
+            start=float(event["start_time"]),
+            end=float(event["end_time"]),
+            boxes=boxes,
+            times=list(times),
+        )
+        tubes.append(
+            Tube(
+                event_id=track.id,
+                clip_event_id=track.id,
+                label=track.label,
+                category=category,
+                start_time=track.start,
+                frames=ghost_frames,
+                context_first=context_first,
+                context_last=context_last,
+            )
+        )
+        tracks.append(track)
+        if settings.pause_seconds:
+            time.sleep(settings.pause_seconds)
+
+    dropped_animals = _merge_dog_walkers(tracks)
+    for track in tracks:
+        if track.id in dropped_animals:
+            continue
+        for tube in tubes:
+            if tube.event_id == track.id:
+                tube.category = track.category
+
+    keep_ids = {track.id for track in tracks if track.id not in dropped_animals}
+    drop_map = dedupe_tracks([track for track in tracks if track.id in keep_ids])
+    ordered = [track for track in tracks if track.id in keep_ids]
+    dropped_ids = {ordered[index].id for index in drop_map}
+    for event_id in dropped_ids | dropped_animals:
+        excluded.append(
+            {
+                "id": event_id,
+                "label": next(
+                    (track.label for track in tracks if track.id == event_id), ""
+                ),
+                "reason": "same object as another track",
+                "start_time": next(
+                    (track.start for track in tracks if track.id == event_id), None
+                ),
+            }
+        )
+    tracks = [track for track in ordered if track.id not in dropped_ids]
+    tubes = [
+        tube
+        for tube in tubes
+        if tube.event_id not in dropped_ids and tube.event_id not in dropped_animals
+    ]
+    by_id = {tube.event_id: tube for tube in tubes}
+
+    if settings.parked_cars and tracks:
+        links = link_parked_cars(
+            [track for track in tracks if track.label == "person"],
+            parked_candidates,
+            width,
+            height,
+            settings.stationary_path,
+        )
+    else:
+        links = []
+
+    progress(78, "Placing labels")
+    units: list[ScheduledUnit] = []
+    repeats: list[int] = []
+    for track in sorted(tracks, key=lambda item: item.start):
+        tube = by_id.get(track.id)
+        if tube is None:
+            continue
+        repeat = repeat_for_min_show(
+            len(track.boxes), settings.output_fps, settings.min_show_seconds
+        )
+        expanded = [box for box in track.boxes for _ in range(repeat)]
+        units.append(
+            ScheduledUnit(
+                event_id=track.id,
+                clip_event_id=track.id,
+                label=track.label,
+                category=track.category,
+                start_time=track.start,
+                boxes=expanded,
+                member_ids=[track.id],
+            )
+        )
+        repeats.append(repeat)
+        tube.category = track.category
+
+    person_unit = {unit.event_id: index for index, unit in enumerate(units)}
+    for link in links:
+        person_index = person_unit.get(link.person_id)
+        if person_index is None:
+            continue
+        person = units[person_index]
+        source = by_id.get(link.person_id)
+        which = "last" if link.kind == "got out" else "first"
+        frame = source.context_image(which) if source else None
+        if frame is None and source is not None:
+            frame = source.context_image("first" if which == "last" else "last")
+        if frame is None:
+            continue
+        ghost = parked_car_ghost(frame, link.car_box)
+        if ghost is None:
+            continue
+        parked_id = f"parked-{link.person_id}-{link.kind.replace(' ', '-')}"
+        ghost_frame = GhostFrame(
+            x=int(ghost["x"]),
+            y=int(ghost["y"]),
+            box=ghost["box"],  # type: ignore[arg-type]
+            crop=ghost["crop"],  # type: ignore[arg-type]
+            alpha=ghost["alpha"],  # type: ignore[arg-type]
+        )
+        ghost_frame.pack()
+        clip_id = link.vehicle_id or link.person_id
+        tubes.append(
+            Tube(
+                event_id=parked_id,
+                clip_event_id=clip_id,
+                label="car",
+                category="parked",
+                start_time=link.ts,
+                frames=[ghost_frame],
+                suffix=link.kind,
+                link_event_id=link.person_id,
+            )
+        )
+        units.append(
+            ScheduledUnit(
+                event_id=parked_id,
+                clip_event_id=clip_id,
+                label="car",
+                category="parked",
+                start_time=link.ts,
+                boxes=[link.car_box for _ in person.boxes],
+                suffix=link.kind,
+                link_index=person_index,
+                member_ids=[parked_id],
+            )
+        )
+        repeats.append(max(1, len(person.boxes)))
+
+    if not units:
+        return _empty_video(
+            plate,
+            camera,
+            after,
+            before,
+            zone,
+            settings,
+            out_dir,
+            ffmpeg,
+            excluded,
+            cancel,
+            progress,
+        )
+
+    texts = assign_label_texts(
+        [unit.start_time for unit in units],
+        [unit.suffix for unit in units],
+        zone,
+    )
+    for unit, text in zip(units, texts, strict=True):
+        unit.text = text
+
+    target = int(settings.target_length * settings.output_fps)
+    starts, frame_count = schedule_units(
+        units,
+        width,
+        height,
+        target,
+        max_delay=int(2.5 * settings.output_fps),
+        max_active=settings.max_labels,
+    )
+    header_h = max(28, int(round(0.075 * height)))
+    rects = layout_labels(
+        units,
+        starts,
+        width,
+        height,
+        font_scale=settings.font_scale,
+        header_h=header_h,
+        min_gap=settings.min_label_gap,
+    )
+    shown = sum(1 for unit in units if unit.category != "parked")
+    header = f"{camera}  {_clock_range(after, before, zone)}  {shown} shown"
+    progress(88, "Encoding video")
+    thumb = encode_video(
+        plate,
+        units,
+        tubes,
+        starts,
+        rects,
+        frame_count,
+        str(out_dir / "video.mp4"),
+        ffmpeg=ffmpeg,
+        fps=settings.output_fps,
+        header=header,
+        header_h=header_h,
+        fade_frames=max(1, int(round(settings.fade_seconds * settings.output_fps))),
+        label_opacity=settings.label_opacity,
+        font_scale=settings.font_scale,
+        repeats=repeats,
+        cancel_check=cancel,
+    )
+    if thumb is None:
+        raise RecapCancelled()
+    cv2.imwrite(str(out_dir / "thumb.jpg"), thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return _manifest_body(
+        camera,
+        after,
+        before,
+        settings,
+        width,
+        height,
+        frame_count,
+        units,
+        starts,
+        rects,
+        excluded,
+        links,
+    )
+
+
+class RecapCancelled(Exception):
+    """The user or a shutdown asked the job to stop."""
+
+
+def _jpeg(frame: np.ndarray) -> bytes | None:
+    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not ok:
+        return None
+    return encoded.tobytes()
+
+
+def _empty_video(
+    plate: np.ndarray,
+    camera: str,
+    after: float,
+    before: float,
+    zone: tzinfo,
+    settings: RecapConfig,
+    out_dir: Path,
+    ffmpeg: str,
+    excluded: list[dict[str, Any]],
+    cancel: Callable[[], bool],
+    progress: Callable[[float, str], None],
+) -> dict[str, Any]:
+    height, width = plate.shape[:2]
+    header = f"{camera}  {_clock_range(after, before, zone)}  nothing tracked"
+    progress(90, "Nothing to show, saving the background")
+    thumb = encode_video(
+        plate,
+        [],
+        [],
+        [],
+        [],
+        settings.output_fps * 2,
+        str(out_dir / "video.mp4"),
+        ffmpeg=ffmpeg,
+        fps=settings.output_fps,
+        header=header,
+        header_h=max(28, int(round(0.075 * height))),
+        fade_frames=1,
+        label_opacity=settings.label_opacity,
+        font_scale=settings.font_scale,
+        repeats=[],
+        cancel_check=cancel,
+    )
+    if thumb is None:
+        raise RecapCancelled()
+    cv2.imwrite(str(out_dir / "thumb.jpg"), thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return _manifest_body(
+        camera,
+        after,
+        before,
+        settings,
+        width,
+        height,
+        settings.output_fps * 2,
+        [],
+        [],
+        [],
+        excluded,
+        [],
+    )
+
+
+def _manifest_body(
+    camera: str,
+    after: float,
+    before: float,
+    settings: RecapConfig,
+    width: int,
+    height: int,
+    frame_count: int,
+    units: list[ScheduledUnit],
+    starts: list[int],
+    rects: list[tuple[int, int, int, int]],
+    excluded: list[dict[str, Any]],
+    links: list[Any],
+) -> dict[str, Any]:
+    tracks = []
+    for index, unit in enumerate(units):
+        rect = rects[index] if index < len(rects) else (0, 0, 0, 0)
+        tracks.append(
+            {
+                "event_id": unit.event_id,
+                "clip_event_id": unit.clip_event_id,
+                "cat": unit.category,
+                "label": unit.label,
+                "text": unit.text,
+                "start_time": unit.start_time,
+                "out_start": starts[index] if index < len(starts) else 0,
+                "length": len(unit.boxes),
+                "label_box": [
+                    round(rect[0] / width, 4),
+                    round(rect[1] / height, 4),
+                    round(rect[2] / width, 4),
+                    round(rect[3] / height, 4),
+                ],
+                "suffix": unit.suffix,
+                "link_event_id": None
+                if unit.link_index is None
+                else units[unit.link_index].event_id,
+            }
+        )
+    counts = {
+        category: sum(1 for unit in units if unit.category == category)
+        for category in CAT_ORDER
+    }
+    return {
+        "camera": camera,
+        "after": after,
+        "before": before,
+        "fps": settings.output_fps,
+        "width": width,
+        "height": height,
+        "seconds": round(frame_count / settings.output_fps, 2),
+        "frame_count": frame_count,
+        "event_count": sum(1 for unit in units if unit.category != "parked"),
+        "tracks": tracks,
+        "excluded": excluded,
+        "parked_links": [
+            {
+                "person_id": link.person_id,
+                "vehicle_id": link.vehicle_id,
+                "kind": link.kind,
+                "time": link.ts,
+            }
+            for link in links
+        ],
+        "categories": [
+            {
+                "key": category,
+                "name": CAT_NAME[category],
+                "color": bgr_hex(CAT_COLOR[category]),
+                "count": counts[category],
+            }
+            for category in CAT_ORDER
+        ],
+    }
+
+
+def sample_times(start: float, end: float, count: int) -> list[float]:
+    """Timestamps spread across a clip, matching frames ffmpeg returns in order."""
+    if count <= 0:
+        return []
+    span = max(0.001, end - start)
+    return [start + span * (index + 0.5) / count for index in range(count)]
+
+
+def plate_timestamps(after: float, before: float, count: int = 16) -> list[float]:
+    if before <= after:
+        return [after]
+    return [float(item) for item in np.linspace(after, before, count)]

@@ -51,6 +51,7 @@ from .camera.notification import NotificationConfig
 from .camera.objects import FilterConfig, ObjectConfig
 from .camera.record import RecordConfig
 from .camera.review import ReviewConfig
+from .recap import RecapConfig
 from .camera.snapshots import SnapshotsConfig
 from .camera.timestamp import TimestampStyleConfig
 from .camera_group import CameraGroupConfig
@@ -381,6 +382,9 @@ class FrigateConfig(FrigateBaseModel):
     review: ReviewConfig = Field(
         default_factory=ReviewConfig, title="Review configuration."
     )
+    recap: RecapConfig = Field(
+        default_factory=RecapConfig, title="Video synopsis (recap) configuration."
+    )
     snapshots: SnapshotsConfig = Field(
         default_factory=SnapshotsConfig, title="Global snapshots configuration."
     )
@@ -455,6 +459,7 @@ class FrigateConfig(FrigateBaseModel):
                 "live": ...,
                 "objects": ...,
                 "review": ...,
+                "recap": ...,
                 "motion": ...,
                 "notifications": ...,
                 "detect": ...,
@@ -608,6 +613,7 @@ class FrigateConfig(FrigateBaseModel):
             camera_config.review.genai.enabled_in_config = (
                 camera_config.review.genai.enabled
             )
+            camera_config.recap.enabled_in_config = camera_config.recap.enabled
 
             # Add default filters
             object_keys = camera_config.objects.track

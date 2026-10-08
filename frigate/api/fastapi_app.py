@@ -22,6 +22,7 @@ from frigate.api import (
     media,
     notification,
     preview,
+    recap,
     review,
 )
 from frigate.api.auth import get_jwt_secret, limiter, require_admin_by_default
@@ -32,6 +33,7 @@ from frigate.config import FrigateConfig
 from frigate.config.camera.updater import CameraConfigUpdatePublisher
 from frigate.embeddings import EmbeddingsContext
 from frigate.ptz.onvif import OnvifController
+from frigate.recap.manager import RecapManager
 from frigate.stats.emitter import StatsEmitter
 from frigate.storage import StorageMaintainer
 
@@ -62,6 +64,7 @@ def create_fastapi_app(
     stats_emitter: StatsEmitter,
     event_metadata_updater: EventMetadataPublisher,
     config_publisher: CameraConfigUpdatePublisher,
+    recap_manager: Optional[RecapManager] = None,
     enforce_default_admin: bool = True,
 ):
     logger.info("Starting FastAPI app")
@@ -126,6 +129,7 @@ def create_fastapi_app(
     app.include_router(preview.router)
     app.include_router(notification.router)
     app.include_router(export.router)
+    app.include_router(recap.router)
     app.include_router(event.router)
     app.include_router(media.router)
     # App Properties
@@ -138,6 +142,7 @@ def create_fastapi_app(
     app.stats_emitter = stats_emitter
     app.event_metadata_updater = event_metadata_updater
     app.config_publisher = config_publisher
+    app.recap_manager = recap_manager
 
     if frigate_config.auth.enabled:
         secret = get_jwt_secret()

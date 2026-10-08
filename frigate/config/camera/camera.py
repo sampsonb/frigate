@@ -36,6 +36,7 @@ from .objects import ObjectConfig
 from .onvif import OnvifConfig
 from .record import RecordConfig
 from .review import ReviewConfig
+from ..recap import RecapConfig
 from .snapshots import SnapshotsConfig
 from .timestamp import TimestampStyleConfig
 from .ui import CameraUiConfig
@@ -98,6 +99,9 @@ class CameraConfig(FrigateBaseModel):
     )
     review: ReviewConfig = Field(
         default_factory=ReviewConfig, title="Review configuration."
+    )
+    recap: RecapConfig = Field(
+        default_factory=RecapConfig, title="Video synopsis (recap) configuration."
     )
     semantic_search: CameraSemanticSearchConfig = Field(
         default_factory=CameraSemanticSearchConfig,

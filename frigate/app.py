@@ -37,6 +37,7 @@ from frigate.const import (
     EXPORT_DIR,
     FACE_DIR,
     MODEL_CACHE_DIR,
+    RECAP_DIR,
     RECORD_DIR,
     THUMB_DIR,
     TRIGGER_DIR,
@@ -64,6 +65,7 @@ from frigate.object_detection.base import ObjectDetectProcess
 from frigate.output.output import OutputProcess
 from frigate.ptz.autotrack import PtzAutoTrackerThread
 from frigate.ptz.onvif import OnvifController
+from frigate.recap.manager import RecapMaintainer, RecapManager
 from frigate.record.cleanup import RecordingCleanup
 from frigate.record.export import migrate_exports
 from frigate.record.record import RecordProcess
@@ -113,6 +115,8 @@ class FrigateApp:
         self.ptz_metrics: dict[str, PTZMetrics] = {}
         self.processes: dict[str, int] = {}
         self.embeddings: Optional[EmbeddingsContext] = None
+        self.recap_manager: RecapManager | None = None
+        self.recap_maintainer: RecapMaintainer | None = None
         self.config = config
 
     def ensure_dirs(self) -> None:
@@ -124,6 +128,7 @@ class FrigateApp:
             CACHE_DIR,
             MODEL_CACHE_DIR,
             EXPORT_DIR,
+            RECAP_DIR,
         ]
 
         if self.config.face_recognition.enabled:
@@ -545,6 +550,11 @@ class FrigateApp:
         self.start_detectors()
         self.init_dispatcher()
         self.init_embeddings_client()
+        self.recap_manager = RecapManager(self.config, self.embeddings)
+        self.recap_maintainer = RecapMaintainer(
+            self.config, self.stop_event, self.recap_manager
+        )
+        self.recap_maintainer.start()
         self.start_video_output_processor()
         self.start_ptz_autotracker()
         self.start_detected_frames_processor()
@@ -572,6 +582,7 @@ class FrigateApp:
                     self.stats_emitter,
                     self.event_metadata_updater,
                     self.inter_config_updater,
+                    recap_manager=self.recap_manager,
                 ),
                 host="127.0.0.1",
                 port=5001,
@@ -587,6 +598,11 @@ class FrigateApp:
         Path("/dev/shm/.frigate-is-stopping").touch()
 
         self.stop_event.set()
+
+        if self.recap_manager is not None:
+            self.recap_manager.shutdown()
+        if self.recap_maintainer is not None:
+            self.recap_maintainer.join(timeout=5)
 
         # set an end_time on entries without an end_time before exiting
         Event.update(
