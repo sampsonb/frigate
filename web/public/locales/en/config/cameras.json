@@ -525,6 +525,10 @@
         "retain_days": {
           "label": "Days to keep generated recaps. 0 keeps them until deleted."
         },
+        "replace_superseded": {
+          "label": "Replace an older recap of the same kind when a new one is ready.",
+          "description": "On-demand recaps group by window length, such as last 6 hours. Nightly and backfill recaps group by the calendar day in ui.timezone. Running, failed, and archive copies are kept."
+        },
         "output_fps": {
           "label": "Frame rate of the synopsis video."
         },

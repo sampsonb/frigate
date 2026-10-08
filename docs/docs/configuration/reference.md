@@ -826,6 +826,11 @@ recap:
   fade_seconds: 0.35
   # Optional: Days to keep generated recaps. 0 keeps them until deleted (default: shown below)
   retain_days: 14
+  # Optional: Delete older completed recaps of the same camera and kind once
+  # a new one is Ready (default: shown below). On-demand kinds are the window
+  # length. Nightly and backfill kinds are the calendar day in ui.timezone.
+  # Running, failed, and archive copies are kept.
+  replace_superseded: True
   # Optional: External archive. Leave unset to disable.
   # The path is a mount with Frigate's media layout. The url is an HTTP base.
   # archive:

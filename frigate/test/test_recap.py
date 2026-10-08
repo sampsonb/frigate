@@ -54,7 +54,7 @@ from frigate.recap.render import (
     compose_frame,
     leader_without_ghost,
 )
-from frigate.recap.storage import list_visible_recaps
+from frigate.recap.storage import list_visible_recaps, recap_kind, remove_superseded
 
 
 def _recap_config():
@@ -119,6 +119,8 @@ class TestRecapLabels(unittest.TestCase):
         RecapConfig = _recap_config()
         config = RecapConfig()
         self.assertFalse(config.enabled)
+        self.assertTrue(config.replace_superseded)
+        self.assertFalse(RecapConfig(replace_superseded=False).replace_superseded)
         self.assertIsNone(config.archive.path)
         self.assertIsNone(config.archive.url)
         self.assertIsNone(RecapConfig(schedule="").schedule)
@@ -1246,6 +1248,225 @@ class TestClipPlayback(unittest.TestCase):
             }
             self.assertTrue(headers["content-type"].startswith("video/mp4"))
             self.assertTrue(headers["content-range"].startswith("bytes 0-7/"))
+
+
+def _write_recap(root: Path, camera: str, recap_id: str, **fields) -> None:
+    folder = root / camera / recap_id
+    folder.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": recap_id,
+        "camera": camera,
+        "status": "complete",
+        "message": "Ready",
+        "created": 1,
+        "after": 0.0,
+        "before": 3600.0,
+        "reason": "manual",
+    }
+    payload.update(fields)
+    (folder / "manifest.json").write_text(json.dumps(payload))
+
+
+class TestSupersededRecaps(unittest.TestCase):
+    def test_on_demand_kind_is_window_length(self):
+        zone = ZoneInfo("America/New_York")
+        self.assertEqual(recap_kind("manual", 0, 3600, zone), "last-1h")
+        self.assertEqual(recap_kind("manual", 0, 6 * 3600, zone), "last-6h")
+        self.assertEqual(recap_kind("manual", 0, 12 * 3600, zone), "last-12h")
+        self.assertEqual(recap_kind("manual", 0, 24 * 3600, zone), "last-24h")
+        self.assertEqual(recap_kind("", 0, 24 * 3600, zone), "last-24h")
+        self.assertEqual(recap_kind("manual", 0, 3600 + 30, zone), "last-1h")
+        self.assertEqual(recap_kind("manual", 0, 3600 + 90, zone), "last-1h")
+        self.assertEqual(recap_kind("manual", 0, 3600 + 91, zone), "last-62m")
+        self.assertEqual(recap_kind("manual", 0, 90 * 60, zone), "last-90m")
+
+    def test_nightly_kind_uses_the_ui_timezone_date(self):
+        zone = ZoneInfo("America/New_York")
+        # 03:00 UTC is still the previous evening in New York.
+        before = datetime(2026, 10, 8, 3, 0, tzinfo=timezone.utc).timestamp()
+        after = before - 24 * 3600
+        self.assertEqual(recap_kind("schedule", after, before, zone), "day:2026-10-07")
+        self.assertEqual(recap_kind("backfill", after, before, zone), "day:2026-10-07")
+        self.assertEqual(recap_kind("manual", after, before, zone), "last-24h")
+
+    def test_ready_recap_replaces_older_completed_duplicates_only(self):
+        zone = ZoneInfo("UTC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local"
+            archive = Path(tmp) / "archive"
+            root.mkdir()
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(root, "front", "front_new", created=20, kind="last-1h")
+                _write_recap(root, "front", "front_old", created=10)
+                _write_recap(root, "front", "front_same_time", created=20)
+                _write_recap(root, "front", "front_newer", created=30, kind="last-1h")
+                _write_recap(root, "front", "front_six", created=5, before=6 * 3600)
+                _write_recap(root, "door", "door_old", created=5, kind="last-1h")
+                _write_recap(
+                    root,
+                    "front",
+                    "front_failed",
+                    created=5,
+                    status="failed",
+                    message="Recap failed. Check the Frigate logs",
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_running",
+                    created=5,
+                    status="running",
+                    message="Building a background",
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_archived",
+                    created=5,
+                    source="archive",
+                    kind="last-1h",
+                )
+                archive_copy = archive / "recap" / "front" / "front_archive_copy"
+                _write_recap(
+                    archive / "recap",
+                    "front",
+                    "front_archive_copy",
+                    created=5,
+                    kind="last-1h",
+                )
+                with self.assertLogs("frigate.recap.storage", level="INFO") as logs:
+                    removed = remove_superseded("front", "front_new", zone)
+                self.assertCountEqual(removed, ["front_old", "front_same_time"])
+                kept = {
+                    "front_new",
+                    "front_newer",
+                    "front_six",
+                    "door_old",
+                    "front_failed",
+                    "front_running",
+                    "front_archived",
+                }
+                for recap_id in kept:
+                    camera = "door" if recap_id.startswith("door") else "front"
+                    self.assertTrue(
+                        (root / camera / recap_id / "manifest.json").is_file(),
+                        recap_id,
+                    )
+                self.assertFalse((root / "front" / "front_old").exists())
+                self.assertFalse((root / "front" / "front_same_time").exists())
+                self.assertTrue(
+                    (archive_copy / "manifest.json").is_file(),
+                )
+                text = "\n".join(logs.output)
+                self.assertIn(
+                    "Removed superseded recap front_old for front (last-1h)", text
+                )
+                self.assertIn(
+                    "Removed superseded recap front_same_time for front (last-1h)",
+                    text,
+                )
+
+    def test_nothing_is_deleted_before_the_new_recap_is_ready(self):
+        zone = ZoneInfo("UTC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(
+                    root,
+                    "front",
+                    "front_new",
+                    created=20,
+                    status="running",
+                    message="Looking up events",
+                )
+                _write_recap(root, "front", "front_old", created=10)
+                self.assertEqual(remove_superseded("front", "front_new", zone), [])
+                self.assertTrue(
+                    (root / "front" / "front_old" / "manifest.json").is_file()
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_new",
+                    created=20,
+                    status="complete",
+                    message="Finishing",
+                )
+                self.assertEqual(remove_superseded("front", "front_new", zone), [])
+                self.assertTrue(
+                    (root / "front" / "front_old" / "manifest.json").is_file()
+                )
+
+    def test_flag_off_keeps_duplicates(self):
+        zone = ZoneInfo("UTC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(root, "front", "front_new", created=20, kind="last-1h")
+                _write_recap(root, "front", "front_old", created=10, kind="last-1h")
+                removed = remove_superseded("front", "front_new", zone, enabled=False)
+                self.assertEqual(removed, [])
+                self.assertTrue(
+                    (root / "front" / "front_old" / "manifest.json").is_file()
+                )
+
+    def test_nightly_replaces_the_same_local_day_only(self):
+        zone = ZoneInfo("America/New_York")
+        same = datetime(2026, 10, 8, 3, 0, tzinfo=timezone.utc).timestamp()
+        previous = datetime(2026, 10, 7, 3, 0, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(
+                    root,
+                    "front",
+                    "front_new",
+                    created=50,
+                    reason="schedule",
+                    after=same - 24 * 3600,
+                    before=same,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_same_day",
+                    created=10,
+                    reason="backfill",
+                    after=same - 24 * 3600,
+                    before=same,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_previous_day",
+                    created=5,
+                    reason="schedule",
+                    after=previous - 24 * 3600,
+                    before=previous,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_manual_day",
+                    created=8,
+                    reason="manual",
+                    after=same - 24 * 3600,
+                    before=same,
+                )
+                with self.assertLogs("frigate.recap.storage", level="INFO") as logs:
+                    removed = remove_superseded("front", "front_new", zone)
+                self.assertEqual(removed, ["front_same_day"])
+                self.assertFalse((root / "front" / "front_same_day").exists())
+                self.assertTrue(
+                    (root / "front" / "front_previous_day" / "manifest.json").is_file()
+                )
+                self.assertTrue(
+                    (root / "front" / "front_manual_day" / "manifest.json").is_file()
+                )
+                self.assertTrue(
+                    (root / "front" / "front_new" / "manifest.json").is_file()
+                )
+                self.assertIn("day:2026-10-07", "\n".join(logs.output))
 
 
 if __name__ == "__main__":

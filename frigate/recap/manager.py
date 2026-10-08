@@ -46,6 +46,8 @@ from frigate.recap.storage import (
     ensure_tree,
     purge_expired,
     read_manifest,
+    recap_kind,
+    remove_superseded,
     update_manifest,
     write_manifest,
 )
@@ -128,6 +130,7 @@ class RecapManager:
             "after": after,
             "before": before,
             "reason": reason,
+            "kind": recap_kind(reason, after, before, resolve_zone(self.config)),
             "tracks": [],
             "event_count": 0,
         }
@@ -320,6 +323,16 @@ class RecapJob(threading.Thread):
         current["status"] = "complete"
         current["progress"] = 100
         current["message"] = "Ready"
+        # Set again after generate_recap's body is merged so the kind
+        # used for replacement is the finished window, not a stale value.
+        current["kind"] = recap_kind(
+            str(current.get("reason") or "manual"),
+            float(current["after"] if current.get("after") is not None else self.after),
+            float(
+                current["before"] if current.get("before") is not None else self.before
+            ),
+            resolve_zone(config),
+        )
         write_manifest(self.directory, current)
         logger.info(
             "Recap %s ready, %s objects, %ss",
@@ -327,6 +340,16 @@ class RecapJob(threading.Thread):
             current.get("event_count"),
             current.get("seconds"),
         )
+        # A deletion error must not flip a Ready recap to failed.
+        try:
+            remove_superseded(
+                self.camera,
+                self.recap_id,
+                resolve_zone(config),
+                enabled=self.settings.replace_superseded,
+            )
+        except Exception:
+            logger.exception("Could not remove superseded recaps for %s", self.recap_id)
 
     def _semantic(self, events: list[dict[str, Any]]) -> tuple[set[str], set[str]]:
         if not self.settings.delivery_search:

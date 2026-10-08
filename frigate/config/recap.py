@@ -156,6 +156,15 @@ class RecapConfig(FrigateBaseModel):
         title="Days to keep generated recaps. 0 keeps them until deleted.",
         ge=0,
     )
+    replace_superseded: bool = Field(
+        default=True,
+        title="Replace an older recap of the same kind when a new one is ready.",
+        description=(
+            "On-demand recaps group by window length, such as last 6 hours. "
+            "Nightly and backfill recaps group by the calendar day in "
+            "ui.timezone. Running, failed, and archive copies are kept."
+        ),
+    )
     output_fps: int = Field(
         default=12,
         title="Frame rate of the synopsis video.",

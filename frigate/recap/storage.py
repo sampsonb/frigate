@@ -8,13 +8,20 @@ rewritten in place as a job moves from queued to complete.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from frigate.const import RECAP_DIR
+
+logger = logging.getLogger(__name__)
+
+# A Last 1 hour button and a custom range a few seconds off still match.
+_HOUR_SLACK_SECONDS = 90
 
 MANIFEST = "manifest.json"
 VIDEO = "video.mp4"
@@ -163,6 +170,8 @@ def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
         "width": manifest.get("width"),
         "height": manifest.get("height"),
         "reason": manifest.get("reason") or "",
+        "kind": manifest.get("kind") or "",
+        "source": manifest.get("source") or "",
         "categories": summary_categories(manifest.get("categories")),
     }
 
@@ -218,4 +227,96 @@ def purge_expired(retain_days_for: dict[str, int], now: float | None = None) -> 
         recap_id = str(summary.get("id") or "")
         if safe_id(camera) and safe_id(recap_id) and delete_recap(camera, recap_id):
             removed += 1
+    return removed
+
+
+def recap_kind(reason: str, after: float, before: float, zone) -> str:
+    """Group key for duplicate recaps of one camera.
+
+    On-demand recaps group by window length (``last-6h``, ``last-90m``).
+    Nightly and backfill recaps group by the calendar day of the window
+    end in the UI timezone, not by how many hours the window covers.
+    """
+    if reason in {"schedule", "backfill"}:
+        end = datetime.fromtimestamp(float(before), tz=zone)
+        return f"day:{end.date().isoformat()}"
+    span = max(0.0, float(before) - float(after))
+    nearest_hour = int(round(span / 3600))
+    if nearest_hour >= 1 and abs(span - nearest_hour * 3600) <= _HOUR_SLACK_SECONDS:
+        return f"last-{nearest_hour}h"
+    minutes = max(1, int(round(span / 60)))
+    return f"last-{minutes}m"
+
+
+def kind_of(manifest: dict[str, Any], zone) -> str:
+    """Stored kind, or the kind implied by reason and the window."""
+    stored = str(manifest.get("kind") or "")
+    if stored:
+        return stored
+    return recap_kind(
+        str(manifest.get("reason") or ""),
+        float(manifest.get("after") or 0),
+        float(manifest.get("before") or 0),
+        zone,
+    )
+
+
+def remove_superseded(
+    camera: str,
+    recap_id: str,
+    zone,
+    *,
+    enabled: bool = True,
+) -> list[str]:
+    """Delete older completed local recaps of the same camera and kind.
+
+    No-op unless the new recap is already complete and Ready. Running,
+    failed, queued, cancelled, and archive-sourced recaps are kept, and
+    the recap that just finished is never deleted.
+    """
+    if not enabled:
+        return []
+    found = find_manifest(recap_id)
+    if found is None:
+        return []
+    directory, manifest = found
+    try:
+        directory.resolve().relative_to(recap_root().resolve())
+    except ValueError:
+        return []
+    if manifest.get("status") != "complete" or manifest.get("message") != "Ready":
+        return []
+    if str(manifest.get("source") or "") == "archive":
+        return []
+    kind = kind_of(manifest, zone)
+    created = float(manifest.get("created") or 0)
+    camera_name = str(manifest.get("camera") or camera)
+    if not safe_id(camera_name):
+        return []
+    removed: list[str] = []
+    for summary in list_recaps():
+        other_id = str(summary.get("id") or "")
+        if not other_id or other_id == recap_id:
+            continue
+        if str(summary.get("camera") or "") != camera_name:
+            continue
+        if summary.get("status") != "complete":
+            continue
+        if str(summary.get("source") or "") == "archive":
+            continue
+        if float(summary.get("created") or 0) > created:
+            continue
+        if kind_of(summary, zone) != kind:
+            continue
+        if not safe_id(other_id):
+            continue
+        if not delete_recap(camera_name, other_id):
+            continue
+        logger.info(
+            "Removed superseded recap %s for %s (%s)",
+            other_id,
+            camera_name,
+            kind,
+        )
+        removed.append(other_id)
     return removed
