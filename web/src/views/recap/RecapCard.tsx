@@ -1,5 +1,6 @@
 import { baseUrl } from "@/api/baseUrl";
 import { Button } from "@/components/ui/button";
+import { useCameraFriendlyName } from "@/hooks/use-camera-friendly-name";
 import { cn } from "@/lib/utils";
 import { RecapCategory, RecapSummary } from "@/types/recap";
 import { useState } from "react";
@@ -46,6 +47,7 @@ export default function RecapCard({
   onDelete,
 }: RecapCardProps) {
   const { t } = useTranslation(["views/recap", "common"]);
+  const cameraName = useCameraFriendlyName(item.camera);
   const [thumbFailed, setThumbFailed] = useState(false);
   const busy = item.status === "queued" || item.status === "running";
   const nightly = item.reason === "schedule";
@@ -86,7 +88,7 @@ export default function RecapCard({
             <span className="flex size-full items-center justify-center px-2 text-center text-xs text-muted-foreground">
               {busy
                 ? `${item.message || item.status} (${item.progress ?? 0}%)`
-                : item.camera}
+                : cameraName}
             </span>
           )}
           {item.source === "archive" && (
@@ -110,11 +112,11 @@ export default function RecapCard({
         </span>
         <span className="flex flex-col gap-0.5 p-2">
           <span className="truncate text-sm font-medium">
-            {day || item.camera}
+            {day || cameraName}
           </span>
           {day && (
             <span className="truncate text-[11px] text-muted-foreground">
-              {item.camera}
+              {cameraName}
             </span>
           )}
           <span className="truncate text-[11px] text-muted-foreground">

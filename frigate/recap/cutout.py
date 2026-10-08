@@ -16,6 +16,13 @@ import numpy as np
 
 from frigate.recap.layout import MotionTrack
 
+# Vehicle masks wider than this are computed on a smaller image and scaled
+# back. A distant car stays at full resolution so its few pixels are not lost.
+_MASK_LONG_SIDE = 160
+# Median plate samples. More frames do not make a cleaner plate once the
+# object has moved, and each extra frame is a full-resolution partition.
+_PLATE_SAMPLES = 9
+
 
 def clean_background(
     frames: list[np.ndarray],
@@ -30,7 +37,7 @@ def clean_background(
     if not frames:
         raise ValueError("clean_background requires at least one frame")
     height, width = frames[0].shape[:2]
-    chosen = np.linspace(0, len(frames) - 1, min(len(frames), 25)).round().astype(int)
+    chosen = np.linspace(0, len(frames) - 1, min(len(frames), _PLATE_SAMPLES)).round().astype(int)
     stack = np.stack([frames[index] for index in chosen]).astype(np.float32)
     exclude = np.zeros((len(chosen), height, width), dtype=bool)
     for sample, index in enumerate(chosen):
@@ -50,8 +57,12 @@ def clean_background(
         if y1 > y0 and x1 > x0:
             exclude[sample, y0:y1, x0:x1] = True
     background = np.median(stack, axis=0)
-    covered = exclude.mean(axis=0)
-    redo = covered > 0.34
+    # Pixels the object covers in every sample have no clean color. The
+    # plain median already includes them, and a nan-median over that region
+    # is the slow part of a parked or slow car.
+    excluded_count = exclude.sum(axis=0)
+    samples = exclude.shape[0]
+    redo = (excluded_count > 0.34 * samples) & (excluded_count < samples)
     if redo.any():
         ys, xs = np.nonzero(redo)
         values = np.array(stack[:, ys, xs], copy=True)
@@ -74,6 +85,13 @@ def clean_background(
 def _motion(crop: np.ndarray, background: np.ndarray, thresh: int) -> np.ndarray:
     """Foreground against the plate, with cast shadows removed."""
     diff = cv2.absdiff(crop, background).max(axis=2)
+    return _foreground(crop, background, diff, thresh)
+
+
+def _foreground(
+    crop: np.ndarray, background: np.ndarray, diff: np.ndarray, thresh: int
+) -> np.ndarray:
+    """Foreground from a difference image, with cast shadows removed."""
     foreground = diff > thresh
     current = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).astype(np.int16)
     plate = cv2.cvtColor(background, cv2.COLOR_BGR2HSV).astype(np.int16)
@@ -164,9 +182,16 @@ def attach_motion(
     crop = frame[y0:y1, x0:x1]
     plate = background[y0:y1, x0:x1]
     local = (box[0] - x0, box[1] - y0, box[2] - x0, box[3] - y0)
-    core = _seed(crop.shape[:2], local, category)
-    thresh = _object_threshold(crop, plate, core, category, fg_thresh)
-    motion = _motion(crop, plate, thresh)
+    work_crop, work_plate, work_box = crop, plate, local
+    if category == "vehicle":
+        work_crop, work_plate, work_box = _vehicle_view(crop, plate, local)
+    core = _seed(work_crop.shape[:2], work_box, category)
+    if category == "vehicle":
+        diff = cv2.absdiff(work_crop, work_plate).max(axis=2)
+        thresh = _object_threshold(diff, core, category, fg_thresh)
+        motion = _foreground(work_crop, work_plate, diff, thresh)
+    else:
+        motion = _motion(work_crop, work_plate, fg_thresh)
     seed = cv2.dilate(core, np.ones((7, 7), np.uint8))
     _count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(
         (motion > 0).astype(np.uint8), connectivity=8
@@ -209,12 +234,41 @@ def attach_motion(
             1,
             -1,
         )
+    if mask.shape[:2] != crop.shape[:2]:
+        mask = cv2.resize(
+            mask,
+            (crop.shape[1], crop.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
     return x0, y0, mask
 
 
-def _object_threshold(
+def _vehicle_view(
     crop: np.ndarray,
     plate: np.ndarray,
+    box: tuple[float, float, float, float],
+) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]]:
+    """Shrink a large vehicle window. Small windows are returned unchanged."""
+    height, width = crop.shape[:2]
+    longest = max(height, width)
+    if longest <= _MASK_LONG_SIDE or height < 8 or width < 8:
+        return crop, plate, box
+    scale = _MASK_LONG_SIDE / longest
+    work_w = max(8, int(round(width * scale)))
+    work_h = max(8, int(round(height * scale)))
+    small_crop = cv2.resize(crop, (work_w, work_h), interpolation=cv2.INTER_AREA)
+    small_plate = cv2.resize(plate, (work_w, work_h), interpolation=cv2.INTER_AREA)
+    fitted = (
+        box[0] * work_w / width,
+        box[1] * work_h / height,
+        box[2] * work_w / width,
+        box[3] * work_h / height,
+    )
+    return small_crop, small_plate, fitted
+
+
+def _object_threshold(
+    diff: np.ndarray,
     core: np.ndarray,
     category: str,
     requested: int,
@@ -227,12 +281,24 @@ def _object_threshold(
     """
     if category != "vehicle":
         return requested
-    diff = cv2.absdiff(crop, plate).max(axis=2)
     values = diff[core > 0]
     if values.size == 0:
         return min(requested, 11)
     level = float(np.percentile(values, 65))
     return int(np.clip(level * 0.5, 7, 24))
+
+
+def _outline_worth_tracing(mask: np.ndarray) -> bool:
+    """Skip the contour fill when the car is only a few dozen pixels.
+
+    The detector seed is already a solid block at that size. Tracing every
+    distant car is most of the extra cost and does not change the ghost.
+    """
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 6:
+        return False
+    span = min(int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
+    return span >= 48
 
 
 def _trace_outline(mask: np.ndarray) -> np.ndarray:
@@ -320,9 +386,17 @@ def _object_is_visible(
     ys, xs = np.nonzero(mask)
     if len(xs) < 8:
         return False
-    diff = cv2.absdiff(frame, background).max(axis=2)
-    fy = np.clip(ys + origin_y, 0, diff.shape[0] - 1)
-    fx = np.clip(xs + origin_x, 0, diff.shape[1] - 1)
+    # Only the mask's box needs a difference image. A full-frame absdiff
+    # repeats the same pixels for every sample of a long track.
+    y0 = max(0, origin_y + int(ys.min()))
+    x0 = max(0, origin_x + int(xs.min()))
+    y1 = min(frame.shape[0], origin_y + int(ys.max()) + 1)
+    x1 = min(frame.shape[1], origin_x + int(xs.max()) + 1)
+    if y1 <= y0 or x1 <= x0:
+        return False
+    diff = cv2.absdiff(frame[y0:y1, x0:x1], background[y0:y1, x0:x1]).max(axis=2)
+    fy = np.clip(ys + origin_y - y0, 0, diff.shape[0] - 1)
+    fx = np.clip(xs + origin_x - x0, 0, diff.shape[1] - 1)
     return float(np.median(diff[fy, fx])) >= 8
 
 
@@ -381,7 +455,7 @@ def _feather_piece(
     a ring of edges, and the body would otherwise drop out.
     """
     height, width = frame.shape[:2]
-    if category == "vehicle":
+    if category == "vehicle" and _outline_worth_tracing(mask):
         mask = _trace_outline(mask)
     ys, xs = np.nonzero(mask)
     if len(xs) < 6:
@@ -503,6 +577,100 @@ def _blank_ghost(box: tuple[float, float, float, float]) -> dict[str, object]:
     }
 
 
+def _boxes_are_stable(
+    previous: tuple[float, float, float, float],
+    current: tuple[float, float, float, float],
+) -> bool:
+    """True when the detector box barely moved or changed size.
+
+    A parked car or a slow creep does not need a new mask every sample.
+    """
+    previous_w = previous[2] - previous[0]
+    previous_h = previous[3] - previous[1]
+    current_w = current[2] - current[0]
+    current_h = current[3] - current[1]
+    if min(previous_w, previous_h, current_w, current_h) < 1:
+        return False
+    if abs(current_w - previous_w) > 0.08 * previous_w:
+        return False
+    if abs(current_h - previous_h) > 0.08 * previous_h:
+        return False
+    limit = max(3.0, 0.04 * max(previous_w, previous_h))
+    dx = (current[0] + current[2]) / 2 - (previous[0] + previous[2]) / 2
+    dy = (current[1] + current[3]) / 2 - (previous[1] + previous[3]) / 2
+    return abs(dx) <= limit and abs(dy) <= limit
+
+
+def _shift_piece(
+    piece: tuple[int, int, np.ndarray],
+    source: tuple[float, float, float, float],
+    dest: tuple[float, float, float, float],
+) -> tuple[int, int, np.ndarray]:
+    """Move a mask with the box. The array itself is shared."""
+    x, y, mask = piece
+    dx = int(round((dest[0] + dest[2]) / 2 - (source[0] + source[2]) / 2))
+    dy = int(round((dest[1] + dest[3]) / 2 - (source[1] + source[3]) / 2))
+    return x + dx, y + dy, mask
+
+
+def _reuse_ghost(
+    cached: dict[str, object],
+    source: tuple[float, float, float, float],
+    dest: tuple[float, float, float, float],
+    width: int,
+    height: int,
+) -> dict[str, object] | None:
+    """Shift a finished ghost with a box that barely moved.
+
+    Feathering and the outline trace already ran for the source frame.
+    Repeating them on the same car is the slow part of a long track.
+    """
+    crop = cached["crop"]
+    alpha = cached["alpha"]
+    assert isinstance(crop, np.ndarray)
+    assert isinstance(alpha, np.ndarray)
+    dx = int(round((dest[0] + dest[2]) / 2 - (source[0] + source[2]) / 2))
+    dy = int(round((dest[1] + dest[3]) / 2 - (source[1] + source[3]) / 2))
+    x = int(cached["x"]) + dx  # type: ignore[arg-type]
+    y = int(cached["y"]) + dy  # type: ignore[arg-type]
+    moved: dict[str, object] = {
+        "x": x,
+        "y": y,
+        "crop": crop,
+        "alpha": alpha,
+        "box": (float(dest[0]), float(dest[1]), float(dest[2]), float(dest[3])),
+    }
+    if x >= 0 and y >= 0 and x + crop.shape[1] <= width and y + crop.shape[0] <= height:
+        return moved
+    return _clip_ghost(moved, width, height)
+
+
+def _motion_pieces(
+    frames: list[np.ndarray],
+    boxes: list[tuple[float, float, float, float]],
+    background: np.ndarray,
+    category: str,
+    fg_thresh: int,
+) -> list[tuple[int, int, np.ndarray]]:
+    """One mask per frame. Stable boxes reuse the last measured mask."""
+    pieces: list[tuple[int, int, np.ndarray]] = []
+    source_piece: tuple[int, int, np.ndarray] | None = None
+    source_box: tuple[float, float, float, float] | None = None
+    for frame, box in zip(frames, boxes, strict=True):
+        if (
+            source_piece is not None
+            and source_box is not None
+            and _boxes_are_stable(source_box, box)
+        ):
+            pieces.append(_shift_piece(source_piece, source_box, box))
+            continue
+        piece = attach_motion(frame, background, box, category, fg_thresh)
+        pieces.append(piece)
+        source_piece = piece
+        source_box = box
+    return pieces
+
+
 def build_cutouts(
     frames: list[np.ndarray],
     boxes: list[tuple[float, float, float, float]],
@@ -521,10 +689,7 @@ def build_cutouts(
         return None
     background = clean_background(frames, boxes, category)
     height, width = background.shape[:2]
-    pieces = [
-        attach_motion(frame, background, box, category, fg_thresh)
-        for frame, box in zip(frames, boxes, strict=True)
-    ]
+    pieces = _motion_pieces(frames, boxes, background, category, fg_thresh)
     areas = np.array([int(piece[2].sum()) for piece in pieces], np.float32)
     bad = [
         bool(area < 8) or not _object_is_visible(frame, background, piece)
@@ -597,7 +762,18 @@ def build_cutouts(
         return _clip_ghost(blended, width, height)
 
     ghosts: list[dict[str, object]] = []
+    cached: dict[str, object] | None = None
+    cached_box: tuple[float, float, float, float] | None = None
     for index, (frame, box) in enumerate(zip(frames, boxes, strict=True)):
+        if (
+            cached is not None
+            and cached_box is not None
+            and _boxes_are_stable(cached_box, box)
+        ):
+            reused = _reuse_ghost(cached, cached_box, box, width, height)
+            if reused is not None:
+                ghosts.append(reused)
+                continue
         ghost: dict[str, object] | None = None
         if not bad[index]:
             sources: list[tuple[tuple[int, int, np.ndarray], float]] = [
@@ -616,6 +792,8 @@ def build_cutouts(
             ghost = _soft_box(frame, box)
         if ghost is None:
             ghost = _blank_ghost(box)
+        cached = ghost
+        cached_box = box
         ghosts.append(ghost)
     return ghosts
 

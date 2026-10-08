@@ -1,5 +1,6 @@
 import { baseUrl } from "@/api/baseUrl";
 import { Toaster } from "@/components/ui/sonner";
+import { useCameraFriendlyName } from "@/hooks/use-camera-friendly-name";
 import { CameraConfig } from "@/types/frigateConfig";
 import { RecapSummary } from "@/types/recap";
 import axios from "axios";
@@ -82,62 +83,86 @@ export default function LiveRecapStrip({ cameras }: LiveRecapStripProps) {
           ? `/recap?camera=${encodeURIComponent(camera.name)}&id=${encodeURIComponent(latest.id)}`
           : `/recap?camera=${encodeURIComponent(camera.name)}`;
         return (
-          <div
+          <RecapStripCard
             key={camera.name}
-            className="flex w-[15.5rem] shrink-0 items-center gap-2 rounded-lg border border-secondary bg-background_alt p-1.5"
-          >
-            <button
-              type="button"
-              className="relative h-12 w-[4.5rem] shrink-0 overflow-hidden rounded-md bg-black"
-              aria-label={t("recapStrip.open", { camera: camera.name })}
-              onClick={() => navigate(href)}
-            >
-              {latest ? (
-                <img
-                  src={`${baseUrl}api/recap/${latest.id}/thumb.jpg`}
-                  alt=""
-                  className="size-full object-cover"
-                />
-              ) : (
-                <span className="flex size-full items-center justify-center text-muted-foreground">
-                  <LuClapperboard className="size-5" />
-                </span>
-              )}
-            </button>
-            <div className="min-w-0 flex-1">
-              <button
-                type="button"
-                className="block w-full truncate text-left text-xs font-medium"
-                onClick={() => navigate(href)}
-              >
-                {t("recapStrip.title")}
-                <span className="font-normal text-muted-foreground">
-                  {" "}
-                  · {camera.name}
-                </span>
-              </button>
-              {!latest && (
-                <div className="truncate text-[10px] text-muted-foreground">
-                  {t("recapStrip.none")}
-                </div>
-              )}
-              <div className="mt-1 flex gap-1">
-                {HOURS.map((hours) => (
-                  <button
-                    key={hours}
-                    type="button"
-                    className="rounded bg-secondary px-1.5 py-0.5 text-[10px] leading-tight text-secondary-foreground hover:bg-muted"
-                    aria-label={hourLabel(hours, false)}
-                    onClick={() => start(camera.name, hours)}
-                  >
-                    {hourLabel(hours, true)}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
+            camera={camera}
+            latest={latest}
+            onOpen={() => navigate(href)}
+            onStart={(hours) => start(camera.name, hours)}
+            hourLabel={hourLabel}
+          />
         );
       })}
+    </div>
+  );
+}
+
+function RecapStripCard({
+  camera,
+  latest,
+  onOpen,
+  onStart,
+  hourLabel,
+}: {
+  camera: CameraConfig;
+  latest?: RecapSummary;
+  onOpen: () => void;
+  onStart: (hours: number) => void;
+  hourLabel: (hours: number, short: boolean) => string;
+}) {
+  const { t } = useTranslation(["views/live"]);
+  const cameraName = useCameraFriendlyName(camera);
+  return (
+    <div className="flex w-[15.5rem] shrink-0 items-center gap-2 rounded-lg border border-secondary bg-background_alt p-1.5">
+      <button
+        type="button"
+        className="relative h-12 w-[4.5rem] shrink-0 overflow-hidden rounded-md bg-black"
+        aria-label={t("recapStrip.open", { camera: cameraName })}
+        onClick={onOpen}
+      >
+        {latest ? (
+          <img
+            src={`${baseUrl}api/recap/${latest.id}/thumb.jpg`}
+            alt=""
+            className="size-full object-cover"
+          />
+        ) : (
+          <span className="flex size-full items-center justify-center text-muted-foreground">
+            <LuClapperboard className="size-5" />
+          </span>
+        )}
+      </button>
+      <div className="min-w-0 flex-1">
+        <button
+          type="button"
+          className="block w-full truncate text-left text-xs font-medium"
+          onClick={onOpen}
+        >
+          {t("recapStrip.title")}
+          <span className="font-normal text-muted-foreground">
+            {" "}
+            · {cameraName}
+          </span>
+        </button>
+        {!latest && (
+          <div className="truncate text-[10px] text-muted-foreground">
+            {t("recapStrip.none")}
+          </div>
+        )}
+        <div className="mt-1 flex gap-1">
+          {HOURS.map((hours) => (
+            <button
+              key={hours}
+              type="button"
+              className="rounded bg-secondary px-1.5 py-0.5 text-[10px] leading-tight text-secondary-foreground hover:bg-muted"
+              aria-label={hourLabel(hours, false)}
+              onClick={() => onStart(hours)}
+            >
+              {hourLabel(hours, true)}
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

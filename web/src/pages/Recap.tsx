@@ -1,6 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Toaster } from "@/components/ui/sonner";
+import { resolveCameraName } from "@/hooks/use-camera-friendly-name";
 import { FrigateConfig } from "@/types/frigateConfig";
 import { RecapManifest, RecapSummary } from "@/types/recap";
 import RecapCard from "@/views/recap/RecapCard";
@@ -230,7 +231,7 @@ export default function Recap() {
             >
               {cameras.map((name) => (
                 <option key={name} value={name}>
-                  {name}
+                  {resolveCameraName(config, name)}
                 </option>
               ))}
             </select>

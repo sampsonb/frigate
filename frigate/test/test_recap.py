@@ -10,6 +10,7 @@ import types
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -416,6 +417,85 @@ class TestCutout(unittest.TestCase):
         frame[40:90, 60:140] = 80
         _x, _y, mask = attach_motion(frame, plate, (60.0, 40.0, 140.0, 90.0), "vehicle")
         self.assertGreater(int(mask.sum()), 20)
+
+    def test_stable_vehicle_measures_motion_once(self):
+        height, width = 120, 200
+        plate = np.full((height, width, 3), 90, np.uint8)
+        box = (40.0, 30.0, 120.0, 90.0)
+        frames = []
+        for _index in range(8):
+            frame = plate.copy()
+            frame[32:88, 42:118] = (0, 0, 210)
+            frames.append(frame)
+        with patch("frigate.recap.cutout.attach_motion", wraps=attach_motion) as spy:
+            ghosts = build_cutouts(frames, [box] * 8, "vehicle")
+        self.assertEqual(spy.call_count, 1)
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        self.assertEqual(len(ghosts), 8)
+        for ghost in ghosts:
+            alpha = np.asarray(ghost["alpha"])
+            crop = np.asarray(ghost["crop"])
+            strong = alpha > 40
+            self.assertGreater(int(strong.sum()), 10)
+            self.assertGreater(float(crop[strong][:, 2].mean()), 150)
+
+    def test_moving_vehicle_is_measured_on_each_frame(self):
+        height, width = 160, 320
+        plate = np.full((height, width, 3), 90, np.uint8)
+        frames = []
+        boxes = []
+        for index in range(4):
+            frame = plate.copy()
+            x = 20 + index * 40
+            frame[40:100, x : x + 50] = (0, 0, 210)
+            frames.append(frame)
+            boxes.append((float(x), 40.0, float(x + 50), 100.0))
+        with patch("frigate.recap.cutout.attach_motion", wraps=attach_motion) as spy:
+            ghosts = build_cutouts(frames, boxes, "vehicle")
+        self.assertEqual(spy.call_count, 4)
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        for ghost in ghosts:
+            self.assertGreater(int(np.asarray(ghost["alpha"]).sum()), 0)
+
+    def test_large_and_tiny_vehicles_stay_visible(self):
+        plate = np.full((360, 640, 3), (80, 80, 80), np.uint8)
+        frames = []
+        boxes = []
+        for index in range(4):
+            frame = plate.copy()
+            x = 40 + index * 20
+            frame[70:270, x : x + 360] = (20, 20, 200)
+            frame[20:36, 20:38] = (0, 0, 200)
+            frames.append(frame)
+            boxes.append((float(x), 70.0, float(x + 360), 270.0))
+        ghosts = build_cutouts(frames, boxes, "vehicle")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        sample = ghosts[1]
+        alpha = np.asarray(sample["alpha"])
+        crop = np.asarray(sample["crop"])
+        strong = alpha > 40
+        self.assertGreater(int(strong.sum()), 1000)
+        self.assertGreater(float(crop[strong][:, 2].mean()), 150)
+
+        tiny_plate = np.full((180, 320, 3), 90, np.uint8)
+        tiny_frames = []
+        tiny_box = (40.0, 40.0, 62.0, 58.0)
+        for _index in range(4):
+            frame = tiny_plate.copy()
+            frame[40:58, 40:62] = (0, 0, 220)
+            tiny_frames.append(frame)
+        tiny = build_cutouts(tiny_frames, [tiny_box] * 4, "vehicle")
+        self.assertIsNotNone(tiny)
+        assert tiny is not None
+        for ghost in tiny:
+            alpha = np.asarray(ghost["alpha"])
+            crop = np.asarray(ghost["crop"])
+            strong = alpha > 40
+            self.assertGreater(int(strong.sum()), 10)
+            self.assertGreater(float(crop[strong][:, 2].mean()), 150)
 
     def test_leader_is_not_drawn_without_a_ghost(self):
         plate = np.zeros((180, 320, 3), np.uint8)
