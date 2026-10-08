@@ -62,7 +62,12 @@ def classify_event(
     sub_label = str(event.get("sub_label") or "").lower()
     if label.lower() in DELIVERY_LABELS or sub_label in DELIVERY_LABELS:
         return "delivery"
-    for attribute in (event.get("data") or {}).get("attributes") or []:
+    attributes = _event_data(event).get("attributes") or []
+    if not isinstance(attributes, list):
+        attributes = []
+    for attribute in attributes:
+        if not isinstance(attribute, dict):
+            continue
         name = str(attribute.get("label") or "").lower()
         score = float(attribute.get("score") or 0)
         if name in DELIVERY_LABELS and score >= 0.5:
@@ -76,7 +81,9 @@ def classify_event(
 
 def _path_points(event: dict[str, Any]) -> list[tuple[float, float, float]]:
     """Normalized ``(x, bottom_y, timestamp)`` samples, oldest first."""
-    raw = (event.get("data") or {}).get("path_data") or []
+    raw = _event_data(event).get("path_data") or []
+    if not isinstance(raw, list):
+        raw = []
     points: list[tuple[float, float, float]] = []
     for item in raw:
         if not isinstance(item, (list, tuple)) or len(item) < 2:
@@ -94,7 +101,7 @@ def _path_points(event: dict[str, Any]) -> list[tuple[float, float, float]]:
 
 def _snapshot_box(event: dict[str, Any]) -> tuple[float, float, float, float] | None:
     """Normalized xywh box, or None when the event has no box."""
-    box = (event.get("data") or {}).get("box")
+    box = _event_data(event).get("box")
     if not isinstance(box, (list, tuple)) or len(box) < 4:
         return None
     try:
@@ -135,6 +142,29 @@ def boxes_at(
     return [fixed for _ in times]
 
 
+def _event_data(event: dict[str, Any]) -> dict[str, Any]:
+    """Event ``data`` JSON, or an empty dict when it is missing."""
+    data = event.get("data")
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _event_span(event: dict[str, Any]) -> tuple[float, float]:
+    """Start and end seconds. NULL ``end_time`` is an open event."""
+    start = float(event["start_time"])
+    raw = event.get("end_time")
+    end = start
+    if raw is not None:
+        try:
+            end = float(raw)
+        except (TypeError, ValueError):
+            end = start
+    if end <= start:
+        end = start + 0.5
+    return start, end
+
+
 def _clamp_box(
     box: tuple[float, float, float, float], width: int, height: int
 ) -> tuple[float, float, float, float]:
@@ -152,10 +182,7 @@ def preview_track(
     height: int,
 ) -> MotionTrack | None:
     """A cheap track used to decide parked-versus-moving before any decode."""
-    start = float(event["start_time"])
-    end = float(event["end_time"])
-    if end <= start:
-        end = start + 0.5
+    start, end = _event_span(event)
     count = 8
     times = [start + (end - start) * (index + 0.5) / count for index in range(count)]
     boxes = boxes_at(event, times, width, height)
@@ -166,7 +193,7 @@ def preview_track(
         label=str(event["label"]),
         category=category,
         start=start,
-        end=float(event["end_time"] or end),
+        end=end,
         boxes=boxes,
         times=times,
     )
@@ -413,12 +440,13 @@ def generate_recap(
         ghost_frames = ghost_frames[:count]
         boxes = boxes[:count]
         times = times[:count]
+        start, end = _event_span(event)
         track = MotionTrack(
             id=str(event["id"]),
             label=str(event["label"]),
             category=category,
-            start=float(event["start_time"]),
-            end=float(event["end_time"]),
+            start=start,
+            end=end,
             boxes=boxes,
             times=list(times),
         )

@@ -613,5 +613,281 @@ class TestTimezone(unittest.TestCase):
         self.assertTrue(schedule_due(local.replace(minute=1, second=30), "02:00"))
 
 
+class TestNullableEventRows(unittest.TestCase):
+    """Rows shaped like a real 0.17.2 database.
+
+    ``false_positive`` is NULL because the maintainer never writes it.
+    An event that has not ended has NULL ``end_time``.
+    """
+
+    def setUp(self):
+        from playhouse.sqlite_ext import SqliteExtDatabase
+
+        from frigate.models import Event, Recordings
+
+        self.Event = Event
+        self.Recordings = Recordings
+        self._event_db = Event._meta.database
+        self._recording_db = Recordings._meta.database
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = SqliteExtDatabase(str(Path(self._tmp.name) / "frigate.db"))
+        self.db.bind([Event, Recordings])
+        self.db.connect()
+        _create_nullable_table(self.db, Event)
+        _create_nullable_table(self.db, Recordings)
+        self.after = 1_000.0
+        self.before = 4_600.0
+        self.labels = ["person", "car"]
+
+    def tearDown(self):
+        self.db.close()
+        self.Event._meta.database = self._event_db
+        self.Recordings._meta.database = self._recording_db
+        self._tmp.cleanup()
+
+    def test_null_false_positive_and_open_events_are_included(self):
+        from frigate.recap.queries import live_recordings_exist, load_events
+
+        data = {
+            "box": [0.4, 0.3, 0.1, 0.2],
+            "region": [0.2, 0.1, 0.5, 0.6],
+            "score": 0.82,
+            "top_score": 0.91,
+            "attributes": None,
+            "path_data": [[[0.45, 0.5], 1050.0], [[0.5, 0.55], 1080.0]],
+            "type": "object",
+        }
+        self._event(
+            "1050.0-person",
+            label="person",
+            start=1050.0,
+            end=1200.0,
+            has_clip=1,
+            false_positive=None,
+            sub_label=None,
+            top_score=None,
+            zones=None,
+            data=data,
+        )
+        # Explicit false still counts as a real object.
+        self._event(
+            "1300.0-car00",
+            label="car",
+            start=1300.0,
+            end=1400.0,
+            has_clip=1,
+            false_positive=0,
+            data={"box": [0.1, 0.1, 0.2, 0.2], "top_score": None},
+        )
+        # Still in progress: end_time NULL, same as a live track.
+        self._event(
+            "2000.0-open01",
+            label="person",
+            start=2000.0,
+            end=None,
+            has_clip=1,
+            false_positive=None,
+            has_snapshot=None,
+            data=None,
+        )
+        # has_clip was never written. Do not treat that as "no clip".
+        self._event(
+            "2100.0-nullcl",
+            label="person",
+            start=2100.0,
+            end=2200.0,
+            has_clip=None,
+            false_positive=None,
+        )
+        self._event(
+            "1500.0-fp0001",
+            label="person",
+            start=1500.0,
+            end=1600.0,
+            has_clip=1,
+            false_positive=1,
+        )
+        self._event(
+            "1600.0-noclip",
+            label="person",
+            start=1600.0,
+            end=1700.0,
+            has_clip=0,
+            false_positive=None,
+        )
+        self._event(
+            "0100.0-ended",
+            label="person",
+            start=100.0,
+            end=500.0,
+            has_clip=1,
+            false_positive=None,
+        )
+        self._event(
+            "1800.0-back1",
+            label="person",
+            camera="back",
+            start=1800.0,
+            end=1900.0,
+            has_clip=1,
+            false_positive=None,
+        )
+
+        found = load_events("front", self.after, self.before, self.labels)
+        by_id = {row["id"]: row for row in found}
+        self.assertEqual(
+            set(by_id),
+            {"1050.0-person", "1300.0-car00", "2000.0-open01", "2100.0-nullcl"},
+        )
+        real = by_id["1050.0-person"]
+        self.assertIsNone(real["sub_label"])
+        self.assertEqual(real["data"]["box"], [0.4, 0.3, 0.1, 0.2])
+        self.assertIsNone(real["data"]["attributes"])
+        self.assertEqual(real["data"]["top_score"], 0.91)
+        open_event = by_id["2000.0-open01"]
+        self.assertEqual(open_event["end_time"], self.before)
+        self.assertEqual(open_event["data"], {})
+        self.assertIsInstance(by_id["1300.0-car00"]["end_time"], float)
+
+        stored = self.Event.get(self.Event.id == "2000.0-open01")
+        self.assertIsNone(stored.false_positive)
+        self.assertIsNone(stored.end_time)
+        self.assertIsNone(stored.top_score)
+        self.assertIsNone(stored.zones)
+        self._recording("rec-open", start=1900.0, end=None)
+        self.assertTrue(live_recordings_exist(stored, now=self.before))
+        no_clip = self.Event.get(self.Event.id == "1600.0-noclip")
+        self.assertFalse(live_recordings_exist(no_clip, now=self.before))
+
+    def test_open_recordings_overlap_the_window(self):
+        from frigate.recap.queries import load_recordings
+
+        self._recording("rec-closed", start=1000.0, end=1060.0)
+        self._recording("rec-open", start=4000.0, end=None)
+        self._recording("rec-old", start=100.0, end=200.0)
+        self._recording("rec-back", camera="back", start=1000.0, end=1100.0)
+        rows = load_recordings("front", self.after, self.before)
+        by_path = {row["path"]: row for row in rows}
+        self.assertEqual(set(by_path), {"rec-closed", "rec-open"})
+        self.assertEqual(by_path["rec-open"]["end"], self.before)
+        self.assertEqual(by_path["rec-closed"]["start"], 1000.0)
+
+    def test_archived_open_event_still_names_recordings(self):
+        moment = datetime(2026, 10, 7, 15, 50, 5, tzinfo=timezone.utc).timestamp()
+        event_id = f"{moment:.0f}-open01"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "db"
+            database.mkdir()
+            db_path = database / "frigate-2026-10-07.db"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                "CREATE TABLE event (id TEXT, camera TEXT, label TEXT, "
+                "start_time REAL, end_time REAL, false_positive INTEGER)"
+            )
+            connection.execute(
+                "CREATE TABLE recordings (path TEXT, camera TEXT, "
+                "start_time REAL, end_time REAL)"
+            )
+            connection.execute(
+                "INSERT INTO event VALUES (?, ?, ?, ?, ?, ?)",
+                (event_id, "front", "person", moment, None, None),
+            )
+            connection.execute(
+                "INSERT INTO recordings VALUES (?, ?, ?, ?)",
+                (
+                    "/media/frigate/recordings/2026-10-07/15/front/50.00.mp4",
+                    "front",
+                    moment - 5,
+                    None,
+                ),
+            )
+            connection.commit()
+            connection.close()
+            folder = root / "recordings" / "2026-10-07" / "15" / "front"
+            folder.mkdir(parents=True)
+            (folder / "50.00.mp4").write_bytes(b"mp4")
+            playback = lookup_playback([ArchiveLocation(path=root)], event_id)
+            self.assertIsNotNone(playback)
+            assert playback is not None
+            self.assertEqual(
+                [segment.path.name for segment in playback.segments if segment.path],
+                ["50.00.mp4"],
+            )
+
+    def _event(
+        self,
+        event_id: str,
+        label: str,
+        start: float,
+        end: float | None,
+        has_clip: int | None,
+        false_positive: int | None,
+        camera: str = "front",
+        sub_label: str | None = None,
+        top_score: float | None = None,
+        zones: str | None = None,
+        has_snapshot: int | None = 1,
+        data: dict | None = None,
+    ) -> None:
+        _insert(
+            self.db,
+            "event",
+            {
+                "id": event_id,
+                "label": label,
+                "sub_label": sub_label,
+                "camera": camera,
+                "start_time": start,
+                "end_time": end,
+                "top_score": top_score,
+                "false_positive": false_positive,
+                "zones": zones,
+                "has_clip": has_clip,
+                "has_snapshot": has_snapshot,
+                "data": None if data is None else json.dumps(data),
+            },
+        )
+
+    def _recording(
+        self,
+        path: str,
+        start: float,
+        end: float | None,
+        camera: str = "front",
+    ) -> None:
+        _insert(
+            self.db,
+            "recordings",
+            {
+                "id": path,
+                "camera": camera,
+                "path": path,
+                "start_time": start,
+                "end_time": end,
+            },
+        )
+
+
+def _create_nullable_table(db, model) -> None:
+    columns = []
+    for field in model._meta.sorted_fields:
+        name = f'"{field.column_name}"'
+        if field.primary_key:
+            columns.append(f"{name} TEXT PRIMARY KEY")
+        else:
+            columns.append(name)
+    db.execute_sql(f'CREATE TABLE "{model._meta.table_name}" ({", ".join(columns)})')
+
+
+def _insert(db, table: str, values: dict) -> None:
+    names = ", ".join(f'"{name}"' for name in values)
+    placeholders = ", ".join("?" for _ in values)
+    db.execute_sql(
+        f'INSERT INTO "{table}" ({names}) VALUES ({placeholders})',
+        list(values.values()),
+    )
+
+
 if __name__ == "__main__":
     unittest.main()

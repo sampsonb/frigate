@@ -23,7 +23,6 @@ from zoneinfo import ZoneInfo
 from frigate.config import FrigateConfig
 from frigate.config.recap import RecapConfig
 from frigate.const import CACHE_DIR, RECAP_DIR
-from frigate.models import Event, Recordings
 from frigate.recap.categories import (
     DELIVERY_QUERIES_PERSON,
     DELIVERY_QUERIES_VEHICLE,
@@ -42,6 +41,7 @@ from frigate.recap.generate import (
     sample_times,
 )
 from frigate.recap.layout import schedule_due
+from frigate.recap.queries import load_events, load_recordings
 from frigate.recap.storage import (
     ensure_tree,
     purge_expired,
@@ -246,14 +246,12 @@ class RecapJob(threading.Thread):
         config = self.manager.config
         ffmpeg = config.ffmpeg.ffmpeg_path
         ffprobe = config.ffmpeg.ffprobe_path
-        events = _load_events(
-            self.camera, self.after, self.before, self.settings.labels
-        )
+        events = load_events(self.camera, self.after, self.before, self.settings.labels)
         if self._cancel.is_set():
             raise RecapCancelled()
         self._progress(4, f"Found {len(events)} events")
         delivery_ids, dog_ids = self._semantic(events)
-        rows = _recordings(self.camera, self.after, self.before)
+        rows = load_recordings(self.camera, self.after, self.before)
         if not rows:
             raise RuntimeError("No recordings in that time range")
         size = None
@@ -444,55 +442,6 @@ class RecapMaintainer(threading.Thread):
                 if len(str(key).split(":")) >= 2 and str(key).split(":")[1] == today
             }
             state_file.write_text(json.dumps(fresh))
-
-
-def _load_events(
-    camera: str, after: float, before: float, labels: list[str]
-) -> list[dict[str, Any]]:
-    if not labels:
-        return []
-    query = (
-        Event.select()
-        .where(Event.camera == camera)
-        .where(Event.label.in_(labels))
-        .where(Event.has_clip == True)  # noqa: E712
-        .where(Event.false_positive == False)  # noqa: E712
-        .where(Event.end_time.is_null(False))
-        .where(Event.start_time < before)
-        .where(Event.end_time > after)
-        .order_by(Event.start_time.asc())
-    )
-    events: list[dict[str, Any]] = []
-    for event in query:
-        events.append(
-            {
-                "id": event.id,
-                "label": event.label,
-                "sub_label": event.sub_label,
-                "start_time": float(event.start_time),
-                "end_time": float(event.end_time),
-                "data": event.data or {},
-            }
-        )
-    return events
-
-
-def _recordings(camera: str, after: float, before: float) -> list[dict[str, Any]]:
-    query = (
-        Recordings.select(Recordings.path, Recordings.start_time, Recordings.end_time)
-        .where(Recordings.camera == camera)
-        .where(Recordings.start_time < before)
-        .where(Recordings.end_time > after)
-        .order_by(Recordings.start_time.asc())
-    )
-    return [
-        {
-            "path": row.path,
-            "start": float(row.start_time),
-            "end": float(row.end_time),
-        }
-        for row in query
-    ]
 
 
 def _segments(

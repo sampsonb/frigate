@@ -587,14 +587,20 @@ def _read_db(path: Path, event_id: str) -> dict[str, Any] | None:
         start_epoch = _as_epoch(start)
         end_epoch = _as_epoch(end)
         paths: list[str] = []
-        if camera and start_epoch is not None and end_epoch is not None:
+        # NULL end_time is an event that was still running when the
+        # database was copied. Search through now, and keep recordings
+        # whose own end_time was never written.
+        if camera and start_epoch is not None:
+            end_bound = time.time() if end_epoch is None else end_epoch
             recordings = connection.execute(
                 """
                 SELECT path FROM recordings
-                WHERE camera = ? AND start_time < ? AND end_time > ?
+                WHERE camera = ?
+                  AND start_time < ?
+                  AND (end_time IS NULL OR end_time > ?)
                 ORDER BY start_time ASC
                 """,
-                (camera, end_epoch, start_epoch),
+                (camera, end_bound, start_epoch),
             )
             for (stored,) in recordings:
                 relative = rewrite_media_path(str(stored))

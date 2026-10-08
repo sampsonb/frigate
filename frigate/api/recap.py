@@ -23,7 +23,7 @@ from frigate.api.auth import (
 )
 from frigate.api.defs.tags import Tags
 from frigate.const import RECAP_DIR
-from frigate.models import Event, Recordings
+from frigate.models import Event
 from frigate.recap.archive import (
     CLIP_GONE,
     ArchivePlayback,
@@ -34,6 +34,7 @@ from frigate.recap.archive import (
     remote_manifest,
     remote_recap_summaries,
 )
+from frigate.recap.queries import live_recordings_exist
 from frigate.recap.storage import (
     delete_recap,
     find_manifest,
@@ -481,17 +482,11 @@ def _live_clip(event_id: str) -> tuple[bool, str | None]:
     except Exception:
         logger.debug("Live event lookup failed for %s", event_id)
         return False, None
-    camera = str(event.camera)
-    if not event.has_clip or event.end_time is None:
-        return False, camera
+    camera = str(event.camera) if event.camera else None
+    # NULL has_clip was never written. NULL end_time is still in progress.
+    # Both used to look like "no clip" and skip the recordings table.
     try:
-        exists = (
-            Recordings.select()
-            .where(Recordings.camera == camera)
-            .where(Recordings.start_time < float(event.end_time))
-            .where(Recordings.end_time > float(event.start_time))
-            .exists()
-        )
+        exists = live_recordings_exist(event)
     except Exception:
         logger.debug("Live recording lookup failed for %s", event_id)
         return False, camera
