@@ -1,15 +1,12 @@
 import { baseUrl } from "@/api/baseUrl";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { RecapClipSource, RecapManifest, RecapTrack } from "@/types/recap";
 import axios from "axios";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 type RecapPlayerProps = {
@@ -46,10 +43,11 @@ function mediaUrl(value?: string | null) {
 
 export default function RecapPlayer({ recap }: RecapPlayerProps) {
   const { t } = useTranslation(["views/recap"]);
+  const navigate = useNavigate();
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
-  const clickTimer = useRef<number | null>(null);
   const [current, setCurrent] = useState(0);
+  const [paused, setPaused] = useState(true);
   const [content, setContent] = useState<ContentRect>({
     x: 0,
     y: 0,
@@ -59,8 +57,8 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
   const [enabled, setEnabled] = useState<Record<string, boolean>>({});
   const [open, setOpen] = useState<OpenClip>();
 
-  const categories = recap.categories ?? [];
-  const tracks = recap.tracks ?? [];
+  const categories = useMemo(() => recap.categories ?? [], [recap.categories]);
+  const tracks = useMemo(() => recap.tracks ?? [], [recap.tracks]);
   const fps = recap.fps || 12;
 
   useEffect(() => {
@@ -131,16 +129,23 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
     });
   }, [current, fps, visibleTracks]);
 
-  const seek = (track: RecapTrack) => {
+  const pauseAt = (track: RecapTrack) => {
     const video = videoRef.current;
     if (!video) {
       return;
     }
+    video.pause();
     video.currentTime = track.out_start / fps;
-    video.play().catch(() => undefined);
+    setCurrent(track.out_start / fps);
+    setPaused(true);
   };
 
   const openClip = async (track: RecapTrack) => {
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+    }
+    setPaused(true);
     const eventId = track.clip_event_id || track.event_id;
     try {
       const response = await axios.get<RecapClipSource>(
@@ -148,7 +153,9 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
       );
       const data = response.data;
       if (!data.clip && !data.snapshot) {
-        toast.error(data.message || t("clipMissing"), { position: "top-center" });
+        toast.error(data.message || t("clipMissing"), {
+          position: "top-center",
+        });
         return;
       }
       setOpen({
@@ -163,28 +170,24 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
     }
   };
 
-  const onLabelClick = (track: RecapTrack) => {
-    if (clickTimer.current) {
-      window.clearTimeout(clickTimer.current);
+  const openHistory = () => {
+    if (!open) {
+      return;
     }
-    clickTimer.current = window.setTimeout(() => {
-      seek(track);
-      clickTimer.current = null;
-    }, 220);
-  };
-
-  const onLabelDoubleClick = (track: RecapTrack) => {
-    if (clickTimer.current) {
-      window.clearTimeout(clickTimer.current);
-      clickTimer.current = null;
-    }
-    openClip(track);
+    navigate("/review", {
+      state: {
+        severity: "detection",
+        recording: {
+          camera: recap.camera,
+          startTime: open.track.start_time,
+          severity: "detection",
+        },
+      },
+    });
   };
 
   const clipIndex = open
-    ? visibleTracks.findIndex(
-        (track) => track.event_id === open.track.event_id,
-      )
+    ? visibleTracks.findIndex((track) => track.event_id === open.track.event_id)
     : -1;
 
   const stepClip = (delta: number) => {
@@ -227,7 +230,7 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
         <p className="text-xs text-muted-foreground">{t("clickHint")}</p>
         <div
           ref={frameRef}
-          className="relative aspect-video w-full overflow-hidden rounded-lg bg-black"
+          className="relative aspect-video max-h-[42vh] w-full overflow-hidden rounded-lg bg-black lg:max-h-[68vh]"
         >
           <video
             ref={videoRef}
@@ -236,29 +239,63 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
             src={`${baseUrl}api/recap/${recap.id}/video.mp4`}
             controls
             playsInline
-            onLoadedMetadata={measure}
-            onTimeUpdate={(event) => setCurrent(event.currentTarget.currentTime)}
+            onLoadedMetadata={(event) => {
+              measure();
+              setCurrent(event.currentTarget.currentTime);
+              setPaused(event.currentTarget.paused);
+            }}
+            onTimeUpdate={(event) =>
+              setCurrent(event.currentTarget.currentTime)
+            }
+            onPlay={() => setPaused(false)}
+            onPause={(event) => {
+              setPaused(true);
+              setCurrent(event.currentTarget.currentTime);
+            }}
+            onSeeked={(event) => setCurrent(event.currentTarget.currentTime)}
           />
-          {activeTracks.map((track) => {
-            const [x0, y0, x1, y1] = track.label_box;
-            return (
-              <button
-                key={track.event_id}
-                type="button"
-                className="absolute rounded-sm border-2 bg-black/20 text-left"
-                style={{
-                  left: content.x + x0 * content.w,
-                  top: content.y + y0 * content.h,
-                  width: Math.max(8, (x1 - x0) * content.w),
-                  height: Math.max(8, (y1 - y0) * content.h),
-                  borderColor: colorFor(track.cat),
-                }}
-                onClick={() => onLabelClick(track)}
-                onDoubleClick={() => onLabelDoubleClick(track)}
-                title={track.text}
-              />
-            );
-          })}
+          <div className="pointer-events-none absolute inset-0">
+            {content.w > 0 &&
+              activeTracks.map((track) => {
+                const [x0, y0, x1, y1] = track.label_box;
+                const boxWidth = Math.max(
+                  paused ? 44 : 32,
+                  (x1 - x0) * content.w,
+                );
+                const boxHeight = Math.max(
+                  paused ? 44 : 32,
+                  (y1 - y0) * content.h,
+                );
+                return (
+                  <button
+                    key={track.event_id}
+                    type="button"
+                    aria-label={track.text}
+                    className={`pointer-events-auto absolute touch-manipulation whitespace-nowrap rounded-md border-2 text-left text-xs font-medium text-white ${paused ? "bg-black/55 px-2 py-1" : "bg-black/20"}`}
+                    style={{
+                      left: content.x + ((x0 + x1) / 2) * content.w,
+                      top: content.y + ((y0 + y1) / 2) * content.h,
+                      minWidth: boxWidth,
+                      minHeight: boxHeight,
+                      width: paused ? "max-content" : boxWidth,
+                      height: paused ? "max-content" : boxHeight,
+                      transform: "translate(-50%, -50%)",
+                      borderColor: colorFor(track.cat),
+                    }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openClip(track);
+                    }}
+                  >
+                    {paused ? (
+                      track.text
+                    ) : (
+                      <span className="sr-only">{track.text}</span>
+                    )}
+                  </button>
+                );
+              })}
+          </div>
         </div>
       </div>
       <div className="flex max-h-[50vh] w-full flex-col gap-1 overflow-y-auto lg:max-h-none lg:w-72">
@@ -275,8 +312,10 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
               key={track.event_id}
               type="button"
               className={`rounded-md px-2 py-1 text-left text-sm ${active ? "bg-secondary" : "hover:bg-secondary/60"}`}
-              onClick={() => seek(track)}
-              onDoubleClick={() => openClip(track)}
+              onClick={() => {
+                pauseAt(track);
+                openClip(track);
+              }}
             >
               <span style={{ color: colorFor(track.cat) }}>{track.text}</span>
             </button>
@@ -336,12 +375,13 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
             </Button>
             <Button
               variant="outline"
-              disabled={
-                clipIndex < 0 || clipIndex >= visibleTracks.length - 1
-              }
+              disabled={clipIndex < 0 || clipIndex >= visibleTracks.length - 1}
               onClick={() => stepClip(1)}
             >
               {t("next")}
+            </Button>
+            <Button variant="outline" onClick={openHistory}>
+              {t("openHistory")}
             </Button>
           </div>
         </DialogContent>

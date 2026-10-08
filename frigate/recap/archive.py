@@ -25,6 +25,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from frigate.recap.storage import summary_categories
+
 logger = logging.getLogger(__name__)
 
 # Shown when an index row exists but the file is gone, including when it
@@ -293,6 +295,8 @@ def remote_recap_summaries(locations: list[ArchiveLocation]) -> list[dict[str, A
                     "event_count": row.get("event_count", 0),
                     "width": row.get("width"),
                     "height": row.get("height"),
+                    "reason": row.get("reason") or "",
+                    "categories": summary_categories(row.get("categories")),
                     "source": "archive",
                 }
             )

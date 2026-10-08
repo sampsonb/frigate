@@ -26,7 +26,8 @@
   "failed": "Recap failed",
   "filters": "Show",
   "eventList": "Events",
-  "clickHint": "Click a time to jump there. Double-click to open that event.",
+  "clickHint": "Tap a time on the video to open that clip. While paused, every time on screen can be tapped.",
+  "openHistory": "Open in Frigate review at this time",
   "fromArchive": "Playing the archived copy. Frigate no longer has this recording.",
   "snapshotOnly": "The recording has aged out. This is the archived snapshot.",
   "clipMissing": "This event is no longer available.",
@@ -37,5 +38,13 @@
   "noEvents": "No events for the selected types.",
   "rangeInvalid": "The end of the range has to be after the start.",
   "rangeLong": "That range is longer than this camera allows.",
-  "started": "Recap queued."
+  "started": "Recap queued.",
+  "emptyPlayer": "Pick a recap, or make one with the buttons above.",
+  "emptyRecaps": "Empty recaps",
+  "emptyRecapsCount": "{{count}} with nothing tracked",
+  "secondsShort": "{{count}}s",
+  "minutesShort": "{{count}}m",
+  "showEmpty": "Show empty recaps",
+  "hideEmpty": "Hide empty recaps",
+  "thumbnail": "Recap thumbnail"
 }

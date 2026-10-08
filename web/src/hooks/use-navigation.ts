@@ -5,8 +5,8 @@ import { useMemo } from "react";
 import { isDesktop } from "react-device-detect";
 import { FaCompactDisc, FaVideo } from "react-icons/fa";
 import { IoSearch } from "react-icons/io5";
-import { LuConstruction } from "react-icons/lu";
-import { MdCategory, MdTimelapse, MdVideoLibrary } from "react-icons/md";
+import { LuClapperboard, LuConstruction } from "react-icons/lu";
+import { MdCategory, MdVideoLibrary } from "react-icons/md";
 import { TbFaceId } from "react-icons/tb";
 import useSWR from "swr";
 import { useIsAdmin } from "./use-is-admin";
@@ -46,6 +46,13 @@ export default function useNavigation(
           url: "/review",
         },
         {
+          id: ID_RECAP,
+          variant,
+          icon: LuClapperboard,
+          title: "menu.recap",
+          url: "/recap",
+        },
+        {
           id: ID_EXPLORE,
           variant,
           icon: IoSearch,
@@ -58,13 +65,6 @@ export default function useNavigation(
           icon: FaCompactDisc,
           title: "menu.export",
           url: "/export",
-        },
-        {
-          id: ID_RECAP,
-          variant,
-          icon: MdTimelapse,
-          title: "menu.recap",
-          url: "/recap",
         },
         {
           id: ID_PLAYGROUND,

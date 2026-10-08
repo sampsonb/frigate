@@ -192,5 +192,20 @@
       "description": "This camera group has no assigned or enabled cameras.",
       "buttonText": "Manage Groups"
     }
+  },
+  "recapStrip": {
+    "title": "Recap",
+    "open": "Open {{camera}} recap",
+    "last1": "Last 1 hour",
+    "last6": "Last 6 hours",
+    "last12": "Last 12 hours",
+    "last24": "Last 24 hours",
+    "short1": "1h",
+    "short6": "6h",
+    "short12": "12h",
+    "short24": "24h",
+    "started": "Recap queued.",
+    "failed": "Recap failed",
+    "none": "No recap yet"
   }
 }

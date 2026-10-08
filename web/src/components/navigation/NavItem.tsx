@@ -4,7 +4,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { isDesktop } from "react-device-detect";
+import { isDesktop, isTablet } from "react-device-detect";
 import { TooltipPortal } from "@radix-ui/react-tooltip";
 import { NavData } from "@/types/navigation";
 import { IconType } from "react-icons";
@@ -40,10 +40,13 @@ export default function NavItem({
     return;
   }
 
+  const label = t(item.title);
   const content = (
     <NavLink
       to={item.url}
       onClick={onClick}
+      aria-label={label}
+      title={isDesktop ? undefined : label}
       className={({ isActive }) =>
         cn(
           "flex flex-col items-center justify-center rounded-lg p-[6px]",
@@ -53,15 +56,20 @@ export default function NavItem({
       }
     >
       <Icon className="size-5" />
+      {item.url === "/recap" && item.variant === "secondary" && (
+        <span className="mt-0.5 hidden text-[10px] leading-none md:block">
+          {label}
+        </span>
+      )}
     </NavLink>
   );
 
-  if (isDesktop) {
+  if (isDesktop || isTablet) {
     return (
       <Tooltip>
         <TooltipTrigger>{content}</TooltipTrigger>
         <TooltipPortal>
-          <TooltipContent side="right">
+          <TooltipContent side={item.variant === "secondary" ? "top" : "right"}>
             <p>{t(item.title)}</p>
           </TooltipContent>
         </TooltipPortal>

@@ -124,6 +124,29 @@ def list_visible_recaps(archive_dirs: list[Path]) -> list[dict[str, Any]]:
     return merged
 
 
+def summary_categories(value: Any) -> list[dict[str, Any]]:
+    """Per-type counts for the recap cards. Track geometry stays on the detail call."""
+    if not isinstance(value, list):
+        return []
+    counts: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            count = int(item.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        counts.append(
+            {
+                "key": str(item.get("key") or ""),
+                "name": str(item.get("name") or ""),
+                "color": str(item.get("color") or ""),
+                "count": count,
+            }
+        )
+    return counts
+
+
 def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
     """Fields the list view needs. The full track list stays on the detail call."""
     return {
@@ -139,6 +162,8 @@ def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
         "event_count": manifest.get("event_count", 0),
         "width": manifest.get("width"),
         "height": manifest.get("height"),
+        "reason": manifest.get("reason") or "",
+        "categories": summary_categories(manifest.get("categories")),
     }
 
 

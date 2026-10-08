@@ -53,6 +53,8 @@ export type RecapSummary = {
   width?: number;
   height?: number;
   source?: "local" | "archive";
+  reason?: string;
+  categories?: RecapCategory[];
 };
 
 export type RecapClipSource = {

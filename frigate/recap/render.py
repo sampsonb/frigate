@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import math
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import cv2
@@ -247,25 +248,42 @@ def draw_label(
     )
 
 
-def _paste_ghost(canvas: np.ndarray, ghost: GhostFrame, alpha_scale: float) -> None:
+def _paste_ghost(canvas: np.ndarray, ghost: GhostFrame, alpha_scale: float) -> bool:
+    """Paint a ghost. False when nothing visible landed on the canvas.
+
+    Callers use that to skip the leader. A line with no object under it
+    looks like the track is still there.
+    """
     pixels = ghost.pixels()
     if pixels is None or alpha_scale <= 0.01:
-        return
+        return False
     crop, alpha = pixels
     height, width = crop.shape[:2]
     y0, x0 = ghost.y, ghost.x
     y1 = min(canvas.shape[0], y0 + height)
     x1 = min(canvas.shape[1], x0 + width)
     if y0 < 0 or x0 < 0 or y1 <= y0 or x1 <= x0:
-        return
+        return False
     region = canvas[y0:y1, x0:x1]
     crop_h = y1 - y0
     crop_w = x1 - x0
     factor = (alpha[:crop_h, :crop_w].astype(np.float32) * (alpha_scale / 255.0))[
         ..., None
     ]
+    if float(factor.max()) < 0.04:
+        return False
     blended = crop[:crop_h, :crop_w] * factor + region * (1 - factor)
     region[:] = blended.astype(np.uint8)
+    return True
+
+
+def leader_without_ghost(
+    ghost_drawn: Sequence[bool], leader_drawn: Sequence[bool]
+) -> int:
+    """Frames that painted a leader without a ghost. Must stay 0."""
+    return sum(
+        1 for ghost, leader in zip(ghost_drawn, leader_drawn) if leader and not ghost
+    )
 
 
 def _dotted(
@@ -338,6 +356,7 @@ def compose_frame(
             )
             active.append(index)
     tube_by_id = {tube.event_id: tube for tube in tubes}
+    shown: set[int] = set()
     for index in active:
         unit = units[index]
         if unit.category == "parked":
@@ -360,9 +379,12 @@ def compose_frame(
         source_index = min(
             len(tube.frames) - 1, (frame_index - starts[index]) // repeat
         )
-        _paste_ghost(canvas, tube.frames[source_index], ghost_alpha)
+        if _paste_ghost(canvas, tube.frames[source_index], ghost_alpha):
+            shown.add(index)
 
     for index in active:
+        if index not in shown:
+            continue
         local = frame_index - starts[index]
         box = units[index].boxes[min(local, len(units[index].boxes) - 1)]
         head = ((box[0] + box[2]) / 2, box[1])

@@ -39,6 +39,12 @@ from frigate.recap.layout import (
     schedule_due,
     schedule_units,
 )
+from frigate.recap.render import (
+    GhostFrame,
+    Tube,
+    compose_frame,
+    leader_without_ghost,
+)
 from frigate.recap.storage import list_visible_recaps
 
 
@@ -356,9 +362,126 @@ class TestCutout(unittest.TestCase):
         ghosts = build_cutouts(frames, boxes, "person")
         self.assertIsNotNone(ghosts)
         assert ghosts is not None
+        self.assertEqual(len(ghosts), len(frames))
         sample = ghosts[len(ghosts) // 2]
         alpha = sample["alpha"]
         self.assertGreater(int(alpha.sum()), 200)
+
+    def test_stopped_car_still_gets_a_feathered_ghost(self):
+        height, width = 180, 320
+        frames = [np.full((height, width, 3), (40, 40, 40), np.uint8) for _ in range(4)]
+        box = (100.0, 40.0, 180.0, 110.0)
+        ghosts = build_cutouts(frames, [box] * 4, "vehicle")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        self.assertEqual(len(ghosts), 4)
+        for ghost in ghosts:
+            self.assertGreater(int(np.asarray(ghost["alpha"]).sum()), 0)
+
+    def test_vehicle_gap_is_repaired_from_a_neighbor(self):
+        height, width = 180, 320
+        plate = np.full((height, width, 3), (90, 90, 90), np.uint8)
+        car = np.array((0, 0, 220), np.uint8)
+        frames = []
+        boxes = []
+        for index in range(6):
+            frame = plate.copy()
+            x = 30 + index * 28
+            if index not in (2, 3):
+                frame[50:110, x : x + 50] = car
+            frames.append(frame)
+            boxes.append((float(x), 50.0, float(x + 50), 110.0))
+        ghosts = build_cutouts(frames, boxes, "vehicle")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        self.assertEqual(len(ghosts), 6)
+        for ghost in ghosts:
+            alpha = np.asarray(ghost["alpha"])
+            crop = np.asarray(ghost["crop"])
+            strong = alpha > 40
+            self.assertGreater(int(strong.sum()), 10)
+            self.assertGreater(float(crop[strong][:, 2].mean()), 150)
+
+    def test_low_contrast_vehicle_is_not_dropped(self):
+        plate = np.full((120, 200, 3), 90, np.uint8)
+        frame = plate.copy()
+        frame[40:90, 60:140] = 80
+        _x, _y, mask = attach_motion(frame, plate, (60.0, 40.0, 140.0, 90.0), "vehicle")
+        self.assertGreater(int(mask.sum()), 20)
+
+    def test_leader_is_not_drawn_without_a_ghost(self):
+        plate = np.zeros((180, 320, 3), np.uint8)
+        box = (100.0, 40.0, 180.0, 100.0)
+        unit = ScheduledUnit(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            boxes=[box],
+            text="5:50 PM",
+        )
+        empty = GhostFrame(
+            x=100,
+            y=40,
+            box=box,
+            crop=np.zeros((60, 80, 3), np.uint8),
+            alpha=np.zeros((60, 80), np.uint8),
+        )
+        tube = Tube(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            frames=[empty],
+        )
+        rect = (10, 10, 80, 36)
+        blank = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [rect],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        vehicle = np.array((40, 165, 255), np.uint8)
+        near_tip = blank[30:48, 130:150]
+        self.assertEqual(int((near_tip == vehicle).all(axis=2).sum()), 0)
+        strong = GhostFrame(
+            x=100,
+            y=40,
+            box=box,
+            crop=np.full((60, 80, 3), (0, 0, 200), np.uint8),
+            alpha=np.full((60, 80), 255, np.uint8),
+        )
+        tube.frames = [strong]
+        drawn = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [rect],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        near_tip = drawn[30:48, 130:150]
+        self.assertGreater(int((near_tip == vehicle).all(axis=2).sum()), 0)
+
+    def test_leader_without_ghost_counts_mismatches(self):
+        self.assertEqual(leader_without_ghost([True, False], [True, False]), 0)
+        self.assertEqual(leader_without_ghost([False], [True]), 1)
 
 
 class TestArchive(unittest.TestCase):
@@ -523,6 +646,61 @@ class TestArchive(unittest.TestCase):
             match = [item for item in listed if item["id"] == "front_20261007_abcd"]
             self.assertEqual(len(match), 1)
             self.assertEqual(match[0]["source"], "archive")
+            self.assertEqual(match[0]["categories"], [])
+            self.assertEqual(match[0]["reason"], "")
+
+    def test_summary_keeps_schedule_day_and_category_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "front" / "front_20261007_abcd"
+            folder.mkdir(parents=True)
+            manifest = {
+                "id": "front_20261007_abcd",
+                "camera": "front",
+                "status": "complete",
+                "created": 20,
+                "reason": "schedule",
+                "event_count": 4,
+                "before": 1_700_000_000,
+                "categories": [
+                    {
+                        "key": "person",
+                        "name": "People",
+                        "color": "#3cb9ff",
+                        "count": 3,
+                    },
+                    {
+                        "key": "vehicle",
+                        "name": "Vehicles",
+                        "color": "#ffa528",
+                        "count": "1",
+                    },
+                    "skip",
+                ],
+            }
+            (folder / "manifest.json").write_text(json.dumps(manifest))
+            listed = list_visible_recaps([root])
+            match = [item for item in listed if item["id"] == "front_20261007_abcd"]
+            self.assertEqual(len(match), 1)
+            self.assertEqual(match[0]["reason"], "schedule")
+            self.assertEqual(match[0]["event_count"], 4)
+            self.assertEqual(
+                match[0]["categories"],
+                [
+                    {
+                        "key": "person",
+                        "name": "People",
+                        "color": "#3cb9ff",
+                        "count": 3,
+                    },
+                    {
+                        "key": "vehicle",
+                        "name": "Vehicles",
+                        "color": "#ffa528",
+                        "count": 1,
+                    },
+                ],
+            )
 
     def test_events_index_and_missing_files(self):
         moment = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc).timestamp()
