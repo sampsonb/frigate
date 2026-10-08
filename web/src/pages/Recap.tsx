@@ -1,27 +1,61 @@
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { resolveCameraName } from "@/hooks/use-camera-friendly-name";
+import { cn } from "@/lib/utils";
 import { FrigateConfig } from "@/types/frigateConfig";
-import { RecapManifest, RecapSummary } from "@/types/recap";
-import RecapCard from "@/views/recap/RecapCard";
+import { RecapManifest, RecapRollingStatus, RecapSummary } from "@/types/recap";
+import RecapBuildProgress from "@/views/recap/RecapBuildProgress";
+import RecapListItem from "@/views/recap/RecapListItem";
 import RecapPlayer from "@/views/recap/RecapPlayer";
+import RecapRangePicker from "@/views/recap/RecapRangePicker";
+import {
+  LongerChoice,
+  availableNights,
+  isBusy,
+  isRolling,
+  nightlyPlaylist,
+  useNow,
+  useRecapTime,
+} from "@/views/recap/recapUtils";
 import axios from "axios";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { LuChevronDown } from "react-icons/lu";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { LuChevronDown, LuRefreshCw, LuSparkles } from "react-icons/lu";
 import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import useSWR from "swr";
 
-const HOURS = [1, 6, 12, 24] as const;
+type Choice = LongerChoice | "custom";
+
+type View =
+  | { kind: "rolling" }
+  | { kind: "recap"; id: string; choice?: Choice }
+  | { kind: "playlist"; ids: string[]; choice: LongerChoice };
 
 function playable(item: RecapSummary) {
   return item.status === "complete" && (item.event_count ?? 0) > 0;
 }
 
+function errorMessage(error: unknown, fallback: string) {
+  return axios.isAxiosError(error) && error.response?.data?.message
+    ? String(error.response.data.message)
+    : fallback;
+}
+
 export default function Recap() {
   const { t } = useTranslation(["views/recap", "common"]);
+  const times = useRecapTime();
+  const now = useNow(30000);
   const [searchParams] = useSearchParams();
   const requested = useRef({
     id: searchParams.get("id") || "",
@@ -37,11 +71,11 @@ export default function Recap() {
       .map(([name]) => name);
   }, [config]);
   const [camera, setCamera] = useState<string>(requested.current.camera);
-  const [from, setFrom] = useState("");
-  const [to, setTo] = useState("");
-  const [selected, setSelected] = useState<string>();
+  const [view, setView] = useState<View>({ kind: "rolling" });
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<RecapSummary>();
   const [showEmpty, setShowEmpty] = useState(false);
-  const [customOpen, setCustomOpen] = useState(false);
+  const [pinned, setPinned] = useState<number>();
 
   useEffect(() => {
     document.title = t("documentTitle");
@@ -59,55 +93,67 @@ export default function Recap() {
 
   const { data: recaps, mutate } = useSWR<RecapSummary[]>("recap", {
     refreshInterval: (latest) =>
-      latest?.some(
-        (item) => item.status === "queued" || item.status === "running",
-      )
-        ? 2000
-        : 15000,
+      latest?.some((item) => isBusy(item) && !isRolling(item)) ? 2000 : 15000,
   });
 
+  const { data: rolling, mutate: mutateRolling } = useSWR<RecapRollingStatus>(
+    camera ? `recap/rolling/${camera}` : null,
+    {
+      refreshInterval: (latest) => (latest?.building ? 2000 : 30000),
+      shouldRetryOnError: false,
+    },
+  );
+  const rollingCurrent =
+    rolling?.current?.status === "complete" ? rolling.current : undefined;
+  const latestVersion = rollingCurrent?.finished || rollingCurrent?.created;
+
+  // Keep the version being watched. A newer build is offered, not forced.
+  useEffect(() => {
+    if (latestVersion && pinned === undefined) {
+      setPinned(latestVersion);
+    }
+  }, [latestVersion, pinned]);
+
+  const { data: rollingDetail } = useSWR<RecapManifest>(
+    view.kind === "rolling" && rollingCurrent && pinned
+      ? `recap/${rollingCurrent.id}?v=${pinned}`
+      : null,
+  );
+
   const forCamera = useMemo(
-    () => (recaps ?? []).filter((item) => item.camera === camera),
+    () =>
+      (recaps ?? []).filter(
+        (item) => item.camera === camera && !isRolling(item),
+      ),
     [camera, recaps],
   );
   const featured = forCamera.filter(
-    (item) =>
-      playable(item) ||
-      item.status === "queued" ||
-      item.status === "running" ||
-      item.status === "failed",
+    (item) => playable(item) || isBusy(item) || item.status === "failed",
   );
   const empty = forCamera.filter(
     (item) => item.status === "complete" && (item.event_count ?? 0) === 0,
   );
 
+  // A link from the Live page opens that recap.
   useEffect(() => {
-    if (!forCamera.length) {
-      return;
-    }
     const requestedId = requested.current.id;
-    if (requestedId && forCamera.some((item) => item.id === requestedId)) {
-      setSelected(requestedId);
+    if (!requestedId || !recaps) {
+      return;
+    }
+    const match = recaps.find((item) => item.id === requestedId);
+    if (match) {
       requested.current.id = "";
-      return;
+      if (!isRolling(match)) {
+        setView({ kind: "recap", id: requestedId });
+      }
     }
-    // Keep the recap the user is watching, including one that was just queued.
-    if (selected) {
-      return;
-    }
-    const next = forCamera.find(playable);
-    if (next) {
-      setSelected(next.id);
-    }
-  }, [forCamera, selected]);
+  }, [recaps]);
 
+  const viewedId = view.kind === "recap" ? view.id : undefined;
   const { data: detail } = useSWR<RecapManifest>(
-    selected ? `recap/${selected}` : null,
+    viewedId ? `recap/${viewedId}` : null,
     {
-      refreshInterval: (latest) =>
-        latest && (latest.status === "queued" || latest.status === "running")
-          ? 1500
-          : 0,
+      refreshInterval: (latest) => (isBusy(latest) ? 1500 : 0),
     },
   );
 
@@ -115,117 +161,148 @@ export default function Recap() {
     (camera && config?.cameras[camera]?.recap?.max_window_hours) ||
     config?.recap?.max_window_hours ||
     48;
+  const nights = useMemo(
+    () => availableNights(recaps ?? [], camera, now),
+    [camera, now, recaps],
+  );
 
-  const choose = (id: string) => {
-    setSelected(id);
+  const startBuild = useCallback(
+    async (
+      body: { hours: number } | { after: number; before: number },
+      choice: Choice,
+    ) => {
+      if (!camera) {
+        return;
+      }
+      try {
+        const response = await axios.post(`recap/${camera}/start`, body);
+        const id = String(response.data.id);
+        setView({ kind: "recap", id, choice });
+        setPickerOpen(false);
+        toast.success(
+          response.data?.recap?.deduped ? t("alreadyBuilding") : t("started"),
+          { position: "top-center" },
+        );
+        mutate();
+      } catch (error) {
+        toast.error(errorMessage(error, t("failed")), {
+          position: "top-center",
+        });
+      }
+    },
+    [camera, mutate, t],
+  );
+
+  const chooseLonger = (hours: LongerChoice) => {
+    if (hours >= 24) {
+      const list = nightlyPlaylist(recaps ?? [], camera, hours / 24, now);
+      if (list) {
+        setPickerOpen(false);
+        if (list.length === 1) {
+          setView({ kind: "recap", id: list[0].id, choice: hours });
+        } else {
+          setView({
+            kind: "playlist",
+            ids: list.map((item) => item.id),
+            choice: hours,
+          });
+        }
+        return;
+      }
+    }
+    if (hours <= maxHours) {
+      startBuild({ hours }, hours);
+      return;
+    }
+    toast.error(t("picker.notYet", { count: hours / 24, have: nights }), {
+      position: "top-center",
+    });
   };
 
-  const startHours = async (hours: number) => {
+  const refreshNow = async () => {
     if (!camera) {
       return;
     }
     try {
-      const response = await axios.post(`recap/${camera}/start`, { hours });
-      setSelected(response.data.id);
-      toast.success(t("started"), { position: "top-center" });
-      mutate();
+      const response = await axios.post(`recap/rolling/${camera}/refresh`);
+      const status = response.data?.status;
+      if (status === "skipped") {
+        toast.success(t("rolling.upToDate"), { position: "top-center" });
+      } else {
+        toast.success(t("rolling.refreshing"), { position: "top-center" });
+      }
+      mutateRolling();
     } catch (error) {
-      const message =
-        axios.isAxiosError(error) && error.response?.data?.message
-          ? String(error.response.data.message)
-          : t("failed");
-      toast.error(message, { position: "top-center" });
+      toast.error(errorMessage(error, t("failed")), { position: "top-center" });
     }
   };
 
-  const startCustom = async () => {
-    if (!camera || !from || !to) {
-      return;
-    }
-    const after = new Date(from).getTime() / 1000;
-    const before = new Date(to).getTime() / 1000;
-    if (!(before > after)) {
-      toast.error(t("rangeInvalid"), { position: "top-center" });
-      return;
-    }
-    if ((before - after) / 3600 > maxHours) {
-      toast.error(t("rangeLong"), { position: "top-center" });
+  const confirmDelete = async () => {
+    const item = pendingDelete;
+    setPendingDelete(undefined);
+    if (!item) {
       return;
     }
     try {
-      const response = await axios.post(`recap/${camera}/start`, {
-        after,
-        before,
-      });
-      setSelected(response.data.id);
-      toast.success(t("started"), { position: "top-center" });
+      await axios.delete(`recap/${item.id}`);
+      if (
+        (view.kind === "recap" && view.id === item.id) ||
+        (view.kind === "playlist" && view.ids.includes(item.id))
+      ) {
+        setView({ kind: "rolling" });
+      }
       mutate();
     } catch (error) {
-      const message =
-        axios.isAxiosError(error) && error.response?.data?.message
-          ? String(error.response.data.message)
-          : t("failed");
-      toast.error(message, { position: "top-center" });
+      toast.error(errorMessage(error, t("failed")), { position: "top-center" });
     }
-  };
-
-  const remove = async (item: RecapSummary) => {
-    if (item.source === "archive") {
-      toast.error(t("deleteArchive"), { position: "top-center" });
-      return;
-    }
-    if (!window.confirm(t("deleteConfirm"))) {
-      return;
-    }
-    await axios.delete(`recap/${item.id}`);
-    if (selected === item.id) {
-      setSelected(undefined);
-    }
-    mutate();
   };
 
   const cancel = async (id: string) => {
-    await axios.post(`recap/${id}/cancel`);
-    mutate();
+    try {
+      await axios.post(`recap/${id}/cancel`);
+    } finally {
+      if (view.kind === "recap" && view.id === id) {
+        setView({ kind: "rolling" });
+      }
+      mutate();
+    }
   };
 
-  const hourLabel = (hours: number) => {
-    if (hours === 1) {
-      return t("lastHour");
-    }
-    if (hours === 6) {
-      return t("last6");
-    }
-    if (hours === 12) {
-      return t("last12");
-    }
-    return t("last24");
-  };
-
-  const running =
-    detail && (detail.status === "queued" || detail.status === "running");
+  const choice =
+    view.kind === "rolling"
+      ? undefined
+      : view.kind === "recap"
+        ? view.choice
+        : view.choice;
+  const moreLabel =
+    choice === undefined
+      ? t("more")
+      : choice === "custom"
+        ? t("customShort")
+        : t("lastHours", { count: choice });
+  const rollingHours = rolling?.hours ?? 6;
+  const building = rolling?.building;
+  const updatedAt = rollingCurrent?.checked || latestVersion;
+  const newerReady =
+    view.kind === "rolling" &&
+    latestVersion !== undefined &&
+    pinned !== undefined &&
+    latestVersion > pinned;
 
   return (
     <div className="flex size-full flex-col gap-3 overflow-hidden p-2 md:p-3">
       <Toaster closeButton />
       <div className="flex flex-col gap-2">
-        <div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <h1 className="text-lg font-medium md:text-xl">{t("title")}</h1>
-          <p className="text-sm text-muted-foreground">{t("description")}</p>
-        </div>
-        {config && cameras.length === 0 && (
-          <p className="rounded-md border border-secondary p-3 text-sm">
-            {t("disabled")}
-          </p>
-        )}
-        <div className="flex flex-wrap items-end gap-2">
-          <label className="flex min-w-[8rem] flex-col gap-1 text-sm">
-            {t("camera")}
+          {cameras.length > 1 && (
             <select
-              className="h-10 rounded-md border border-input bg-background px-2"
+              aria-label={t("camera")}
+              className="h-9 rounded-md border border-input bg-background px-2 text-sm"
               value={camera}
               onChange={(event) => {
-                setSelected(undefined);
+                setView({ kind: "rolling" });
+                setPinned(undefined);
                 setCamera(event.target.value);
               }}
             >
@@ -235,122 +312,138 @@ export default function Recap() {
                 </option>
               ))}
             </select>
-          </label>
-          {HOURS.map((hours) => (
-            <Button
-              key={hours}
-              variant="select"
-              disabled={!camera}
-              onClick={() => startHours(hours)}
-            >
-              {hourLabel(hours)}
-            </Button>
-          ))}
-          <Button
-            variant="outline"
-            type="button"
-            aria-expanded={customOpen}
-            onClick={() => setCustomOpen((current) => !current)}
-          >
-            {t("custom")}
-            <LuChevronDown
-              className={`ml-1 size-4 transition-transform ${customOpen ? "rotate-180" : ""}`}
-            />
-          </Button>
+          )}
         </div>
-        {customOpen && (
-          <div className="flex w-full flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-end">
-            <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm">
-              {t("from")}
-              <Input
-                type="datetime-local"
-                value={from}
-                onChange={(event) => setFrom(event.target.value)}
-              />
-            </label>
-            <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm">
-              {t("to")}
-              <Input
-                type="datetime-local"
-                value={to}
-                onChange={(event) => setTo(event.target.value)}
-              />
-            </label>
-            <Button variant="outline" disabled={!camera} onClick={startCustom}>
-              {t("generate")}
+        {config && cameras.length === 0 && (
+          <p className="rounded-md border border-secondary p-3 text-sm">
+            {t("disabled")}
+          </p>
+        )}
+        {cameras.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant={view.kind === "rolling" ? "select" : "default"}
+              aria-pressed={view.kind === "rolling"}
+              onClick={() => {
+                setView({ kind: "rolling" });
+                if (latestVersion) {
+                  setPinned(latestVersion);
+                }
+              }}
+            >
+              {t("lastHours", { count: rollingHours })}
             </Button>
+            <Button
+              variant={choice !== undefined ? "select" : "default"}
+              aria-pressed={choice !== undefined}
+              aria-haspopup="dialog"
+              onClick={() => setPickerOpen(true)}
+            >
+              {moreLabel}
+              <LuChevronDown className="ml-1 size-4" />
+            </Button>
+            <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-x-3 gap-y-1 text-xs text-muted-foreground">
+              {building ? (
+                <span className="tabular-nums">
+                  {building.status === "queued"
+                    ? t("rolling.queued")
+                    : t("rolling.refreshingProgress", {
+                        progress: building.progress ?? 0,
+                      })}
+                </span>
+              ) : updatedAt ? (
+                <span title={times.dayTime(latestVersion)}>
+                  {t("rolling.updated", {
+                    when: times.relative(updatedAt, now),
+                  })}
+                </span>
+              ) : null}
+              {newerReady && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7"
+                  onClick={() => setPinned(latestVersion)}
+                >
+                  <LuSparkles className="mr-1 size-3.5" />
+                  {t("rolling.newer")}
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2"
+                disabled={Boolean(building) || !camera}
+                onClick={refreshNow}
+              >
+                <LuRefreshCw
+                  className={cn("mr-1 size-3.5", building && "animate-spin")}
+                />
+                {t("rolling.refreshNow")}
+              </Button>
+            </div>
           </div>
         )}
       </div>
-      <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] gap-3 overflow-hidden lg:grid-cols-[minmax(0,1.35fr)_minmax(16rem,0.9fr)] lg:grid-rows-1">
-        <div className="min-h-0 min-w-0 overflow-y-auto">
-          {detail?.status === "complete" && <RecapPlayer recap={detail} />}
-          {running && (
-            <div className="rounded-md border border-secondary p-3 text-sm">
-              <div className="mb-1">
-                {detail.message || detail.status} ({detail.progress ?? 0}%)
-              </div>
-              <div className="h-1.5 overflow-hidden rounded bg-secondary">
-                <div
-                  className="h-full bg-selected"
-                  style={{ width: `${detail.progress ?? 0}%` }}
-                />
-              </div>
-              <Button
-                className="mt-2"
-                variant="outline"
-                size="sm"
-                onClick={() => cancel(detail.id)}
-              >
-                {t("cancel")}
-              </Button>
-            </div>
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-y-auto lg:grid-cols-[minmax(0,1fr)_20rem] lg:overflow-hidden">
+        <div className="flex min-h-0 min-w-0 flex-col lg:overflow-y-auto">
+          {view.kind === "rolling" && (
+            <RollingPane
+              status={rolling}
+              detail={rollingDetail}
+              version={pinned}
+              hours={rollingHours}
+              onRefresh={refreshNow}
+            />
           )}
-          {!detail && !running && (
-            <p className="rounded-md border border-dashed border-secondary p-4 text-sm text-muted-foreground">
-              {t("emptyPlayer")}
-            </p>
+          {view.kind === "recap" && (
+            <RecapPane
+              detail={detail}
+              title={
+                view.choice === "custom"
+                  ? t("customShort")
+                  : view.choice
+                    ? t("lastHours", { count: view.choice })
+                    : times.span(detail?.after, detail?.before)
+              }
+              onCancel={() => cancel(view.id)}
+            />
+          )}
+          {view.kind === "playlist" && (
+            <PlaylistPane key={view.ids.join(",")} ids={view.ids} />
           )}
         </div>
-        <div className="min-h-0 overflow-y-auto">
-          <h2 className="mb-2 text-sm font-medium">{t("saved")}</h2>
+        <div className="flex min-h-0 flex-col lg:overflow-y-auto">
+          <h2 className="mb-1 px-1 text-sm font-medium">{t("saved")}</h2>
           {!forCamera.length && (
-            <p className="text-sm text-muted-foreground">{t("empty")}</p>
+            <p className="px-1 text-sm text-muted-foreground">{t("empty")}</p>
           )}
-          <div className="grid grid-cols-2 gap-2 lg:grid-cols-1 xl:grid-cols-2">
+          <div className="flex flex-col gap-1">
             {featured.map((item) => (
-              <RecapCard
+              <RecapListItem
                 key={item.id}
-                item={
-                  detail?.id === item.id
-                    ? {
-                        ...item,
-                        progress: detail.progress ?? item.progress,
-                        message: detail.message || item.message,
-                        status: detail.status || item.status,
-                      }
-                    : item
+                item={item}
+                now={now}
+                active={
+                  (view.kind === "recap" && view.id === item.id) ||
+                  (view.kind === "playlist" && view.ids.includes(item.id))
                 }
-                active={item.id === selected}
-                onOpen={() => choose(item.id)}
+                onOpen={() => setView({ kind: "recap", id: item.id })}
                 onCancel={
-                  item.source !== "archive" &&
-                  (item.status === "queued" || item.status === "running")
+                  item.source !== "archive" && isBusy(item)
                     ? () => cancel(item.id)
                     : undefined
                 }
                 onDelete={
-                  item.source !== "archive" &&
-                  item.status !== "queued" &&
-                  item.status !== "running"
-                    ? () => remove(item)
+                  item.source !== "archive" && !isBusy(item)
+                    ? () => setPendingDelete(item)
                     : undefined
                 }
               />
             ))}
           </div>
           {empty.length > 0 && (
-            <div className="mt-3">
+            <div className="mt-2">
               <Button
                 variant="ghost"
                 size="sm"
@@ -362,16 +455,17 @@ export default function Recap() {
                 {t("emptyRecapsCount", { count: empty.length })}
               </Button>
               {showEmpty && (
-                <div className="mt-2 grid grid-cols-2 gap-2 opacity-70 lg:grid-cols-1 xl:grid-cols-2">
+                <div className="mt-1 flex flex-col gap-1 opacity-70">
                   {empty.map((item) => (
-                    <RecapCard
+                    <RecapListItem
                       key={item.id}
                       item={item}
-                      active={item.id === selected}
-                      onOpen={() => choose(item.id)}
+                      now={now}
+                      active={view.kind === "recap" && view.id === item.id}
+                      onOpen={() => setView({ kind: "recap", id: item.id })}
                       onDelete={
                         item.source !== "archive"
-                          ? () => remove(item)
+                          ? () => setPendingDelete(item)
                           : undefined
                       }
                     />
@@ -382,6 +476,215 @@ export default function Recap() {
           )}
         </div>
       </div>
+      <RecapRangePicker
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        maxHours={maxHours}
+        nightsAvailable={nights}
+        busy={false}
+        selected={choice}
+        onChoose={chooseLonger}
+        onCustom={(after, before) => startBuild({ after, before }, "custom")}
+      />
+      <AlertDialog
+        open={pendingDelete !== undefined}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingDelete(undefined);
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("deleteTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingDelete
+                ? t("deleteDescription", {
+                    when: times.dayTime(
+                      pendingDelete.before || pendingDelete.created,
+                    ),
+                  })
+                : ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>
+              {t("button.cancel", { ns: "common" })}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className={buttonVariants({ variant: "destructive" })}
+              onClick={confirmDelete}
+            >
+              {t("button.delete", { ns: "common" })}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
+  );
+}
+
+function RollingPane({
+  status,
+  detail,
+  version,
+  hours,
+  onRefresh,
+}: {
+  status?: RecapRollingStatus;
+  detail?: RecapManifest;
+  version?: number;
+  hours: number;
+  onRefresh: () => void;
+}) {
+  const { t } = useTranslation(["views/recap"]);
+  if (detail?.status === "complete") {
+    return <RecapPlayer recap={detail} version={version} />;
+  }
+  if (status?.building && !status.current) {
+    return (
+      <RecapBuildProgress
+        recap={status.building}
+        title={t("rolling.firstBuild", { count: hours })}
+      />
+    );
+  }
+  if (status && !status.current) {
+    return (
+      <div className="flex flex-col items-start gap-2 rounded-lg border border-dashed border-secondary p-4 text-sm text-muted-foreground">
+        {status.state?.last === "failed"
+          ? t("rolling.lastFailed")
+          : t("rolling.none", { count: hours })}
+        <Button size="sm" variant="outline" onClick={onRefresh}>
+          {t("rolling.buildNow")}
+        </Button>
+      </div>
+    );
+  }
+  return (
+    <div className="aspect-video w-full animate-pulse rounded-lg bg-secondary/60" />
+  );
+}
+
+function RecapPane({
+  detail,
+  title,
+  onCancel,
+}: {
+  detail?: RecapManifest;
+  title: string;
+  onCancel: () => void;
+}) {
+  const { t } = useTranslation(["views/recap"]);
+  if (!detail) {
+    return (
+      <div className="aspect-video w-full animate-pulse rounded-lg bg-secondary/60" />
+    );
+  }
+  if (isBusy(detail)) {
+    return (
+      <RecapBuildProgress
+        recap={detail}
+        title={t("build.title", { what: title })}
+        onCancel={detail.source !== "archive" ? onCancel : undefined}
+      />
+    );
+  }
+  if (detail.status === "complete") {
+    return <RecapPlayer recap={detail} version={detail.finished} />;
+  }
+  return (
+    <p className="rounded-lg border border-secondary p-4 text-sm text-muted-foreground">
+      {detail.status === "cancelled" ? t("cancelled") : t("failed")}
+    </p>
+  );
+}
+
+function PlaylistPane({ ids }: { ids: string[] }) {
+  const { t } = useTranslation(["views/recap"]);
+  const times = useRecapTime();
+  const [part, setPart] = useState(0);
+  const [advanced, setAdvanced] = useState(false);
+  const { data: detail } = useSWR<RecapManifest>(`recap/${ids[part]}`);
+  const header = (
+    <div className="flex flex-wrap items-center gap-2">
+      {ids.map((id, index) => (
+        <PartChip
+          key={id}
+          id={id}
+          index={index}
+          active={index === part}
+          onClick={() => {
+            setAdvanced(false);
+            setPart(index);
+          }}
+        />
+      ))}
+      <span className="text-xs text-muted-foreground">
+        {t("playlist.hint", { count: ids.length })}
+      </span>
+    </div>
+  );
+  if (!detail || detail.status !== "complete") {
+    return (
+      <div className="flex flex-col gap-2">
+        {header}
+        <div className="aspect-video w-full animate-pulse rounded-lg bg-secondary/60" />
+      </div>
+    );
+  }
+  return (
+    <RecapPlayer
+      recap={detail}
+      version={detail.finished || detail.created}
+      autoPlay={advanced}
+      header={
+        <div className="flex flex-col gap-1">
+          {header}
+          <span className="text-xs text-muted-foreground">
+            {t("playlist.part", {
+              index: part + 1,
+              count: ids.length,
+              span: times.span(detail.after, detail.before),
+            })}
+          </span>
+        </div>
+      }
+      onEnded={() => {
+        if (part < ids.length - 1) {
+          setAdvanced(true);
+          setPart(part + 1);
+        }
+      }}
+    />
+  );
+}
+
+function PartChip({
+  id,
+  index,
+  active,
+  onClick,
+}: {
+  id: string;
+  index: number;
+  active: boolean;
+  onClick: () => void;
+}) {
+  const { t } = useTranslation(["views/recap"]);
+  const times = useRecapTime();
+  const { data: recaps } = useSWR<RecapSummary[]>("recap");
+  const item = recaps?.find((entry) => entry.id === id);
+  return (
+    <Button
+      size="sm"
+      variant={active ? "select" : "outline"}
+      className="h-8"
+      onClick={onClick}
+    >
+      {item?.before
+        ? t("playlist.night", { day: times.day(item.after) })
+        : t("playlist.partShort", { index: index + 1 })}
+    </Button>
   );
 }

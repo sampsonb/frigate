@@ -53,6 +53,45 @@ def ensure_tree(camera: str, recap_id: str) -> Path:
     return path
 
 
+ROLLING_SUFFIX = "_rolling"
+ROLLING_REASON = "rolling"
+
+
+def rolling_id(camera: str) -> str:
+    """Fixed id of a camera's rolling recap. It is rebuilt in place."""
+    return f"{camera}{ROLLING_SUFFIX}"
+
+
+def is_rolling(manifest: dict[str, Any]) -> bool:
+    return str(manifest.get("reason") or "") == ROLLING_REASON or str(
+        manifest.get("id") or ""
+    ).endswith(ROLLING_SUFFIX)
+
+
+def staging_dir(recap_id: str) -> Path:
+    """Build directory for a rolling refresh. A leading dot keeps it out of lists."""
+    return recap_root() / ".staging" / recap_id
+
+
+def swap_into_place(staging: Path, camera: str, recap_id: str) -> Path:
+    """Replace the live rolling recap with a finished build.
+
+    The old folder is renamed aside before the new one is renamed in, so
+    a reader sees either the old recap or the new one. A video already
+    being streamed keeps playing from the old file until it is closed.
+    """
+    target = recap_dir(camera, recap_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    retired = staging.parent / f"{recap_id}.old"
+    if retired.exists():
+        shutil.rmtree(retired, ignore_errors=True)
+    if target.exists():
+        os.replace(target, retired)
+    os.replace(staging, target)
+    shutil.rmtree(retired, ignore_errors=True)
+    return target
+
+
 def write_manifest(directory: Path, payload: dict[str, Any]) -> None:
     """Atomic replace so a reader never sees a half-written manifest."""
     target = directory / MANIFEST
@@ -174,6 +213,12 @@ def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
         "explicit_range": bool(manifest.get("explicit_range")),
         "source": manifest.get("source") or "",
         "categories": summary_categories(manifest.get("categories")),
+        "started": manifest.get("started"),
+        "finished": manifest.get("finished"),
+        "took_s": manifest.get("took_s"),
+        "checked": manifest.get("checked"),
+        "stage": manifest.get("stage") or "",
+        "hours": manifest.get("hours"),
     }
 
 
@@ -224,6 +269,8 @@ def purge_expired(retain_days_for: dict[str, int], now: float | None = None) -> 
         if moment - created < days * 86400:
             continue
         if summary.get("status") in ("queued", "running"):
+            continue
+        if is_rolling(summary):
             continue
         recap_id = str(summary.get("id") or "")
         if safe_id(camera) and safe_id(recap_id) and delete_recap(camera, recap_id):

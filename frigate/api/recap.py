@@ -243,16 +243,76 @@ async def recap_event_snapshot(request: Request, event_id: str):
     )
 
 
+@router.get(
+    "/recap/rolling/{camera_name}",
+    dependencies=[Depends(require_camera_access), Depends(allow_any_authenticated())],
+    summary="Rolling recap status",
+    description=(
+        "The camera's rolling recap (the last rolling_hours, rebuilt in place "
+        "every rolling_interval_minutes when something changed), plus any "
+        "refresh that is building."
+    ),
+)
+def recap_rolling(request: Request, camera_name: str):
+    manager = _manager(request)
+    if manager is None:
+        return JSONResponse(
+            content={"success": False, "message": "Recap is not available"},
+            status_code=503,
+        )
+    camera = manager.config.cameras.get(camera_name)
+    if camera is None or not camera.recap.enabled:
+        return JSONResponse(
+            content={
+                "success": False,
+                "message": "Recap is not enabled for that camera",
+            },
+            status_code=404,
+        )
+    body = manager.rolling_status(camera_name)
+    body["hours"] = camera.recap.rolling_hours
+    body["interval_minutes"] = camera.recap.rolling_interval_minutes
+    return JSONResponse(content=body)
+
+
+@router.post(
+    "/recap/rolling/{camera_name}/refresh",
+    dependencies=[Depends(require_camera_access), Depends(allow_any_authenticated())],
+    summary="Refresh the rolling recap now",
+    description=(
+        "Checks for new events and rebuilds the rolling recap ahead of "
+        "scheduled work. Pass force=true to rebuild even when nothing changed."
+    ),
+)
+def recap_rolling_refresh(request: Request, camera_name: str, force: bool = False):
+    manager = _manager(request)
+    if manager is None:
+        return JSONResponse(
+            content={"success": False, "message": "Recap is not available"},
+            status_code=503,
+        )
+    try:
+        result = manager.start_rolling(camera_name, manual=True, force=force)
+    except ValueError as err:
+        return JSONResponse(
+            content={"success": False, "message": str(err)},
+            status_code=400,
+        )
+    return JSONResponse(content={"success": True, **result})
+
+
 @router.post(
     "/recap/{camera_name}/start",
     dependencies=[Depends(require_camera_access), Depends(allow_any_authenticated())],
     summary="Start a recap",
     description=(
-        "Queues a synopsis for the camera. Pass hours (1, 6, 12, 24) or an "
+        "Queues a synopsis for the camera. Pass hours (for example 12 or 48) or an "
         "after/before epoch range. An explicit after and before that is one "
         "local midnight-to-midnight day uses the same kind as that day's "
         "nightly recap. Any other explicit range is its own kind and is not "
-        "grouped as last-N hours. One recap runs at a time. Others wait."
+        "grouped as last-N hours. One recap runs at a time. Others wait, "
+        "and a request already waiting or running is returned instead of "
+        "being queued twice."
     ),
 )
 def recap_start(request: Request, camera_name: str, body: RecapStartBody):

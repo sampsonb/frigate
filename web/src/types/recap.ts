@@ -35,6 +35,15 @@ export type RecapManifest = {
   height?: number;
   frame_count?: number;
   source?: "local" | "archive";
+  reason?: string;
+  kind?: string;
+  hours?: number;
+  started?: number;
+  finished?: number;
+  took_s?: number;
+  checked?: number;
+  stage?: string;
+  elapsed_s?: number;
   tracks?: RecapTrack[];
   categories?: RecapCategory[];
 };
@@ -54,7 +63,30 @@ export type RecapSummary = {
   height?: number;
   source?: "local" | "archive";
   reason?: string;
+  kind?: string;
+  explicit_range?: boolean;
+  hours?: number;
+  started?: number;
+  finished?: number;
+  took_s?: number;
+  checked?: number;
+  stage?: string;
   categories?: RecapCategory[];
+};
+
+export type RecapRollingStatus = {
+  camera: string;
+  id: string;
+  hours: number;
+  interval_minutes: number;
+  current: RecapManifest | null;
+  building: RecapManifest | null;
+  state: {
+    last?: string;
+    at?: number;
+    error?: string;
+    took_s?: number;
+  };
 };
 
 export type RecapClipSource = {

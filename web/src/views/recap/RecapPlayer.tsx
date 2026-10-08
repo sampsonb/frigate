@@ -5,13 +5,25 @@ import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { RecapClipSource, RecapManifest, RecapTrack } from "@/types/recap";
 import axios from "axios";
 import Hls from "hls.js";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 type RecapPlayerProps = {
   recap: RecapManifest;
+  // Changes when a recap is rebuilt in place, so the browser fetches the new file.
+  version?: number;
+  autoPlay?: boolean;
+  onEnded?: () => void;
+  header?: ReactNode;
 };
 
 type ContentRect = { x: number; y: number; w: number; h: number };
@@ -99,7 +111,13 @@ function RecapClipVideo({ src, hls }: { src: string; hls: boolean }) {
   );
 }
 
-export default function RecapPlayer({ recap }: RecapPlayerProps) {
+export default function RecapPlayer({
+  recap,
+  version,
+  autoPlay = false,
+  onEnded,
+  header,
+}: RecapPlayerProps) {
   const { t } = useTranslation(["views/recap"]);
   const navigate = useNavigate();
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -262,8 +280,9 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
+    <div className="flex min-h-0 flex-1 flex-col gap-3 xl:flex-row">
       <div className="flex min-w-0 flex-1 flex-col gap-2">
+        {header}
         <div className="flex flex-wrap gap-3">
           {categories.map((category) => (
             <label
@@ -291,15 +310,18 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
         <p className="text-xs text-muted-foreground">{t("clickHint")}</p>
         <div
           ref={frameRef}
-          className="relative aspect-video max-h-[42vh] w-full overflow-hidden rounded-lg bg-black lg:max-h-[68vh]"
+          className="relative aspect-video max-h-[46vh] w-full overflow-hidden rounded-lg bg-black lg:max-h-[62vh]"
         >
           <video
             ref={videoRef}
-            key={recap.id}
+            key={`${recap.id}-${version ?? 0}`}
             className="size-full object-contain"
-            src={`${baseUrl}api/recap/${recap.id}/video.mp4`}
+            src={`${baseUrl}api/recap/${recap.id}/video.mp4${version ? `?v=${version}` : ""}`}
             controls
             playsInline
+            autoPlay={autoPlay}
+            muted={autoPlay}
+            onEnded={() => onEnded?.()}
             onLoadedMetadata={(event) => {
               measure();
               setCurrent(event.currentTarget.currentTime);
@@ -359,7 +381,7 @@ export default function RecapPlayer({ recap }: RecapPlayerProps) {
           </div>
         </div>
       </div>
-      <div className="flex max-h-[50vh] w-full flex-col gap-1 overflow-y-auto lg:max-h-none lg:w-72">
+      <div className="flex max-h-[40vh] w-full flex-col gap-1 overflow-y-auto xl:max-h-none xl:w-64">
         <div className="text-sm font-medium">{t("eventList")}</div>
         {visibleTracks.length === 0 && (
           <p className="text-sm text-muted-foreground">{t("noEvents")}</p>

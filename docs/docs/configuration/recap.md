@@ -113,6 +113,23 @@ Archived recaps show in the Recap list with an Archive badge. They are not delet
 
 If you only set `url`, clip fallback reads `index/YYYY-MM-DD.json` from that host, and the list reads `recap/index.json`. Playing a recording that spans multiple files needs `path`, because Frigate has to join them.
 
+## Rolling recap
+
+Each recap camera keeps one rolling recap of the last `rolling_hours` (default 6) ready, so the Recap page can play it right away. Every `rolling_interval_minutes` (default 30, `0` turns it off) Frigate checks the events in that window. If no event is new and none changed its end time, the refresh is skipped. Otherwise the recap is rebuilt in a staging folder and swapped into place, so there is only ever one rolling recap per camera and the saved list does not grow. After `rolling_max_age_minutes` (default 180) it is rebuilt even with no new events, so objects that aged out of the window drop off.
+
+```yaml
+recap:
+  rolling_hours: 6
+  rolling_interval_minutes: 30
+  rolling_max_age_minutes: 180
+```
+
+Queue rules: one recap is built at a time. A request from the UI (a longer range, a custom range, or Refresh now) runs before scheduled work. A refresh never waits behind another refresh of the same camera, and a request that is already waiting or running is returned instead of being queued twice.
+
+Each event's cutouts are cached under `/media/frigate/recap/.cutcache`, keyed on the event id and end time, output size, sample rate, the per-object time cap, the category, and a cache version. A refresh only decodes events it has not seen. Entries unused for 74 hours are removed after each job, and the size is written to the log. Manifests record `started`, `finished`, `took_s`, the start of each stage, and cache hits and misses.
+
+`GET /api/recap/rolling/<camera>` returns the rolling recap, any refresh in progress, and the last outcome. `POST /api/recap/rolling/<camera>/refresh` checks now (`?force=true` rebuilds even when nothing changed).
+
 ## Install on an existing 0.17.2 container
 
 Build the overlay on the host. The repository is public, so this does not need a GitHub login. It starts from stock `ghcr.io/blakeblackshear/frigate:0.17.2` (pinned by digest) and does not compile Frigate. On a Beelink that already has that image, expect about 15 to 25 minutes. Most of that is `npm install` and the web UI production build. The first run also downloads the `node:20` image used only for that build.
@@ -160,5 +177,5 @@ Semantic search, when enabled, only looks at the nearest thumbnails Frigate alre
 - Cutouts are weaker than a segmentation model on a cluttered background. A connected moving object is included. A shadow or a full-frame lighting change is not.
 - The schedule is a single daily time, not a cron expression. If Frigate is down at that minute, that day's recap is skipped.
 - Label times and the nightly schedule use `ui.timezone`. The container clock is often UTC. If `ui.timezone` is unset, both fall back to the container's local time.
-- At most `max_events` events are processed (default 400), oldest first after parked vehicles are set aside.
+- At most `max_events` events are processed (default 400). When a window has more, the newest are kept, after parked vehicles are set aside.
 - An archive URL alone cannot join multiple recording files. Mount `archive.path` for that.

@@ -504,6 +504,17 @@
         "max_window_hours": {
           "label": "Longest time range an on-demand recap may cover."
         },
+        "rolling_hours": {
+          "label": "Hours covered by the rolling recap that is kept ready."
+        },
+        "rolling_interval_minutes": {
+          "label": "Minutes between rolling recap refreshes. 0 turns the rolling recap off.",
+          "description": "The rolling recap is rebuilt in place on this interval. A refresh is skipped when no event in the window is new or changed."
+        },
+        "rolling_max_age_minutes": {
+          "label": "Rebuild the rolling recap after this long even with no new events.",
+          "description": "Drops events that have aged out of the window. 0 never forces a rebuild."
+        },
         "labels": {
           "label": "Tracked labels to include."
         },

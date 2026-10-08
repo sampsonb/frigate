@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ import cv2
 import numpy as np
 
 from frigate.config.recap import RecapConfig
+from frigate.recap import cutcache
 from frigate.recap.categories import (
     CAT_COLOR,
     CAT_NAME,
@@ -294,9 +296,17 @@ def generate_recap(
     dog_walker_ids: set[str] | None = None,
     width: int,
     height: int,
+    cache_root: Path | None = None,
+    cache_stats: cutcache.CacheStats | None = None,
+    use_cache: bool = False,
 ) -> dict[str, Any]:
-    """Build ``video.mp4`` and return the manifest body (without status)."""
+    """Build ``video.mp4`` and return the manifest body (without status).
+
+    With ``use_cache`` each event's cutouts are read from, or written to,
+    the per-event cache in ``cutcache`` so only new events are decoded.
+    """
     delivery_ids = delivery_ids or set()
+    stats = cache_stats if cache_stats is not None else cutcache.CacheStats()
     dog_walker_ids = dog_walker_ids or set()
     progress(8, "Choosing objects")
     if cancel():
@@ -356,9 +366,7 @@ def generate_recap(
             len(active),
             settings.max_events,
         )
-        active.sort(key=lambda item: item[2].start)
-        overflow = active[settings.max_events :]
-        active = active[: settings.max_events]
+        active, overflow = cap_newest(active, settings.max_events)
         for event, _category, _track in overflow:
             excluded.append(
                 {
@@ -390,8 +398,19 @@ def generate_recap(
             if category == "vehicle"
             else settings.sample_fps
         )
-        loaded = load_clip(event, sample_fps, width, height)
-        if not loaded:
+        cut = _cutouts_for(
+            event,
+            category,
+            sample_fps,
+            settings,
+            width,
+            height,
+            load_clip,
+            use_cache=use_cache,
+            cache_root=cache_root,
+            stats=stats,
+        )
+        if cut.status == "no_frames":
             excluded.append(
                 {
                     "id": event.get("id"),
@@ -401,20 +420,9 @@ def generate_recap(
                 }
             )
             continue
-        frames, times = loaded
-        boxes = boxes_at(event, times, width, height)
-        if not boxes:
+        if cut.status == "no_box":
             continue
-        limit = max(3, int(settings.max_object_seconds * sample_fps))
-        if len(frames) > limit:
-            chosen = np.linspace(0, len(frames) - 1, limit).round().astype(int)
-            frames = [frames[int(item)] for item in chosen]
-            times = [times[int(item)] for item in chosen]
-            boxes = [boxes[int(item)] for item in chosen]
-        ghosts = build_cutouts(frames, boxes, category)
-        context_first = _jpeg(frames[0])
-        context_last = _jpeg(frames[-1])
-        if not ghosts:
+        if cut.status != "ok":
             excluded.append(
                 {
                     "id": event.get("id"),
@@ -426,16 +434,19 @@ def generate_recap(
             continue
         ghost_frames = [
             GhostFrame(
-                x=int(ghost["x"]),
-                y=int(ghost["y"]),
-                box=ghost["box"],  # type: ignore[arg-type]
-                crop=ghost["crop"],  # type: ignore[arg-type]
-                alpha=ghost["alpha"],  # type: ignore[arg-type]
+                x=int(item["x"]),
+                y=int(item["y"]),
+                box=tuple(item["box"]),  # type: ignore[arg-type]
+                jpeg=item["jpeg"],
+                alpha_shape=tuple(item["alpha_shape"]),  # type: ignore[arg-type]
+                alpha_bytes=item["alpha_bytes"],
             )
-            for ghost in ghosts
+            for item in cut.frames
         ]
-        for ghost_frame in ghost_frames:
-            ghost_frame.pack()
+        boxes = list(cut.boxes)
+        times = list(cut.times)
+        context_first = cut.context_first
+        context_last = cut.context_last
         count = min(len(ghost_frames), len(boxes), len(times))
         ghost_frames = ghost_frames[:count]
         boxes = boxes[:count]
@@ -463,7 +474,7 @@ def generate_recap(
             )
         )
         tracks.append(track)
-        if settings.pause_seconds:
+        if settings.pause_seconds and not cut.from_cache:
             time.sleep(settings.pause_seconds)
 
     dropped_animals = _merge_dog_walkers(tracks)
@@ -667,6 +678,153 @@ def generate_recap(
         rects,
         excluded,
         links,
+    )
+
+
+def cap_newest(
+    active: list[tuple[dict[str, Any], str, MotionTrack]], max_events: int
+) -> tuple[
+    list[tuple[dict[str, Any], str, MotionTrack]],
+    list[tuple[dict[str, Any], str, MotionTrack]],
+]:
+    """Keep the newest ``max_events`` objects, oldest first.
+
+    A busy window used to keep the first objects and drop the most recent
+    ones, which is the activity a viewer most wants to see.
+    """
+    ordered = sorted(active, key=lambda item: item[2].start)
+    if max_events <= 0:
+        return [], ordered
+    if len(ordered) <= max_events:
+        return ordered, []
+    return ordered[-max_events:], ordered[:-max_events]
+
+
+@dataclass
+class _Cut:
+    status: str
+    frames: list[dict[str, Any]] = field(default_factory=list)
+    boxes: list[tuple[float, float, float, float]] = field(default_factory=list)
+    times: list[float] = field(default_factory=list)
+    context_first: bytes | None = None
+    context_last: bytes | None = None
+    from_cache: bool = False
+
+
+def _cutouts_for(
+    event: dict[str, Any],
+    category: str,
+    sample_fps: float,
+    settings: RecapConfig,
+    width: int,
+    height: int,
+    load_clip: LoadClip,
+    *,
+    use_cache: bool,
+    cache_root: Path | None,
+    stats: cutcache.CacheStats,
+) -> _Cut:
+    """Ghost frames for one event, from the cache when possible."""
+    raw_end = event.get("end_time")
+    end_time = None if raw_end is None else float(raw_end)
+    key = ""
+    if use_cache:
+        key = cutcache.cache_key(
+            str(event.get("id")),
+            end_time,
+            width,
+            height,
+            sample_fps,
+            settings.max_object_seconds,
+            category,
+        )
+        hit = cutcache.load(key, cache_root)
+        if hit is not None and hit.status in ("ok", "no_frames", "no_cutout"):
+            stats.hits += 1
+            return _Cut(
+                status=hit.status,
+                frames=hit.frames,
+                boxes=list(hit.boxes),
+                times=list(hit.times),
+                context_first=hit.context_first,
+                context_last=hit.context_last,
+                from_cache=True,
+            )
+        stats.misses += 1
+
+    def remember(cut: _Cut) -> _Cut:
+        if not use_cache:
+            return cut
+        if cut.status != "ok" and not cutcache.should_cache_failure(end_time):
+            return cut
+        if cutcache.store(
+            key,
+            cutcache.CachedCutout(
+                status=cut.status,
+                frames=cut.frames,
+                boxes=cut.boxes,
+                times=cut.times,
+                context_first=cut.context_first,
+                context_last=cut.context_last,
+            ),
+            cache_root,
+        ):
+            stats.stored += 1
+        return cut
+
+    loaded = load_clip(event, sample_fps, width, height)
+    if not loaded:
+        return remember(_Cut(status="no_frames"))
+    frames, times = loaded
+    boxes = boxes_at(event, times, width, height)
+    if not boxes:
+        return _Cut(status="no_box")
+    limit = max(3, int(settings.max_object_seconds * sample_fps))
+    if len(frames) > limit:
+        chosen = np.linspace(0, len(frames) - 1, limit).round().astype(int)
+        frames = [frames[int(item)] for item in chosen]
+        times = [times[int(item)] for item in chosen]
+        boxes = [boxes[int(item)] for item in chosen]
+    ghosts = build_cutouts(frames, boxes, category)
+    # Only a person's clip is used to crop a parked car they get in or out of.
+    wants_context = str(event.get("label") or "") == "person"
+    context_first = _jpeg(frames[0]) if wants_context else None
+    context_last = _jpeg(frames[-1]) if wants_context else None
+    if not ghosts:
+        return remember(_Cut(status="no_cutout"))
+    ghost_frames = [
+        GhostFrame(
+            x=int(ghost["x"]),
+            y=int(ghost["y"]),
+            box=ghost["box"],  # type: ignore[arg-type]
+            crop=ghost["crop"],  # type: ignore[arg-type]
+            alpha=ghost["alpha"],  # type: ignore[arg-type]
+        )
+        for ghost in ghosts
+    ]
+    for ghost_frame in ghost_frames:
+        ghost_frame.pack()
+    packed: list[dict[str, Any]] = []
+    kept_boxes: list[tuple[float, float, float, float]] = []
+    kept_times: list[float] = []
+    for ghost_frame, box, moment in zip(ghost_frames, boxes, times):
+        item = cutcache.pack_frames([ghost_frame])
+        if not item:
+            continue
+        packed.append(item[0])
+        kept_boxes.append(tuple(float(v) for v in box))  # type: ignore[arg-type]
+        kept_times.append(float(moment))
+    if not packed:
+        return remember(_Cut(status="no_cutout"))
+    return remember(
+        _Cut(
+            status="ok",
+            frames=packed,
+            boxes=kept_boxes,
+            times=kept_times,
+            context_first=context_first,
+            context_last=context_last,
+        )
     )
 
 

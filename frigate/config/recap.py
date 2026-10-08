@@ -117,6 +117,29 @@ class RecapConfig(FrigateBaseModel):
         gt=0,
         le=168,
     )
+    rolling_hours: float = Field(
+        default=6,
+        title="Hours covered by the rolling recap that is kept ready.",
+        gt=0,
+        le=48,
+    )
+    rolling_interval_minutes: int = Field(
+        default=30,
+        title="Minutes between rolling recap refreshes. 0 turns the rolling recap off.",
+        description=(
+            "The rolling recap is rebuilt in place on this interval. A refresh "
+            "is skipped when no event in the window is new or changed."
+        ),
+        ge=0,
+        le=1440,
+    )
+    rolling_max_age_minutes: int = Field(
+        default=180,
+        title="Rebuild the rolling recap after this long even with no new events.",
+        description="Drops events that have aged out of the window. 0 never forces a rebuild.",
+        ge=0,
+        le=1440,
+    )
     labels: list[str] = Field(
         default_factory=lambda: list(DEFAULT_RECAP_LABELS),
         title="Tracked labels to include.",

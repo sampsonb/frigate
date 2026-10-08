@@ -53,6 +53,60 @@ def load_events(
     return events
 
 
+def event_fingerprint(
+    camera: str, after: float, before: float, labels: list[str]
+) -> dict[str, float | None]:
+    """``{event id: end_time}`` for the window, without loading event data.
+
+    The rolling recap compares this with the map saved at its last build.
+    A new id, or an end time that changed (an event that was still open),
+    means the recap is out of date. It uses the same filters as
+    ``load_events``.
+    """
+    if not labels:
+        return {}
+    query = (
+        Event.select(Event.id, Event.end_time)
+        .where(Event.camera == camera)
+        .where(Event.label.in_(labels))
+        .where(
+            (Event.has_clip.is_null(True)) | (Event.has_clip == True)  # noqa: E712
+        )
+        .where(
+            (Event.false_positive.is_null(True)) | (Event.false_positive == False)  # noqa: E712
+        )
+        .where(Event.start_time < before)
+        .where((Event.end_time.is_null(True)) | (Event.end_time > after))
+        .tuples()
+    )
+    found: dict[str, float | None] = {}
+    for event_id, end_time in query:
+        try:
+            found[str(event_id)] = (
+                None if end_time is None else round(float(end_time), 2)
+            )
+        except (TypeError, ValueError):
+            found[str(event_id)] = None
+    return found
+
+
+def fingerprint_changed(
+    previous: dict[str, float | None] | None, current: dict[str, float | None]
+) -> bool:
+    """True when ``current`` has an event that is new or whose end time moved.
+
+    Events that only aged out of the window do not count.
+    """
+    if previous is None:
+        return True
+    for event_id, end_time in current.items():
+        if event_id not in previous:
+            return True
+        if previous[event_id] != end_time:
+            return True
+    return False
+
+
 def load_recordings(camera: str, after: float, before: float) -> list[dict[str, Any]]:
     """Recording files overlapping the window.
 
