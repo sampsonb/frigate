@@ -491,7 +491,7 @@ class RecapJob(threading.Thread):
         # Set for a rolling refresh. The window is fixed when the job starts.
         self.rolling_hours = rolling_hours
         self._cancel = threading.Event()
-        self._started = 0.0
+        self._t0 = 0.0
         self._stage = ""
         self._stage_times: dict[str, float] = {}
         self._cache_stats = cutcache.CacheStats()
@@ -504,7 +504,7 @@ class RecapJob(threading.Thread):
             os.nice(10)
         except OSError:
             pass
-        self._started = time.time()
+        self._t0 = time.time()
         try:
             self._run()
         except RecapCancelled:
@@ -527,7 +527,7 @@ class RecapJob(threading.Thread):
                 "last": status,
                 "at": finished,
                 "error": error[:200],
-                "took_s": round(finished - self._started, 1),
+                "took_s": round(finished - self._t0, 1),
             }
             shutil.rmtree(self.directory, ignore_errors=True)
             return
@@ -539,7 +539,7 @@ class RecapJob(threading.Thread):
                 status=status,
                 message=message,
                 finished=finished,
-                took_s=round(finished - self._started, 1),
+                took_s=round(finished - self._t0, 1),
             )
         except OSError:
             logger.debug("Recap %s folder is gone", self.recap_id)
@@ -557,7 +557,7 @@ class RecapJob(threading.Thread):
             logger.debug("Recap cache cleanup failed", exc_info=True)
 
     def _progress(self, percent: float, message: str) -> None:
-        elapsed = round(time.time() - self._started, 1)
+        elapsed = round(time.time() - self._t0, 1)
         stage = stage_for(percent)
         if stage != self._stage:
             self._stage = stage
@@ -581,7 +581,7 @@ class RecapJob(threading.Thread):
             status="running",
             progress=1,
             message="Looking up events",
-            started=self._started,
+            started=self._t0,
             after=self.after,
             before=self.before,
         )
@@ -669,9 +669,9 @@ class RecapJob(threading.Thread):
         current["status"] = "complete"
         current["progress"] = 100
         current["message"] = "Ready"
-        current["started"] = self._started
+        current["started"] = self._t0
         current["finished"] = finished
-        current["took_s"] = round(finished - self._started, 1)
+        current["took_s"] = round(finished - self._t0, 1)
         current["stage_started"] = dict(self._stage_times)
         current["stage"] = "done"
         current["cache"] = {

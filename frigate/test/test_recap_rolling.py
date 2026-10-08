@@ -380,5 +380,37 @@ class TestRollingQueue(unittest.TestCase):
         self.assertEqual(call.call_count, 4)
 
 
+class TestRecapJobThread(unittest.TestCase):
+    def test_job_starts_as_a_thread_and_records_timing(self):
+        from frigate.recap import manager as manager_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch("frigate.recap.storage.RECAP_DIR", str(root)),
+                patch("frigate.recap.manager.RECAP_DIR", str(root)),
+                patch.object(manager_module.cutcache, "purge", return_value=(0, 0, 0)),
+            ):
+                manager = manager_module.RecapManager(_fake_config(tmp))
+                ran = []
+
+                def fake_run(job):
+                    ran.append(job.recap_id)
+                    job._progress(50, "Cutting out person 1 of 2")
+
+                with patch.object(manager_module.RecapJob, "_run", fake_run):
+                    manifest = manager.start("front", 0, 3600)
+                    job = manager._jobs.get(manifest["id"])
+                    if job is not None:
+                        job.join(timeout=5)
+                self.assertEqual(ran, [manifest["id"]])
+                from frigate.recap.storage import read_manifest, recap_dir
+
+                saved = read_manifest(recap_dir("front", manifest["id"]))
+                self.assertEqual(saved["stage"], "cutouts")
+                self.assertIn("cutouts", saved["stage_started"])
+                self.assertEqual(manager.queue_snapshot(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
