@@ -30,6 +30,16 @@ BRIGHT_DELTA = 24.0
 PLATE_FADE_SECONDS = 0.5
 # How much saturation and brightness to take off the plate so cutouts pop.
 PLATE_RECEDE = 0.18
+# Smaller than this on screen, a cutout is a speck. 0.15% of a 1280x720
+# frame is about 1400 pixels. Skip it instead of pointing a label at it.
+MIN_VISIBLE_AREA = 0.0015
+# Median channel gap against the plate, below which the object does not
+# read and should not be labeled.
+MIN_CONTRAST = 12.0
+# A mask pixel this close to the plate is background, not the object.
+PLATE_DIFF = 10
+# Below this share of the mask, the cutout is the plate with a box around it.
+MIN_OBJECT_FRACTION = 0.25
 
 
 @dataclass(frozen=True)
@@ -120,18 +130,25 @@ def cutout_is_visible(
     origin_y: int,
     width: int,
     height: int,
+    crop: np.ndarray | None = None,
+    plate: np.ndarray | None = None,
 ) -> tuple[bool, tuple[int, int] | None]:
-    """Whether this ghost should get a label and a leader.
+    """Whether this ghost should be drawn, and where its leader ends.
 
     Returns the tip of the leader (top of the opaque pixels) when the
     cutout is on screen. An empty mask, a box that is mostly off the
-    frame, or a mask that misses the detector box returns no tip.
+    frame, a mask that misses the detector box, a speck under about
+    0.15% of the frame, or a cutout with no contrast against the plate
+    returns no tip. The caller then skips the ghost, the label, and
+    the leader.
     """
     if alpha.size == 0 or mostly_off_frame(box, width, height):
         return False, None
     opaque = alpha >= 64
     count = int(opaque.sum())
     if count < 48:
+        return False, None
+    if width > 0 and height > 0 and count < MIN_VISIBLE_AREA * width * height:
         return False, None
     ys, xs = np.nonzero(opaque)
     span_w = int(xs.max() - xs.min() + 1)
@@ -156,10 +173,89 @@ def cutout_is_visible(
     )
     if int(inset.sum()) < 48:
         return False, None
+    if not _contrasts_with_plate(crop, plate, opaque):
+        return False, None
     top_band = ys <= int(ys.min()) + max(1, span_h // 6)
     tip_x = int(origin_x + round(float(xs[top_band].mean())))
     tip_y = int(origin_y + int(ys.min()))
     return True, (tip_x, tip_y)
+
+
+def _contrasts_with_plate(
+    crop: np.ndarray | None,
+    plate: np.ndarray | None,
+    opaque: np.ndarray,
+) -> bool:
+    """True when the cutout actually reads against the plate under it.
+
+    Without a plate, only the shape checks apply. With one, the median
+    gap on the opaque pixels has to be large enough to see.
+    """
+    if crop is None or plate is None:
+        return True
+    if crop.shape[:2] != opaque.shape[:2] or plate.shape[:2] != opaque.shape[:2]:
+        return True
+    if not np.any(opaque):
+        return False
+    diff = cv2.absdiff(crop, plate).max(axis=2)
+    return float(np.median(diff[opaque])) >= MIN_CONTRAST
+
+
+def tighten_against_plate(
+    crop: np.ndarray,
+    alpha: np.ndarray,
+    plate_patch: np.ndarray,
+) -> np.ndarray | None:
+    """Keep the part of a mask that is not the plate. None if that is most of it.
+
+    A night fallback fills the detector box, so the outline wraps the
+    road and a flower pot beside the car. Pixels close to the plate are
+    removed and the contour of what remains is the mask. The outline is
+    drawn on that contour. A mask that is mostly the plate is dropped.
+    """
+    if (
+        crop.size == 0
+        or crop.shape[:2] != alpha.shape[:2]
+        or crop.shape[:2] != plate_patch.shape[:2]
+    ):
+        return alpha
+    mask = alpha >= 32
+    count = int(mask.sum())
+    if count < 8:
+        return alpha
+    diff = cv2.absdiff(crop, plate_patch).max(axis=2)
+    changed = mask & (diff >= PLATE_DIFF)
+    changed_count = int(changed.sum())
+    if changed_count < MIN_OBJECT_FRACTION * count:
+        return None
+    # The motion mask is already the object. Leave its feather alone.
+    if changed_count >= 0.85 * count:
+        return alpha
+    binary = changed.astype(np.uint8)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    areas = [cv2.contourArea(contour) for contour in contours]
+    largest = max(areas)
+    if largest < 8:
+        return None
+    filled = np.zeros_like(binary)
+    cv2.drawContours(
+        filled,
+        [
+            contour
+            for contour, area in zip(contours, areas, strict=True)
+            if area >= 0.08 * largest
+        ],
+        -1,
+        255,
+        -1,
+    )
+    # Filling the car's contour must not grow back out to the old box.
+    filled[alpha < 32] = 0
+    if int((filled > 0).sum()) < 8:
+        return None
+    return filled
 
 
 def plate_sample_times(

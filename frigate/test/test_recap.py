@@ -60,6 +60,7 @@ from frigate.recap.plates import (
     plate_index_at,
     prepare_cutout,
     recede_plate,
+    tighten_against_plate,
 )
 from frigate.recap.render import (
     GhostFrame,
@@ -1998,7 +1999,9 @@ class TestLightingPlates(unittest.TestCase):
         # is only the lower part of the crop, which is what the line must hit.
         alpha[40:88, 10:90] = 255
         crop = np.full((90, 100, 3), 25, np.uint8)
-        crop[40:88, 10:90] = (28, 28, 28)
+        # The body has to differ from the plate. A mask that matches the
+        # plate is background and is not drawn.
+        crop[40:88, 10:90] = (110, 110, 110)
         ghost = GhostFrame(x=90, y=30, box=box, crop=crop, alpha=alpha)
         unit = ScheduledUnit(
             event_id="car",
@@ -2141,6 +2144,163 @@ class TestLightingPlates(unittest.TestCase):
         assert ghosts is not None
         for ghost in ghosts:
             self.assertEqual(int(np.asarray(ghost["alpha"]).sum()), 0)
+
+    def test_loose_box_keeps_the_car_and_not_the_flower_pot(self):
+        height, width = 180, 320
+        plate = np.full((height, width, 3), 40, np.uint8)
+        plate[80:120, 200:240] = 110
+        frame = plate.copy()
+        frame[50:130, 60:150] = 170
+        _x, _y, mask = attach_motion(
+            frame, plate, (40.0, 30.0, 250.0, 150.0), "vehicle"
+        )
+        full = np.zeros((height, width), np.uint8)
+        full[_y : _y + mask.shape[0], _x : _x + mask.shape[1]] = mask
+        self.assertGreater(float(full[70:110, 80:130].mean()), 0.5)
+        self.assertEqual(int(full[80:120, 200:240].sum()), 0)
+        self.assertEqual(int(full[32:48, 42:58].sum()), 0)
+
+
+def _vehicle_frame(
+    plate: np.ndarray,
+    ghost: GhostFrame,
+    box: tuple[float, float, float, float],
+) -> np.ndarray:
+    unit = ScheduledUnit(
+        event_id="car",
+        clip_event_id="car",
+        label="car",
+        category="vehicle",
+        start_time=0.0,
+        boxes=[box],
+        text="8:19 PM",
+    )
+    tube = Tube(
+        event_id="car",
+        clip_event_id="car",
+        label="car",
+        category="vehicle",
+        start_time=0.0,
+        frames=[ghost],
+    )
+    return compose_frame(
+        plate,
+        [unit],
+        [tube],
+        [0],
+        [(8, 8, 80, 36)],
+        0,
+        header="",
+        header_h=0,
+        fade_frames=1,
+        label_opacity=0.5,
+        font_scale=1.0,
+        repeats=[1],
+    )
+
+
+class TestTightNightMasks(unittest.TestCase):
+    def test_rectangular_mask_shrinks_to_the_car(self):
+        plate = _ir_frame(180, 320, 40)
+        plate[90:125, 200:235] = 100
+        box = (60.0, 40.0, 250.0, 150.0)
+        crop = plate[40:150, 60:250].copy()
+        crop[30:100, 20:100] = 160
+        alpha = np.full(crop.shape[:2], 255, np.uint8)
+        tight = tighten_against_plate(crop, alpha, plate[40:150, 60:250])
+        self.assertIsNotNone(tight)
+        assert tight is not None
+        # Local car is y 30:100, x 20:100. The pot is y 50:85, x 140:175.
+        self.assertGreater(int((tight[40:90, 30:90] >= 64).sum()), 400)
+        self.assertEqual(int(tight[50:85, 140:175].sum()), 0)
+        self.assertEqual(int(tight[0:15, 0:15].sum()), 0)
+
+        ghost = GhostFrame(x=60, y=40, box=box, crop=crop, alpha=alpha)
+        drawn = _vehicle_frame(plate, ghost, box)
+        quiet = recede_plate(plate)
+        # The pot and the empty corner of the box stay the plate.
+        self.assertTrue(np.array_equal(drawn[100, 215], quiet[100, 215]))
+        self.assertTrue(np.array_equal(drawn[48, 70], quiet[48, 70]))
+        # Outline sits on the car, not along the top of the detector box.
+        edge = drawn[90:110, 74:80].astype(np.int16)
+        self.assertGreater(float(edge[:, :, 2].mean()), 70)
+        self.assertGreater(
+            float(edge[:, :, 2].mean()), float(edge[:, :, 0].mean()) + 30
+        )
+        box_top = drawn[36:42, 140:180].astype(np.int16)
+        self.assertLess(float(box_top[:, :, 2].mean()), 50)
+
+    def test_a_mask_that_matches_the_plate_is_dropped(self):
+        plate = _ir_frame(180, 320, 40)
+        box = (80.0, 40.0, 200.0, 140.0)
+        crop = plate[40:140, 80:200].copy()
+        crop[8:16, 8:16] = 200
+        alpha = np.full(crop.shape[:2], 255, np.uint8)
+        self.assertIsNone(tighten_against_plate(crop, alpha, plate[40:140, 80:200]))
+        ghost = GhostFrame(x=80, y=40, box=box, crop=crop, alpha=alpha)
+        drawn = _vehicle_frame(plate, ghost, box)
+        vehicle = np.array((40, 165, 255), np.uint8)
+        self.assertEqual(int((drawn == vehicle).all(axis=2).sum()), 0)
+
+    def test_tiny_or_low_contrast_cutouts_are_not_labeled(self):
+        plate = _ir_frame(180, 320, 40)
+        # 8 x 10 is under 0.15% of 180 x 320 (about 86 pixels).
+        tiny_box = (150.0, 80.0, 158.0, 90.0)
+        tiny = GhostFrame(
+            x=150,
+            y=80,
+            box=tiny_box,
+            crop=np.full((10, 8, 3), 220, np.uint8),
+            alpha=np.full((10, 8), 255, np.uint8),
+        )
+        visible, tip = cutout_is_visible(
+            tiny.alpha,
+            tiny_box,
+            150,
+            80,
+            320,
+            180,
+            crop=tiny.crop,
+            plate=plate[80:90, 150:158],
+        )
+        self.assertFalse(visible)
+        self.assertIsNone(tip)
+        drawn = _vehicle_frame(plate, tiny, tiny_box)
+        vehicle = np.array((40, 165, 255), np.uint8)
+        self.assertEqual(int((drawn == vehicle).all(axis=2).sum()), 0)
+
+        faint_box = (80.0, 40.0, 150.0, 110.0)
+        faint_crop = np.full((70, 70, 3), 46, np.uint8)
+        faint_alpha = np.full((70, 70), 255, np.uint8)
+        visible, tip = cutout_is_visible(
+            faint_alpha,
+            faint_box,
+            80,
+            40,
+            320,
+            180,
+            crop=faint_crop,
+            plate=plate[40:110, 80:150],
+        )
+        self.assertFalse(visible)
+        self.assertIsNone(tip)
+        faint = GhostFrame(
+            x=80, y=40, box=faint_box, crop=faint_crop, alpha=faint_alpha
+        )
+        drawn = _vehicle_frame(plate, faint, faint_box)
+        self.assertEqual(int((drawn == vehicle).all(axis=2).sum()), 0)
+
+        # Large enough, and different from the plate, so it still gets a label.
+        kept_box = (80.0, 40.0, 140.0, 100.0)
+        kept = GhostFrame(
+            x=80,
+            y=40,
+            box=kept_box,
+            crop=np.full((60, 60, 3), 180, np.uint8),
+            alpha=np.full((60, 60), 255, np.uint8),
+        )
+        drawn = _vehicle_frame(plate, kept, kept_box)
+        self.assertGreater(int((drawn == vehicle).all(axis=2).sum()), 0)
 
 
 if __name__ == "__main__":

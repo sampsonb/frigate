@@ -193,8 +193,10 @@ def attach_motion(
     if category == "vehicle":
         work_crop, work_plate, work_box = _vehicle_view(crop, plate, local)
     core = _seed(work_crop.shape[:2], work_box, category)
+    raw_diff: np.ndarray | None = None
     if category == "vehicle":
         diff = cv2.absdiff(work_crop, work_plate).max(axis=2)
+        raw_diff = diff
         thresh = _object_threshold(diff, core, category, fg_thresh)
         motion = _foreground(work_crop, work_plate, diff, thresh)
     else:
@@ -225,7 +227,15 @@ def attach_motion(
             extra |= component.astype(np.uint8)
     if category == "vehicle":
         extra = cv2.morphologyEx(extra, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    mask = ((core > 0) | (extra > 0)).astype(np.uint8)
+        # Box pixels that differ from the plate stay, so a low-contrast
+        # car that fills its box is not dropped. The rest of the rectangle
+        # does not, so a loose night box does not outline the road.
+        inside = np.zeros_like(core)
+        if raw_diff is not None:
+            inside = ((core > 0) & (raw_diff >= 8)).astype(np.uint8)
+        mask = ((extra > 0) | (inside > 0)).astype(np.uint8)
+    else:
+        mask = ((core > 0) | (extra > 0)).astype(np.uint8)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         largest = max(cv2.contourArea(contour) for contour in contours)

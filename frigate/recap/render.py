@@ -29,6 +29,7 @@ from frigate.recap.plates import (
     plate_index_at,
     prepare_cutout,
     recede_plate,
+    tighten_against_plate,
 )
 
 logger = logging.getLogger(__name__)
@@ -341,11 +342,20 @@ def _paste_ghost(
     crop_w = x1 - x0
     crop = crop[:crop_h, :crop_w]
     alpha = solid_feather(alpha[:crop_h, :crop_w])
-    visible, tip = cutout_is_visible(alpha, ghost.box, x0, y0, width, height)
-    if not visible or tip is None:
-        return False, None
     source = plate if plate is not None else canvas
     region = source[y0:y1, x0:x1]
+    # A cached night ghost may still be the detector box. Keep the pixels
+    # that differ from this plate, and drop the cutout when the box is
+    # mostly background. The outline then follows the object, not the box.
+    tightened = tighten_against_plate(crop, alpha, region)
+    if tightened is None:
+        return False, None
+    alpha = solid_feather(tightened)
+    visible, tip = cutout_is_visible(
+        alpha, ghost.box, x0, y0, width, height, crop=crop, plate=region
+    )
+    if not visible or tip is None:
+        return False, None
     fitted = prepare_cutout(
         crop,
         alpha,
