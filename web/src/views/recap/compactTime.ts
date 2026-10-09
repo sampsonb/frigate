@@ -38,6 +38,55 @@ export function compactDay(epoch: number, timezone: string | undefined) {
   return formatInTimeZone(new Date(epoch * 1000), zoneOf(timezone), "MMM d");
 }
 
+const RANGE_DASH = "\u2013";
+
+/** "Oct 9 1:06a–7:06a", or both dates when the window crosses midnight. */
+export function compactRange(
+  after: number,
+  before: number,
+  timezone: string | undefined,
+  hour24: boolean,
+) {
+  const start = compactClock(after, timezone, hour24);
+  const end = compactClock(before, timezone, hour24);
+  const startDay = compactDay(after, timezone);
+  if (sameLocalDay(after, before, timezone)) {
+    return `${startDay} ${start}${RANGE_DASH}${end}`;
+  }
+  return `${startDay} ${start}${RANGE_DASH}${compactDay(before, timezone)} ${end}`;
+}
+
+/** "6h", "30m", or "1h 30m". */
+export function formatShortDuration(after: number, before: number) {
+  const parts = compactDuration(after, before);
+  if (parts.kind === "minutes") {
+    return `${parts.count}m`;
+  }
+  if (parts.kind === "hours") {
+    return `${parts.count}h`;
+  }
+  return `${parts.hours}h ${parts.minutes}m`;
+}
+
+/** Full card title: "Oct 9 1:06a–7:06a · 6h". */
+export function compactCardTitle(
+  after: number,
+  before: number,
+  timezone: string | undefined,
+  hour24: boolean,
+) {
+  return `${compactRange(after, before, timezone, hour24)} \u00b7 ${formatShortDuration(after, before)}`;
+}
+
+/** One moment, when a recap has no window: "Oct 9 1:06a". */
+export function compactStamp(
+  epoch: number,
+  timezone: string | undefined,
+  hour24: boolean,
+) {
+  return `${compactDay(epoch, timezone)} ${compactClock(epoch, timezone, hour24)}`;
+}
+
 export function sameLocalDay(
   after: number,
   before: number,

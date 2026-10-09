@@ -39,9 +39,8 @@ export default function RecapListItem({
   const version = item.finished || item.created || 0;
   const title =
     item.after && item.before
-      ? times.range(item.after, item.before)
-      : times.dayTime(item.before || item.created);
-  const length = times.duration(item.after, item.before);
+      ? times.cardTitle(item.after, item.before)
+      : times.stamp(item.before || item.created);
 
   return (
     <div
@@ -91,10 +90,10 @@ export default function RecapListItem({
           )}
         </span>
         <span className="flex min-w-0 flex-1 flex-col justify-center gap-0.5">
-          <span className="line-clamp-2 text-[13px] font-medium leading-snug">
+          <span className="whitespace-normal break-words text-[13px] font-medium leading-snug [overflow-wrap:anywhere]">
             {title}
           </span>
-          {(length || nightly || savedRolling || badge) && (
+          {(nightly || savedRolling || badge) && (
             <span className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-muted-foreground">
               {nightly && (
                 <LuMoon
@@ -108,7 +107,6 @@ export default function RecapListItem({
                   aria-label={t("savedRolling")}
                 />
               )}
-              {length && <span>{length}</span>}
               {(badge || nightly) && (
                 <span className="shrink-0 rounded bg-secondary px-1.5 py-0.5 text-[10px] font-normal text-secondary-foreground">
                   {badge || t("nightlyBadge")}
@@ -118,7 +116,7 @@ export default function RecapListItem({
           )}
           <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
             {busy ? (
-              <span className="truncate text-muted-foreground">
+              <span className="break-words text-muted-foreground [overflow-wrap:anywhere]">
                 {item.status === "queued"
                   ? t("build.waiting")
                   : item.message || t("build.starting")}

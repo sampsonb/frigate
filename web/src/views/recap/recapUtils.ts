@@ -8,6 +8,8 @@ import {
   compactClock,
   compactDay,
   compactDuration,
+  compactRange,
+  compactStamp,
   sameLocalDay,
 } from "./compactTime";
 
@@ -209,7 +211,7 @@ export function useRecapTime() {
     [hour24, t, timezone],
   );
 
-  const duration = useCallback(
+  const lengthOf = useCallback(
     (after?: number, before?: number) => {
       if (!after || !before) {
         return "";
@@ -227,6 +229,26 @@ export function useRecapTime() {
       });
     },
     [t],
+  );
+
+  const cardTitle = useCallback(
+    (after?: number, before?: number) => {
+      if (!after || !before) {
+        return "";
+      }
+      const window = compactRange(after, before, timezone, hour24);
+      const length = lengthOf(after, before);
+      if (!length) {
+        return window;
+      }
+      return t("rangeWithLength", { range: window, length });
+    },
+    [hour24, lengthOf, t, timezone],
+  );
+
+  const stamp = useCallback(
+    (epoch?: number) => (epoch ? compactStamp(epoch, timezone, hour24) : ""),
+    [hour24, timezone],
   );
 
   const relative = useCallback(
@@ -256,12 +278,26 @@ export function useRecapTime() {
       day,
       span,
       range,
-      duration,
+      duration: lengthOf,
+      cardTitle,
+      stamp,
       relative,
       hour24,
       timezone,
     }),
-    [dayTime, time, day, span, range, duration, relative, hour24, timezone],
+    [
+      dayTime,
+      time,
+      day,
+      span,
+      range,
+      lengthOf,
+      cardTitle,
+      stamp,
+      relative,
+      hour24,
+      timezone,
+    ],
   );
 }
 

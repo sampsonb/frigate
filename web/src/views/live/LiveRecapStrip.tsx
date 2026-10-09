@@ -116,11 +116,10 @@ function RecapStripCard({
   const { t } = useTranslation(["views/live"]);
   const times = useRecapTime();
   const cameraName = useCameraFriendlyName(camera);
-  const range =
+  const title =
     latest?.after && latest?.before
-      ? times.range(latest.after, latest.before)
+      ? times.cardTitle(latest.after, latest.before)
       : "";
-  const length = times.duration(latest?.after, latest?.before);
   return (
     <div className="flex w-[15.5rem] shrink-0 items-center gap-2 rounded-lg border border-secondary bg-background_alt p-1.5">
       <button
@@ -147,22 +146,16 @@ function RecapStripCard({
           className="block w-full text-left text-xs font-medium"
           onClick={onOpen}
         >
-          <span className="block truncate">
+          <span className="block whitespace-normal break-words [overflow-wrap:anywhere]">
             {t("recapStrip.title")}
             <span className="font-normal text-muted-foreground">
               {" "}
               · {cameraName}
             </span>
           </span>
-          {range ? (
-            <span className="mt-0.5 line-clamp-2 text-[11px] font-medium leading-tight">
-              {range}
-              {length ? (
-                <span className="font-normal text-muted-foreground">
-                  {" "}
-                  · {length}
-                </span>
-              ) : null}
+          {title ? (
+            <span className="mt-0.5 block whitespace-normal break-words text-[12px] font-medium leading-snug [overflow-wrap:anywhere]">
+              {title}
             </span>
           ) : (
             !latest && (

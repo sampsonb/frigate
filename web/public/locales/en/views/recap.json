@@ -66,8 +66,9 @@
   "minutesShort_one": "{{count}}m",
   "minutesShort_other": "{{count}}m",
   "durationHoursMinutes": "{{hours}}h {{minutes}}m",
-  "rangeSameDay": "{{day}} {{start}} to {{end}}",
-  "rangeCrossDay": "{{startDay}} {{start}} to {{endDay}} {{end}}",
+  "rangeSameDay": "{{day}} {{start}}–{{end}}",
+  "rangeCrossDay": "{{startDay}} {{start}}–{{endDay}} {{end}}",
+  "rangeWithLength": "{{range}} · {{length}}",
   "spanSameDay": "{{start}} to {{end}}",
   "spanDays": "{{start}} to {{end}}",
   "relative": {
