@@ -28,6 +28,10 @@
       "label": "Rebuild the rolling recap after this long even with no new events.",
       "description": "Drops events that have aged out of the window. 0 never forces a rebuild."
     },
+    "rolling_keep_hours": {
+      "label": "Hours to keep replaced rolling recaps in the saved list. 0 deletes them on replace.",
+      "description": "When a new rolling recap is ready, the one it replaces is saved unless it held the same events. Saved copies older than this are removed. Nightly, custom, and manual recaps are not affected."
+    },
     "interval_minutes": {
       "label": "Minutes between automatic short recaps. 0 disables them.",
       "description": "When set, Frigate builds a recap of the last this many minutes on that interval. The kind is rolling-<minutes>m, so the previous one is replaced when the new one is ready. A run is skipped while the previous one is still queued or rendering. This is separate from the rolling recap that stays ready."

@@ -116,13 +116,14 @@ If you only set `url`, clip fallback reads `index/YYYY-MM-DD.json` from that hos
 
 ## Rolling recap
 
-Each recap camera keeps one rolling recap of the last `rolling_hours` (default 6) ready, so the Recap page can play it right away. Every `rolling_interval_minutes` (default 30, `0` turns it off) Frigate checks the events in that window. If no event is new and none changed its end time, the refresh is skipped. Otherwise the recap is rebuilt in a staging folder and swapped into place, so there is only ever one rolling recap per camera and the saved list does not grow. After `rolling_max_age_minutes` (default 180) it is rebuilt even with no new events, so objects that aged out of the window drop off.
+Each recap camera keeps one rolling recap of the last `rolling_hours` (default 6) ready, so the Recap page can play it right away. Every `rolling_interval_minutes` (default 30, `0` turns it off) Frigate checks the events in that window. If no event is new and none changed its end time, the refresh is skipped. Otherwise the recap is rebuilt in a staging folder and swapped into place, so there is only ever one live rolling recap per camera and the previous one keeps playing until the new one is ready. If a refresh fails or is cancelled, the last good one stays. The rolling recap it replaces is moved into the saved list (marked as an earlier rolling recap), unless it held exactly the same events. Saved copies are removed after `rolling_keep_hours` (default 72, `0` deletes them on replace). Nightly, custom, and manual recaps are never removed by this. After `rolling_max_age_minutes` (default 180) it is rebuilt even with no new events, so objects that aged out of the window drop off.
 
 ```yaml
 recap:
   rolling_hours: 6
   rolling_interval_minutes: 30
   rolling_max_age_minutes: 180
+  rolling_keep_hours: 72
 ```
 
 Queue rules: one recap is built at a time. A request from the UI (a longer range, a custom range, or Refresh now) runs before scheduled work. A refresh never waits behind another refresh of the same camera, and a request that is already waiting or running is returned instead of being queued twice.

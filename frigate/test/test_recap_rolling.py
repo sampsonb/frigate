@@ -412,5 +412,174 @@ class TestRecapJobThread(unittest.TestCase):
                 self.assertEqual(manager.queue_snapshot(), [])
 
 
+class TestRollingSwapAndKeep(unittest.TestCase):
+    """The live rolling recap always plays; replaced ones move to the saved list."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.patch = patch("frigate.recap.storage.RECAP_DIR", str(self.root))
+        self.patch.start()
+        from frigate.recap import storage
+
+        self.storage = storage
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def _build(self, directory, before, fingerprint, video=b"v"):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "video.mp4").write_bytes(video)
+        self.storage.write_manifest(
+            directory,
+            {
+                "id": "front_rolling",
+                "camera": "front",
+                "status": "complete",
+                "message": "Ready",
+                "reason": "rolling",
+                "kind": "rolling",
+                "after": before - 6 * 3600,
+                "before": before,
+                "created": before,
+                "finished": before,
+                "hours": 6,
+                "fingerprint": fingerprint,
+            },
+        )
+
+    def _staging(self, before, fingerprint, video=b"new"):
+        staging = self.storage.staging_dir("front_rolling")
+        self._build(staging, before, fingerprint, video)
+        return staging
+
+    def test_replaced_recap_is_saved_and_chains(self):
+        live = self.storage.recap_dir("front", "front_rolling")
+        self._build(live, 1_000_000.0, {"a": 1.0}, b"first")
+        _, saved1 = self.storage.swap_into_place(
+            self._staging(1_001_800.0, {"a": 1.0, "b": 2.0}, b"second"),
+            "front",
+            "front_rolling",
+            archive=True,
+        )
+        _, saved2 = self.storage.swap_into_place(
+            self._staging(1_003_600.0, {"a": 1.0, "b": 2.0, "c": 3.0}, b"third"),
+            "front",
+            "front_rolling",
+            archive=True,
+        )
+        self.assertTrue(saved1 and saved2 and saved1 != saved2)
+        self.assertEqual((live / "video.mp4").read_bytes(), b"third")
+        first = self.storage.recap_dir("front", saved1)
+        self.assertEqual((first / "video.mp4").read_bytes(), b"first")
+        manifest = self.storage.read_manifest(first)
+        self.assertEqual(manifest["id"], saved1)
+        self.assertEqual(manifest["reason"], self.storage.ARCHIVE_REASON)
+        self.assertNotIn("fingerprint", manifest)
+        self.assertFalse(self.storage.is_rolling(manifest))
+        ids = sorted(item["id"] for item in self.storage.list_recaps())
+        self.assertEqual(ids, sorted(["front_rolling", saved1, saved2]))
+        self.assertFalse((self.root / ".staging" / "front_rolling.old").exists())
+
+    def test_same_events_or_same_window_is_not_saved_twice(self):
+        live = self.storage.recap_dir("front", "front_rolling")
+        self._build(live, 1_000_000.0, {"a": 1.0})
+        _, saved = self.storage.swap_into_place(
+            self._staging(1_000_100.0, {"a": 1.0}),
+            "front",
+            "front_rolling",
+            archive=True,
+        )
+        self.assertIsNone(saved)
+        self.assertEqual(len(self.storage.list_recaps()), 1)
+
+    def test_archive_off_deletes_the_old_copy(self):
+        live = self.storage.recap_dir("front", "front_rolling")
+        self._build(live, 1_000_000.0, {"a": 1.0})
+        _, saved = self.storage.swap_into_place(
+            self._staging(1_001_800.0, {"b": 1.0}), "front", "front_rolling"
+        )
+        self.assertIsNone(saved)
+        self.assertEqual(len(self.storage.list_recaps()), 1)
+
+    def test_purge_only_removes_old_saved_rolling(self):
+        now = 2_000_000.0
+        old_saved = self.storage.recap_dir("front", "front_old_r6h")
+        new_saved = self.storage.recap_dir("front", "front_new_r6h")
+        nightly = self.storage.recap_dir("front", "front_nightly")
+        manual = self.storage.recap_dir("front", "front_manual")
+        for directory, reason, before in [
+            (old_saved, self.storage.ARCHIVE_REASON, now - 73 * 3600),
+            (new_saved, self.storage.ARCHIVE_REASON, now - 71 * 3600),
+            (nightly, "schedule", now - 100 * 3600),
+            (manual, "manual", now - 100 * 3600),
+        ]:
+            directory.mkdir(parents=True)
+            self.storage.write_manifest(
+                directory,
+                {
+                    "id": directory.name,
+                    "camera": "front",
+                    "status": "complete",
+                    "reason": reason,
+                    "before": before,
+                    "created": before,
+                },
+            )
+        removed = self.storage.purge_rolling_archives({"front": 72}, now=now)
+        self.assertEqual(removed, 1)
+        self.assertFalse(old_saved.exists())
+        for directory in (new_saved, nightly, manual):
+            self.assertTrue(directory.exists())
+        self.assertEqual(self.storage.purge_rolling_archives({"front": 0}, now=now), 0)
+
+
+class TestRollingFailureKeepsLive(unittest.TestCase):
+    def test_failed_or_cancelled_refresh_keeps_the_live_copy(self):
+        from frigate.recap import manager as manager_module
+        from frigate.recap import storage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch("frigate.recap.storage.RECAP_DIR", str(root)),
+                patch("frigate.recap.manager.RECAP_DIR", str(root)),
+                patch.object(manager_module.cutcache, "purge", return_value=(0, 0, 0)),
+                patch.object(
+                    manager_module, "event_fingerprint", return_value={"x": 1.0}
+                ),
+            ):
+                live = storage.recap_dir("front", "front_rolling")
+                live.mkdir(parents=True)
+                (live / "video.mp4").write_bytes(b"good")
+                storage.write_manifest(
+                    live,
+                    {
+                        "id": "front_rolling",
+                        "camera": "front",
+                        "status": "complete",
+                        "reason": "rolling",
+                        "finished": 1.0,
+                        "checked": 1.0,
+                        "fingerprint": {"old": 1.0},
+                    },
+                )
+                manager = manager_module.RecapManager(_fake_config(tmp))
+
+                def boom(job):
+                    raise RuntimeError("ffmpeg failed")
+
+                with patch.object(manager_module.RecapJob, "_run", boom):
+                    result = manager.start_rolling("front", manual=True, force=True)
+                    job = manager._jobs.get(result["id"])
+                    if job is not None:
+                        job.join(timeout=5)
+                self.assertEqual((live / "video.mp4").read_bytes(), b"good")
+                self.assertEqual(storage.read_manifest(live)["finished"], 1.0)
+                self.assertFalse(storage.staging_dir("front_rolling").exists())
+                self.assertEqual(manager.rolling_state["front"]["last"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -140,6 +140,17 @@ class RecapConfig(FrigateBaseModel):
         ge=0,
         le=1440,
     )
+    rolling_keep_hours: float = Field(
+        default=72,
+        title="Hours to keep replaced rolling recaps in the saved list. 0 deletes them on replace.",
+        description=(
+            "When a new rolling recap is ready, the one it replaces is saved "
+            "unless it held the same events. Saved copies older than this are "
+            "removed. Nightly, custom, and manual recaps are not affected."
+        ),
+        ge=0,
+        le=720,
+    )
     interval_minutes: Optional[int] = Field(
         default=None,
         title="Minutes between automatic short recaps. 0 disables them.",

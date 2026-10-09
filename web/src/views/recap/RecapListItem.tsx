@@ -4,7 +4,7 @@ import { cn } from "@/lib/utils";
 import { RecapSummary } from "@/types/recap";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { LuMoon, LuTrash2, LuX } from "react-icons/lu";
+import { LuHistory, LuMoon, LuTrash2, LuX } from "react-icons/lu";
 import { isBusy, useRecapTime } from "./recapUtils";
 
 type RecapListItemProps = {
@@ -29,6 +29,7 @@ export default function RecapListItem({
   const [thumbFailed, setThumbFailed] = useState(false);
   const busy = isBusy(item);
   const nightly = item.reason === "schedule" || item.reason === "backfill";
+  const savedRolling = item.reason === "rolling-archive";
   const counts = (item.categories ?? []).filter(
     (category) => category.count > 0,
   );
@@ -88,6 +89,12 @@ export default function RecapListItem({
               <LuMoon
                 className="size-3.5 shrink-0 text-muted-foreground"
                 aria-label={t("nightly")}
+              />
+            )}
+            {savedRolling && (
+              <LuHistory
+                className="size-3.5 shrink-0 text-muted-foreground"
+                aria-label={t("savedRolling")}
               />
             )}
             <span className="truncate">

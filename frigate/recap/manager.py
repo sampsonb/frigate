@@ -54,6 +54,7 @@ from frigate.recap.storage import (
     ROLLING_REASON,
     ensure_tree,
     purge_expired,
+    purge_rolling_archives,
     read_manifest,
     recap_dir,
     recap_kind,
@@ -697,7 +698,14 @@ class RecapJob(threading.Thread):
             current["fingerprint"] = fingerprint
             current["kind"] = ROLLING_REASON
             write_manifest(self.directory, current)
-            swap_into_place(self.directory, self.camera, self.recap_id)
+            _live, saved = swap_into_place(
+                self.directory,
+                self.camera,
+                self.recap_id,
+                archive=float(getattr(self.settings, "rolling_keep_hours", 0) or 0) > 0,
+            )
+            if saved:
+                logger.info("Saved replaced rolling recap as %s", saved)
             self.manager.rolling_state[self.camera] = {
                 "last": "built",
                 "at": finished,
@@ -905,6 +913,14 @@ class RecapMaintainer(threading.Thread):
         removed = purge_expired(days)
         if removed:
             logger.info("Removed %d expired recaps", removed)
+        hours = {
+            name: camera.recap.rolling_keep_hours
+            for name, camera in self.config.cameras.items()
+            if camera.recap.enabled
+        }
+        archived = purge_rolling_archives(hours)
+        if archived:
+            logger.info("Removed %d saved rolling recaps past their limit", archived)
 
     def _schedule(self) -> None:
         zone = resolve_zone(self.config)

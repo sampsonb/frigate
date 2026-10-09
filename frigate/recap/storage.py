@@ -12,7 +12,7 @@ import logging
 import os
 import shutil
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -73,23 +73,99 @@ def staging_dir(recap_id: str) -> Path:
     return recap_root() / ".staging" / recap_id
 
 
-def swap_into_place(staging: Path, camera: str, recap_id: str) -> Path:
+ARCHIVE_REASON = "rolling-archive"
+
+
+def archive_id_for(camera: str, manifest: dict[str, Any]) -> str:
+    """Saved id for a replaced rolling recap, keyed by its window end (UTC)."""
+    end = float(manifest.get("before") or manifest.get("finished") or time.time())
+    stamp = datetime.fromtimestamp(end, timezone.utc).strftime("%Y%m%d%H%M%S")
+    return f"{camera}_{stamp}_r{int(float(manifest.get('hours') or 6))}h"
+
+
+def _same_events(a: Any, b: Any) -> bool:
+    return isinstance(a, dict) and isinstance(b, dict) and bool(a) and a == b
+
+
+def swap_into_place(
+    staging: Path,
+    camera: str,
+    recap_id: str,
+    *,
+    archive: bool = False,
+) -> tuple[Path, str | None]:
     """Replace the live rolling recap with a finished build.
 
     The old folder is renamed aside before the new one is renamed in, so
     a reader sees either the old recap or the new one. A video already
     being streamed keeps playing from the old file until it is closed.
+
+    With ``archive`` the replaced recap is kept as a saved recap (reason
+    ``rolling-archive``) instead of being deleted, unless it holds exactly
+    the same events as the new build or a saved copy of that window
+    already exists. Returns the live path and the saved id, if any.
     """
     target = recap_dir(camera, recap_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     retired = staging.parent / f"{recap_id}.old"
     if retired.exists():
         shutil.rmtree(retired, ignore_errors=True)
+    old = read_manifest(target) if target.exists() else None
+    new = read_manifest(staging) or {}
+    saved: str | None = None
+    if (
+        archive
+        and old is not None
+        and old.get("status") == "complete"
+        and (target / VIDEO).is_file()
+        and not _same_events(old.get("fingerprint"), new.get("fingerprint"))
+    ):
+        candidate = archive_id_for(camera, old)
+        destination = recap_dir(camera, candidate)
+        if safe_id(candidate) and not destination.exists():
+            saved = candidate
     if target.exists():
-        os.replace(target, retired)
+        os.replace(target, destination if saved else retired)
     os.replace(staging, target)
+    if saved:
+        old.update(
+            {
+                "id": saved,
+                "reason": ARCHIVE_REASON,
+                "kind": f"{ARCHIVE_REASON}:{saved}",
+                "archived": time.time(),
+                "rolling_of": recap_id,
+            }
+        )
+        old.pop("fingerprint", None)
+        write_manifest(destination, old)
     shutil.rmtree(retired, ignore_errors=True)
-    return target
+    return target, saved
+
+
+def purge_rolling_archives(
+    hours_for: dict[str, float], now: float | None = None
+) -> int:
+    """Delete saved rolling recaps older than the camera's limit. 0 keeps them.
+
+    Only recaps with reason ``rolling-archive`` are touched, never nightly,
+    custom, manual, or interval recaps.
+    """
+    moment = time.time() if now is None else now
+    removed = 0
+    for summary in list_recaps():
+        if str(summary.get("reason") or "") != ARCHIVE_REASON:
+            continue
+        camera = str(summary.get("camera") or "")
+        hours = hours_for.get(camera)
+        if not hours:
+            continue
+        end = float(summary.get("before") or summary.get("created") or moment)
+        recap_id = str(summary.get("id") or "")
+        if moment - end > hours * 3600 and safe_id(recap_id) and safe_id(camera):
+            if delete_recap(camera, recap_id):
+                removed += 1
+    return removed
 
 
 def write_manifest(directory: Path, payload: dict[str, Any]) -> None:

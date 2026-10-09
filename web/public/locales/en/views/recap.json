@@ -107,6 +107,7 @@
   "deleteTitle": "Delete recap?",
   "deleteDescription": "The recap from {{when}} will be removed. Recordings are not affected.",
   "nightly": "Nightly recap",
+  "savedRolling": "Earlier rolling recap",
   "failedShort": "Failed",
   "nothingTracked": "Nothing tracked",
   "playlist": {
