@@ -23,6 +23,7 @@ import {
   availableNights,
   compareRecapNewest,
   isBusy,
+  isAutomatic,
   isRolling,
   nightlyPlaylist,
   useNow,
@@ -135,6 +136,8 @@ export default function Recap() {
   const empty = forCamera.filter(
     (item) => item.status === "complete" && (item.event_count ?? 0) === 0,
   );
+  const autoItems = featured.filter(isAutomatic);
+  const mineItems = featured.filter((item) => !isAutomatic(item));
 
   // A link from the Live page opens that recap.
   useEffect(() => {
@@ -291,6 +294,29 @@ export default function Recap() {
     pinned !== undefined &&
     latestVersion > pinned;
 
+  const renderItem = (item: RecapSummary) => (
+    <RecapListItem
+      key={item.id}
+      item={item}
+      now={now}
+      active={
+        (view.kind === "recap" && view.id === item.id) ||
+        (view.kind === "playlist" && view.ids.includes(item.id))
+      }
+      onOpen={() => setView({ kind: "recap", id: item.id })}
+      onCancel={
+        item.source !== "archive" && isBusy(item)
+          ? () => cancel(item.id)
+          : undefined
+      }
+      onDelete={
+        item.source !== "archive" && !isBusy(item)
+          ? () => setPendingDelete(item)
+          : undefined
+      }
+    />
+  );
+
   return (
     <div className="flex size-full flex-col gap-3 overflow-hidden p-2 md:p-3">
       <Toaster closeButton />
@@ -416,34 +442,48 @@ export default function Recap() {
           )}
         </div>
         <div className="flex min-h-0 flex-col lg:overflow-y-auto">
-          <h2 className="mb-1 px-1 text-sm font-medium">{t("saved")}</h2>
-          {!forCamera.length && (
-            <p className="px-1 text-sm text-muted-foreground">{t("empty")}</p>
-          )}
-          <div className="flex flex-col gap-1">
-            {featured.map((item) => (
-              <RecapListItem
-                key={item.id}
-                item={item}
-                now={now}
-                active={
-                  (view.kind === "recap" && view.id === item.id) ||
-                  (view.kind === "playlist" && view.ids.includes(item.id))
-                }
-                onOpen={() => setView({ kind: "recap", id: item.id })}
-                onCancel={
-                  item.source !== "archive" && isBusy(item)
-                    ? () => cancel(item.id)
-                    : undefined
-                }
-                onDelete={
-                  item.source !== "archive" && !isBusy(item)
-                    ? () => setPendingDelete(item)
-                    : undefined
-                }
-              />
-            ))}
-          </div>
+          <section aria-labelledby="recap-auto" className="flex flex-col">
+            <div className="mb-1 flex items-baseline justify-between gap-2 px-1">
+              <h2 id="recap-auto" className="text-sm font-medium">
+                {t("autoSection")}
+              </h2>
+              <span className="truncate text-xs text-muted-foreground">
+                {t("autoSectionHint", { count: rollingHours })}
+              </span>
+            </div>
+            <div className="flex flex-col gap-1">
+              {rollingCurrent && (
+                <RecapListItem
+                  key={rollingCurrent.id}
+                  item={rollingCurrent as RecapSummary}
+                  now={now}
+                  badge={t("readyToWatch")}
+                  active={view.kind === "rolling"}
+                  onOpen={() => {
+                    if (latestVersion) {
+                      setPinned(latestVersion);
+                    }
+                    setView({ kind: "rolling" });
+                  }}
+                />
+              )}
+              {autoItems.map((item) => renderItem(item))}
+            </div>
+          </section>
+          <section aria-labelledby="recap-mine" className="mt-4 flex flex-col">
+            <h2 id="recap-mine" className="mb-1 px-1 text-sm font-medium">
+              {t("mineSection")}
+            </h2>
+            {mineItems.length ? (
+              <div className="flex flex-col gap-1">
+                {mineItems.map((item) => renderItem(item))}
+              </div>
+            ) : (
+              <p className="px-1 text-sm text-muted-foreground">
+                {t("mineEmpty")}
+              </p>
+            )}
+          </section>
           {empty.length > 0 && (
             <div className="mt-2">
               <Button

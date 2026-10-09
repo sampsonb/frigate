@@ -30,6 +30,18 @@ export function isRolling(item?: RecapSummary | null) {
   );
 }
 
+const AUTOMATIC_REASONS = new Set([
+  "rolling-archive",
+  "schedule",
+  "backfill",
+  "interval",
+]);
+
+/** Made by Frigate on its own: earlier rolling recaps, nightly, interval. */
+export function isAutomatic(item: RecapSummary) {
+  return AUTOMATIC_REASONS.has(item.reason || "") || isNightly(item);
+}
+
 function isNightly(item: RecapSummary) {
   const kind = item.kind || "";
   return (

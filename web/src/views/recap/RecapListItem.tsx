@@ -14,6 +14,7 @@ type RecapListItemProps = {
   onOpen: () => void;
   onCancel?: () => void;
   onDelete?: () => void;
+  badge?: string;
 };
 
 export default function RecapListItem({
@@ -23,6 +24,7 @@ export default function RecapListItem({
   onOpen,
   onCancel,
   onDelete,
+  badge,
 }: RecapListItemProps) {
   const { t } = useTranslation(["views/recap"]);
   const times = useRecapTime();
@@ -100,6 +102,11 @@ export default function RecapListItem({
             <span className="truncate">
               {times.dayTime(item.before || item.created)}
             </span>
+            {(badge || nightly) && (
+              <span className="shrink-0 rounded bg-secondary px-1.5 py-0.5 text-[10px] font-normal text-secondary-foreground">
+                {badge || t("nightlyBadge")}
+              </span>
+            )}
           </span>
           <span className="truncate text-xs text-muted-foreground">
             {times.duration(item.after, item.before)}
