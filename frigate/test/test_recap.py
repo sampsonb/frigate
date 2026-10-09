@@ -34,7 +34,12 @@ from frigate.recap.clips import (
     playable_mp4_response,
     render_faststart_mp4,
 )
-from frigate.recap.cutout import attach_motion, build_cutouts, solid_feather
+from frigate.recap.cutout import (
+    _smooth_contour,
+    attach_motion,
+    build_cutouts,
+    solid_feather,
+)
 from frigate.recap.layout import (
     MotionTrack,
     ScheduledUnit,
@@ -67,7 +72,9 @@ from frigate.recap.plates import (
 from frigate.recap.render import (
     GhostFrame,
     Tube,
+    _text_size,
     compose_frame,
+    draw_label,
     leader_without_ghost,
 )
 from frigate.recap.storage import list_visible_recaps, recap_kind, remove_superseded
@@ -378,6 +385,54 @@ class TestCutout(unittest.TestCase):
         self.assertGreater(float(full[50:80, 115:145].mean()), 0.4)
         self.assertEqual(int(full[8:24, 8:24].sum()), 0)
         self.assertEqual(int(full[32:46, 68:84].sum()), 0)
+
+    def test_a_head_above_the_box_stays_inside_the_cutout(self):
+        height, width = 220, 200
+        plate = np.full((height, width, 3), 90, np.uint8)
+        frame = plate.copy()
+        box = (80.0, 90.0, 130.0, 180.0)
+        frame[90:180, 92:118] = (40, 60, 210)
+        # Inside the 20% band above the box. A blob much higher is not.
+        frame[74:90, 96:114] = (30, 40, 200)
+        frame[8:22, 92:118] = (20, 20, 220)
+        x, y, mask = attach_motion(frame, plate, box, "person")
+        full = np.zeros((height, width), np.uint8)
+        full[y : y + mask.shape[0], x : x + mask.shape[1]] = mask
+        self.assertGreater(float(full[74:90, 96:114].mean()), 0.4)
+        self.assertEqual(int(full[8:22, 92:118].sum()), 0)
+
+    def test_a_moving_vehicles_nose_is_not_cropped(self):
+        height, width = 160, 420
+        plate = np.full((height, width, 3), 80, np.uint8)
+        frames = []
+        boxes = []
+        for index in range(5):
+            frame = plate.copy()
+            x = 30 + index * 36
+            frame[50:110, x : x + 64] = (0, 0, 220)
+            frames.append(frame)
+            boxes.append((float(x), 50.0, float(x + 50), 110.0))
+        ghosts = build_cutouts(frames, boxes, "vehicle")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        sample = ghosts[2]
+        alpha = np.asarray(sample["alpha"])
+        strong = alpha > 40
+        _ys, xs = np.nonzero(strong)
+        self.assertGreater(len(xs), 10)
+        self.assertGreater(int(xs.max() - xs.min()), 56)
+
+    def test_a_jagged_outline_is_simplified(self):
+        mask = np.zeros((80, 100), np.uint8)
+        cv2.rectangle(mask, (10, 10), (70, 70), 1, -1)
+        for y in range(12, 68):
+            if y % 2 == 0:
+                mask[y, 70:78] = 1
+        smooth = _smooth_contour(mask)
+        edge = smooth[14:66, 74]
+        changes = int(np.abs(np.diff(edge.astype(np.int16))).sum())
+        self.assertLess(changes, 6)
+        self.assertGreater(int(smooth[40, 40]), 0)
 
     def test_moving_cart_survives_the_background_plate(self):
         height, width = 160, 320
@@ -2333,6 +2388,23 @@ class TestTightNightMasks(unittest.TestCase):
         )
         drawn = _vehicle_frame(plate, faint, faint_box)
         self.assertEqual(int((drawn == vehicle).all(axis=2).sum()), 0)
+
+    def test_label_text_is_drawn_once(self):
+        image = np.full((100, 400, 3), 18, np.uint8)
+        text = "6:45:18 AM"
+        rect = (16, 20, 280, 78)
+        scale, thickness = 0.6, 1
+        draw_label(image, text, rect, (40, 165, 255), scale, thickness, 0.8, "vehicle")
+        gray = image.max(axis=2)
+        icon = max(8, (rect[3] - rect[1]) - 6)
+        tx = rect[0] + icon + 8
+        text_w, _text_h = _text_size(text, scale, thickness)
+        body = gray[rect[1] : rect[3], tx : tx + text_w]
+        self.assertGreater(int((body > 180).sum()), 30)
+        # Past the measured string, the chip stays dark. A second "AM"
+        # would light this strip.
+        tail = gray[rect[1] + 6 : rect[3] - 6, tx + text_w + 4 : rect[2] - 4]
+        self.assertLess(int((tail > 80).sum()), 4)
 
     def test_label_anchor_lies_on_the_rendered_mask(self):
         plate = np.full((180, 320, 3), (90, 150, 80), np.uint8)

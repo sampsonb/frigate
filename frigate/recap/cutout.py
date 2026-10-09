@@ -27,10 +27,111 @@ FEATHER_PX = 3
 _PLATE_SAMPLES = 9
 
 
+def _half_extents(
+    boxes: list[tuple[float, float, float, float]],
+) -> tuple[float, float, float, float]:
+    """Widest detector box in the clip, measured from each box's center.
+
+    One frame often misses the nose or the top of the head. Another frame
+    in the same clip may include it. Placing that union back on the
+    current center keeps the whole object inside the window.
+    """
+    left = top = right = bottom = 0.0
+    for box in boxes:
+        cx = (box[0] + box[2]) * 0.5
+        cy = (box[1] + box[3]) * 0.5
+        left = max(left, cx - box[0])
+        right = max(right, box[2] - cx)
+        top = max(top, cy - box[1])
+        bottom = max(bottom, box[3] - cy)
+    return left, top, right, bottom
+
+
+def _horizontal_travel(boxes: list[tuple[float, float, float, float]]) -> float:
+    """Median horizontal motion, in pixels per step. Positive moves right."""
+    if len(boxes) < 2:
+        return 0.0
+    steps = [
+        ((cur[0] + cur[2]) - (prev[0] + prev[2])) * 0.5
+        for prev, cur in zip(boxes, boxes[1:])
+    ]
+    steps.sort()
+    return float(steps[len(steps) // 2])
+
+
+def search_window(
+    box: tuple[float, float, float, float],
+    category: str,
+    width: int,
+    height: int,
+    span: tuple[float, float, float, float] | None = None,
+    travel: float = 0.0,
+) -> tuple[int, int, int, int]:
+    """Padded region to segment. The object has to fit inside it.
+
+    Sides grow by about 12% of the union box. People and animals also get
+    about 20% above the box, and vehicles get more room on the side they
+    are moving toward.
+    """
+    cx = (box[0] + box[2]) * 0.5
+    cy = (box[1] + box[3]) * 0.5
+    own = (
+        cx - box[0],
+        cy - box[1],
+        box[2] - cx,
+        box[3] - cy,
+    )
+    if span is None:
+        span = own
+    left = max(span[0], own[0])
+    top = max(span[1], own[1])
+    right = max(span[2], own[2])
+    bottom = max(span[3], own[3])
+    box_w = max(1.0, left + right)
+    box_h = max(1.0, top + bottom)
+    pad_x = 0.12 * box_w
+    lead = 0.0
+    if category == "person":
+        # Wide on purpose: a cart or stroller sits beside the person.
+        pad_x = max(pad_x, 0.85 * max(box_w, box_h * 0.8))
+        pad_top = 0.20 * box_h
+        pad_bottom = max(0.12 * box_h, 0.9 * box_h)
+    elif category == "animal":
+        pad_x = max(pad_x, 0.45 * box_w)
+        pad_top = 0.20 * box_h
+        pad_bottom = max(0.12 * box_h, 0.25 * box_h)
+    elif category == "vehicle":
+        pad_top = 0.12 * box_h
+        pad_bottom = 0.12 * box_h
+        # The nose sticks out ahead of a lagging detector box.
+        if abs(travel) >= 0.5:
+            lead = 0.30 * box_w
+    else:
+        pad_top = 0.12 * box_h
+        pad_bottom = 0.12 * box_h
+    x0 = cx - left - pad_x
+    x1 = cx + right + pad_x
+    y0 = cy - top - pad_top
+    y1 = cy + bottom + pad_bottom
+    if lead:
+        if travel > 0:
+            x1 += lead
+        else:
+            x0 -= lead
+    return (
+        int(max(0, np.floor(x0))),
+        int(max(0, np.floor(y0))),
+        int(min(width, np.ceil(x1))),
+        int(min(height, np.ceil(y1))),
+    )
+
+
 def clean_background(
     frames: list[np.ndarray],
     boxes: list[tuple[float, float, float, float]],
     category: str,
+    span: tuple[float, float, float, float] | None = None,
+    travel: float = 0.0,
 ) -> np.ndarray:
     """Median background, ignoring pixels under the tracked object.
 
@@ -49,18 +150,7 @@ def clean_background(
     exclude = np.zeros((len(chosen), height, width), dtype=bool)
     for sample, index in enumerate(chosen):
         box = boxes[int(index)]
-        box_w = box[2] - box[0]
-        box_h = box[3] - box[1]
-        if category == "person":
-            pad_x, pad_top, pad_bottom = 0.9 * box_w, 0.2 * box_h, 0.9 * box_h
-        elif category == "vehicle":
-            pad_x, pad_top, pad_bottom = 0.08 * box_w, 0.08 * box_h, 0.06 * box_h
-        else:
-            pad_x, pad_top, pad_bottom = 0.3 * box_w, 0.15 * box_h, 0.25 * box_h
-        y0 = int(max(0, box[1] - pad_top))
-        y1 = int(min(height, box[3] + pad_bottom))
-        x0 = int(max(0, box[0] - pad_x))
-        x1 = int(min(width, box[2] + pad_x))
+        x0, y0, x1, y1 = search_window(box, category, width, height, span, travel)
         if y1 > y0 and x1 > x0:
             exclude[sample, y0:y1, x0:x1] = True
     background = np.median(stack, axis=0)
@@ -154,12 +244,40 @@ def _seed(
     return mask
 
 
+def _smooth_contour(mask: np.ndarray) -> np.ndarray:
+    """Close small gaps and simplify the outline.
+
+    A raw motion edge is a staircase. The filled, simplified contour is
+    what the night outline follows, so the ring is not wavy.
+    """
+    binary = (mask > 0).astype(np.uint8)
+    if int(binary.max()) == 0:
+        return binary
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return closed
+    largest = max(cv2.contourArea(contour) for contour in contours)
+    out = np.zeros_like(binary)
+    for contour in contours:
+        if cv2.contourArea(contour) < max(8.0, 0.04 * largest):
+            continue
+        peri = cv2.arcLength(contour, True)
+        epsilon = max(1.0, 0.012 * peri)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        cv2.drawContours(out, [approx], -1, 1, -1)
+    return out if int(out.max()) else closed
+
+
 def attach_motion(
     frame: np.ndarray,
     background: np.ndarray,
     box: tuple[float, float, float, float],
     category: str,
     fg_thresh: int = 22,
+    span: tuple[float, float, float, float] | None = None,
+    travel: float = 0.0,
 ) -> tuple[int, int, np.ndarray]:
     """Mask of the tracked object plus motion connected to it.
 
@@ -168,22 +286,8 @@ def attach_motion(
     object is included. Vehicles stay tight so the road is not smeared in.
     """
     height, width = frame.shape[:2]
-    box_w = max(1.0, box[2] - box[0])
     box_h = max(1.0, box[3] - box[1])
-    if category == "person":
-        pad_x, pad_top, pad_bottom = (
-            0.85 * max(box_w, box_h * 0.8),
-            0.2 * box_h,
-            0.9 * box_h,
-        )
-    elif category == "vehicle":
-        pad_x, pad_top, pad_bottom = 0.08 * box_w, 0.08 * box_h, 0.06 * box_h
-    else:
-        pad_x, pad_top, pad_bottom = 0.45 * box_w, 0.15 * box_h, 0.3 * box_h
-    x0 = int(max(0, box[0] - pad_x))
-    y0 = int(max(0, box[1] - pad_top))
-    x1 = int(min(width, box[2] + pad_x))
-    y1 = int(min(height, box[3] + pad_bottom))
+    x0, y0, x1, y1 = search_window(box, category, width, height, span, travel)
     if x1 - x0 < 4 or y1 - y0 < 4:
         return x0, y0, np.zeros((max(1, y1 - y0), max(1, x1 - x0)), np.uint8)
     crop = frame[y0:y1, x0:x1]
@@ -200,6 +304,13 @@ def attach_motion(
     else:
         motion = _motion(work_crop, work_plate, fg_thresh)
     seed = cv2.dilate(core, np.ones((7, 7), np.uint8))
+    if category in ("person", "animal"):
+        # The head sits above the detector box. Reach into that band so it
+        # stays connected to the body instead of being cropped off.
+        reach = max(3, int(round(0.20 * box_h)) + int(round(0.10 * box_h)))
+        seed = cv2.dilate(
+            seed, cv2.getStructuringElement(cv2.MORPH_RECT, (3, reach * 2 + 1))
+        )
     _count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(
         (motion > 0).astype(np.uint8), connectivity=8
     )
@@ -225,22 +336,7 @@ def attach_motion(
             extra |= component.astype(np.uint8)
     if category == "vehicle":
         extra = cv2.morphologyEx(extra, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    mask = ((core > 0) | (extra > 0)).astype(np.uint8)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        largest = max(cv2.contourArea(contour) for contour in contours)
-        mask[:] = 0
-        cv2.drawContours(
-            mask,
-            [
-                contour
-                for contour in contours
-                if cv2.contourArea(contour) >= 0.04 * largest
-            ],
-            -1,
-            1,
-            -1,
-        )
+    mask = _smooth_contour(((core > 0) | (extra > 0)).astype(np.uint8))
     if mask.shape[:2] != crop.shape[:2]:
         mask = cv2.resize(
             mask,
@@ -488,6 +584,7 @@ def _feather_piece(
     height, width = frame.shape[:2]
     if category == "vehicle" and _outline_worth_tracing(mask):
         mask = _trace_outline(mask)
+    mask = _smooth_contour(mask)
     ys, xs = np.nonzero(mask)
     if len(xs) < 6:
         return None
@@ -675,6 +772,8 @@ def _motion_pieces(
     background: np.ndarray,
     category: str,
     fg_thresh: int,
+    span: tuple[float, float, float, float],
+    travel: float,
 ) -> list[tuple[int, int, np.ndarray]]:
     """One mask per frame. Stable boxes reuse the last measured mask."""
     pieces: list[tuple[int, int, np.ndarray]] = []
@@ -688,7 +787,7 @@ def _motion_pieces(
         ):
             pieces.append(_shift_piece(source_piece, source_box, box))
             continue
-        piece = attach_motion(frame, background, box, category, fg_thresh)
+        piece = attach_motion(frame, background, box, category, fg_thresh, span, travel)
         pieces.append(piece)
         source_piece = piece
         source_box = box
@@ -711,9 +810,13 @@ def build_cutouts(
     """
     if len(frames) < 3 or len(frames) != len(boxes):
         return None
-    background = clean_background(frames, boxes, category)
+    span = _half_extents(boxes)
+    travel = _horizontal_travel(boxes)
+    background = clean_background(frames, boxes, category, span, travel)
     height, width = background.shape[:2]
-    pieces = _motion_pieces(frames, boxes, background, category, fg_thresh)
+    pieces = _motion_pieces(
+        frames, boxes, background, category, fg_thresh, span, travel
+    )
     areas = np.array([int(piece[2].sum()) for piece in pieces], np.float32)
     bad = [
         bool(area < 8) or not _object_is_visible(frame, background, piece)

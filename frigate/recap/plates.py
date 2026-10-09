@@ -222,7 +222,7 @@ def tighten_night_vehicle(
 
     Day cutouts and people never call this. Headlights light up the yard,
     so a raw difference spreads into the flower pot and the grass. The
-    kept pixels have to sit in a slightly dilated detector box, survive
+    kept pixels have to sit in the padded cutout window, survive
     an open and close, and belong to the largest component that covers
     the box center. Smooth bright ground is rejected. None drops the
     cutout (the mask is the plate). Any other implausible result returns
@@ -284,7 +284,8 @@ def _vehicle_limit(
     y1 = int(round(box[3])) - int(origin_y)
     box_w = max(1, x1 - x0)
     box_h = max(1, y1 - y0)
-    pad = int(np.clip(round(0.04 * min(box_w, box_h)), 2, 6))
+    # Match the cutout window: about 12% past the box, not a few pixels.
+    pad = max(2, int(round(0.12 * min(box_w, box_h))))
     limit = np.zeros(shape, np.uint8)
     cv2.rectangle(
         limit,

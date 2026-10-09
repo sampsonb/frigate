@@ -249,16 +249,7 @@ def draw_label(
     _ = text_w
     tx = rect[0] + icon + 8
     ty = rect[1] + 4 + text_h
-    cv2.putText(
-        image,
-        text,
-        (tx + 1, ty + 1),
-        FONT,
-        scale,
-        (0, 0, 0),
-        thickness + 1,
-        cv2.LINE_AA,
-    )
+    # One draw. A shadow pass left a faint second copy of the last letters.
     cv2.putText(
         image, text, (tx, ty), FONT, scale, (255, 255, 255), thickness, cv2.LINE_AA
     )

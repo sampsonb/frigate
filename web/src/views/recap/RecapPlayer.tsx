@@ -123,7 +123,6 @@ export default function RecapPlayer({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
   const [current, setCurrent] = useState(0);
-  const [paused, setPaused] = useState(true);
   const [content, setContent] = useState<ContentRect>({
     x: 0,
     y: 0,
@@ -325,56 +324,38 @@ export default function RecapPlayer({
             onLoadedMetadata={(event) => {
               measure();
               setCurrent(event.currentTarget.currentTime);
-              setPaused(event.currentTarget.paused);
             }}
             onTimeUpdate={(event) =>
               setCurrent(event.currentTarget.currentTime)
             }
-            onPlay={() => setPaused(false)}
-            onPause={(event) => {
-              setPaused(true);
-              setCurrent(event.currentTarget.currentTime);
-            }}
+            onPause={(event) => setCurrent(event.currentTarget.currentTime)}
             onSeeked={(event) => setCurrent(event.currentTarget.currentTime)}
           />
           <div className="pointer-events-none absolute inset-0">
             {content.w > 0 &&
               activeTracks.map((track) => {
                 const [x0, y0, x1, y1] = track.label_box;
-                const boxWidth = Math.max(
-                  paused ? 44 : 32,
-                  (x1 - x0) * content.w,
-                );
-                const boxHeight = Math.max(
-                  paused ? 44 : 32,
-                  (y1 - y0) * content.h,
-                );
+                const boxWidth = Math.max(44, (x1 - x0) * content.w);
+                const boxHeight = Math.max(44, (y1 - y0) * content.h);
                 return (
                   <button
                     key={track.event_id}
                     type="button"
                     aria-label={track.text}
-                    className={`pointer-events-auto absolute touch-manipulation whitespace-nowrap rounded-md border-2 text-left text-xs font-medium text-white ${paused ? "bg-black/55 px-2 py-1" : "bg-black/20"}`}
+                    className="pointer-events-auto absolute touch-manipulation bg-transparent"
                     style={{
                       left: content.x + ((x0 + x1) / 2) * content.w,
                       top: content.y + ((y0 + y1) / 2) * content.h,
-                      minWidth: boxWidth,
-                      minHeight: boxHeight,
-                      width: paused ? "max-content" : boxWidth,
-                      height: paused ? "max-content" : boxHeight,
+                      width: boxWidth,
+                      height: boxHeight,
                       transform: "translate(-50%, -50%)",
-                      borderColor: colorFor(track.cat),
                     }}
                     onClick={(event) => {
                       event.stopPropagation();
                       openClip(track);
                     }}
                   >
-                    {paused ? (
-                      track.text
-                    ) : (
-                      <span className="sr-only">{track.text}</span>
-                    )}
+                    <span className="sr-only">{track.text}</span>
                   </button>
                 );
               })}
