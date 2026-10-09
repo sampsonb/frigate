@@ -33,7 +33,7 @@ Useful knobs:
 | `target_length` | 120 | Aim for this many seconds. Busy hours run longer rather than merging objects into one label. |
 | `label_opacity` | 0.5 | Time-label background. |
 | `max_labels` | 8 | Most labels on screen at once. |
-| `fade_seconds` | 0.35 | Fade for the ghost, the leader line, and the label. |
+| `fade_seconds` | 0.2 | Fade for the ghost, the leader line, and the label. |
 | `retain_days` | 14 | Delete local recaps after this many days. `0` keeps them. |
 | `replace_superseded` | true | When a recap is Ready, delete older completed recaps of the same camera and kind. Last-N-hours buttons group by that length. An explicit range that is one local midnight-to-midnight day groups with the nightly recap for that date (`day:<date>`, including older `backfill-day:<date>` copies). Any other explicit range is kept on its own and is not treated as last-N hours. Running, failed, and archive copies are kept. |
 | `min_show_seconds` | 2.5 | Shortest time a ghost stays readable. |
@@ -57,6 +57,7 @@ Files are stored at `/media/frigate/recap/<camera>/<id>/` (`manifest.json`, `vid
 - Times are local, without seconds (`5:50 PM`). If two labels fall in the same clock minute, those labels show seconds (`5:50:12 PM`, `5:50:47 PM`). Labels are not grouped with a count.
 - The background matches the lighting of the objects on screen. A frame with almost no color is treated as infrared. Color and infrared are never averaged into one plate. Within one lighting period the plate is the sample nearest those objects, refreshed about every 30 minutes. Objects stay in time order, so a dusk recap moves from afternoon to night, and the plate crossfades for about half a second when the lighting changes.
 - A cutout that is still color on an infrared plate is turned gray, and its brightness and contrast are matched to the local plate. On an infrared or dark plate the cutout also gets a mild contrast boost and a thin outline in its category color, so a dark car on a dark road stays visible.
+- Cutouts are fully opaque inside the mask. Only a 2 to 3 pixel edge is soft, and the fade in and out is 0.2 seconds. The background plate is dimmed and desaturated by about 18% so the objects read first.
 - A label and its leader are drawn only when the cutout is actually on screen. An empty mask, or a box that sits mostly off the frame, does not get a line.
 
 Tap a time on the video, or a row in the event list, to pause and open that clip. The dialog has download, previous, and next, and a link to Frigate review at that time. While the synopsis is paused, every time on screen can be tapped. Live clips play from the camera's HLS VOD playlist (`/vod/<camera>/start/<ts>/end/<ts>/index.m3u8`), which Safari plays natively. Archived files are served as a faststart H.264 MP4 with range requests. If Frigate has already deleted the recording, and `recap.archive` is set, the player uses the archived file for the same event.

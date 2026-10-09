@@ -827,7 +827,7 @@ recap:
   # Optional: Maximum number of time labels on screen at once (default: shown below)
   max_labels: 8
   # Optional: Fade in and out, in seconds (default: shown below)
-  fade_seconds: 0.35
+  fade_seconds: 0.2
   # Optional: Days to keep generated recaps. 0 keeps them until deleted (default: shown below)
   retain_days: 14
   # Optional: Delete older completed recaps of the same camera and kind once

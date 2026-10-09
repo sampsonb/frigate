@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import cv2
 import numpy as np
 
 from frigate.recap.archive import (
@@ -33,7 +34,7 @@ from frigate.recap.clips import (
     playable_mp4_response,
     render_faststart_mp4,
 )
-from frigate.recap.cutout import attach_motion, build_cutouts
+from frigate.recap.cutout import attach_motion, build_cutouts, solid_feather
 from frigate.recap.layout import (
     MotionTrack,
     ScheduledUnit,
@@ -58,6 +59,7 @@ from frigate.recap.plates import (
     gap_sample_times,
     plate_index_at,
     prepare_cutout,
+    recede_plate,
 )
 from frigate.recap.render import (
     GhostFrame,
@@ -130,6 +132,7 @@ class TestRecapLabels(unittest.TestCase):
         RecapConfig = _recap_config()
         config = RecapConfig()
         self.assertFalse(config.enabled)
+        self.assertAlmostEqual(config.fade_seconds, 0.2)
         self.assertIsNone(config.interval_minutes)
         self.assertIsNone(RecapConfig(interval_minutes=0).interval_minutes)
         self.assertIsNone(RecapConfig(interval_minutes="").interval_minutes)
@@ -2035,7 +2038,8 @@ class TestLightingPlates(unittest.TestCase):
             float(edge[:, :, 2].mean()), float(edge[:, :, 0].mean()) + 30
         )
         # The old leader aimed at the box top (y=20). That row stays the plate.
-        self.assertTrue(np.all(drawn[16:24, 130:160] == plate[16:24, 130:160]))
+        canopy = drawn[16:24, 130:160].astype(np.int16)
+        self.assertLess(float(canopy[:, :, 2].mean()), 40)
         # The line ends on the car, whose opaque top is y=70.
         car_top = drawn[64:74, 130:160].astype(np.int16)
         self.assertGreater(float(car_top[:, :, 2].mean()), 70)
@@ -2055,6 +2059,71 @@ class TestLightingPlates(unittest.TestCase):
         )
         self.assertFalse(visible)
         self.assertIsNone(tip)
+
+    def test_cutout_interior_is_opaque_and_the_plate_recedes(self):
+        soft = np.zeros((80, 80), np.uint8)
+        soft[20:60, 20:60] = 90
+        hardened = solid_feather(soft)
+        self.assertEqual(int(hardened[40, 40]), 255)
+        self.assertEqual(int(hardened[10, 40]), 0)
+        # The ramp stays on the rim, not across the whole car.
+        self.assertEqual(int(hardened[28, 40]), 255)
+        self.assertLess(int(hardened[18, 40]), 255)
+
+        plate = np.full((180, 320, 3), (80, 160, 70), np.uint8)
+        quiet = recede_plate(plate)
+        src_luma = float(cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY).mean())
+        dst_luma = float(cv2.cvtColor(quiet, cv2.COLOR_BGR2GRAY).mean())
+        self.assertAlmostEqual(dst_luma / src_luma, 0.82, delta=0.05)
+        src_sat = float(cv2.cvtColor(plate, cv2.COLOR_BGR2HSV)[..., 1].mean())
+        dst_sat = float(cv2.cvtColor(quiet, cv2.COLOR_BGR2HSV)[..., 1].mean())
+        self.assertAlmostEqual(dst_sat / src_sat, 0.82, delta=0.06)
+
+        box = (100.0, 40.0, 180.0, 120.0)
+        crop = np.full((80, 80, 3), (40, 90, 210), np.uint8)
+        ghost = GhostFrame(
+            x=100,
+            y=40,
+            box=box,
+            crop=crop,
+            alpha=np.full((80, 80), 100, np.uint8),
+        )
+        unit = ScheduledUnit(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            boxes=[box],
+            text="4:40 PM",
+        )
+        tube = Tube(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            frames=[ghost],
+        )
+        drawn = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [(8, 8, 90, 36)],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        center = drawn[70, 140].astype(int)
+        # Fully opaque: the pixel is the car, not a blend with the plate.
+        self.assertGreater(int(center[2]), 180)
+        self.assertLess(int(center[0]), 80)
+        self.assertTrue(np.array_equal(drawn[170, 300], quiet[170, 300]))
 
     def test_off_frame_box_does_not_become_a_cutout(self):
         frame = _ir_frame(100, 160, 80)

@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from frigate.recap.categories import CAT_COLOR
+from frigate.recap.cutout import solid_feather
 from frigate.recap.layout import ScheduledUnit, plan_label_rects
 from frigate.recap.plates import (
     PlateFade,
@@ -27,6 +28,7 @@ from frigate.recap.plates import (
     frame_is_ir,
     plate_index_at,
     prepare_cutout,
+    recede_plate,
 )
 
 logger = logging.getLogger(__name__)
@@ -315,12 +317,15 @@ def _paste_ghost(
     plate_is_ir: bool,
     plate_is_dark: bool,
     outline: tuple[int, int, int] | None,
+    plate: np.ndarray | None = None,
 ) -> tuple[bool, tuple[int, int] | None]:
     """Paint a ghost. False when nothing visible landed on the canvas.
 
     The tip is the top of the opaque cutout, which is where the leader
     should end. An empty mask or a box that is mostly off the frame
     returns no tip, and the caller skips the label and the leader.
+    ``plate`` is the undimmed background used to match the cutout. The
+    ghost is painted onto ``canvas``, which may already be dimmed.
     """
     pixels = ghost.pixels()
     if pixels is None or alpha_scale <= 0.01:
@@ -335,11 +340,12 @@ def _paste_ghost(
     crop_h = y1 - y0
     crop_w = x1 - x0
     crop = crop[:crop_h, :crop_w]
-    alpha = alpha[:crop_h, :crop_w]
+    alpha = solid_feather(alpha[:crop_h, :crop_w])
     visible, tip = cutout_is_visible(alpha, ghost.box, x0, y0, width, height)
     if not visible or tip is None:
         return False, None
-    region = canvas[y0:y1, x0:x1]
+    source = plate if plate is not None else canvas
+    region = source[y0:y1, x0:x1]
     fitted = prepare_cutout(
         crop,
         alpha,
@@ -349,12 +355,12 @@ def _paste_ghost(
     )
     if outline is not None:
         _paint_outline(canvas, x0, y0, alpha, outline, alpha_scale)
-        region = canvas[y0:y1, x0:x1]
+    dest = canvas[y0:y1, x0:x1]
     factor = (alpha.astype(np.float32) * (alpha_scale / 255.0))[..., None]
-    blended = fitted.astype(np.float32) * factor + region.astype(np.float32) * (
+    blended = fitted.astype(np.float32) * factor + dest.astype(np.float32) * (
         1 - factor
     )
-    region[:] = blended.astype(np.uint8)
+    dest[:] = blended.astype(np.uint8)
     return True, tip
 
 
@@ -413,7 +419,7 @@ def compose_frame(
     plate_is_dark: bool | None = None,
 ) -> np.ndarray:
     """One synopsis frame. ``repeats[i]`` is how many output frames share a source frame."""
-    canvas = plate.copy()
+    canvas = recede_plate(plate)
     height, width = canvas.shape[:2]
     if plate_is_ir is None:
         plate_is_ir = frame_is_ir(plate)
@@ -458,9 +464,9 @@ def compose_frame(
                 for other in active
             ):
                 continue
-        ghost_alpha = {"vehicle": 0.72, "parked": 0.95}.get(unit.category, 0.84) * fade[
-            index
-        ]
+        # Full opacity once the short fade finishes. A standing 0.72
+        # left cars looking like stickers on the plate.
+        ghost_alpha = fade[index]
         tube = tube_by_id.get(unit.event_id)
         if tube is None or not tube.frames:
             continue
@@ -476,6 +482,7 @@ def compose_frame(
             plate_is_ir=plate_is_ir,
             plate_is_dark=plate_is_dark,
             outline=color if night else None,
+            plate=plate,
         )
         if drawn and tip is not None:
             shown.add(index)

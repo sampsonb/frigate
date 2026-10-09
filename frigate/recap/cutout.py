@@ -20,6 +20,8 @@ from frigate.recap.plates import mostly_off_frame
 # Vehicle masks wider than this are computed on a smaller image and scaled
 # back. A distant car stays at full resolution so its few pixels are not lost.
 _MASK_LONG_SIDE = 160
+# Interior of a cutout is fully opaque. Only this many pixels of edge fade.
+FEATHER_PX = 3
 # Median plate samples. More frames do not make a cleaner plate once the
 # object has moved, and each extra frame is a full-resolution partition.
 _PLATE_SAMPLES = 9
@@ -323,6 +325,30 @@ def _trace_outline(mask: np.ndarray) -> np.ndarray:
     return cv2.morphologyEx(traced, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
 
+def solid_feather(alpha: np.ndarray, radius: int = FEATHER_PX) -> np.ndarray:
+    """Opaque inside the mask, with a soft edge of about 2 to 3 pixels.
+
+    A wide blur leaves the whole car translucent. Pixels clearly inside
+    the mask become 255. Only the rim fades out.
+    """
+    if alpha.size == 0:
+        return alpha
+    radius = max(2, min(3, int(radius)))
+    mask = np.where(alpha >= 32, 255, 0).astype(np.uint8)
+    if int(mask.max()) == 0:
+        return np.zeros_like(alpha)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+    )
+    interior = cv2.erode(mask, kernel)
+    soft = cv2.GaussianBlur(mask, (radius * 2 + 1, radius * 2 + 1), 0.8)
+    if int(interior.max()) == 0:
+        soft[mask > 0] = 255
+    else:
+        soft[interior > 0] = 255
+    return soft
+
+
 def _soft_box(
     frame: np.ndarray, box: tuple[float, float, float, float]
 ) -> dict[str, object] | None:
@@ -351,8 +377,7 @@ def _soft_box(
         255,
         -1,
     )
-    kernel = max(3, int(min(crop.shape[:2]) * 0.18) | 1)
-    alpha = cv2.GaussianBlur(alpha, (kernel, kernel), 0)
+    alpha = solid_feather(alpha)
     return {
         "x": x0,
         "y": y0,
@@ -456,6 +481,7 @@ def _feather_piece(
 ) -> dict[str, object] | None:
     """Feather a 0/1 mask. The crop is taken from ``frame`` at that mask.
 
+    The interior stays fully opaque. Only about 3 pixels of edge fade.
     Vehicles fill the outer contour first. A motion mask on a car is often
     a ring of edges, and the body would otherwise drop out.
     """
@@ -465,9 +491,7 @@ def _feather_piece(
     ys, xs = np.nonzero(mask)
     if len(xs) < 6:
         return None
-    span = min(int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
-    feather = max(3, int(span * 0.045) | 1)
-    pad = feather + 2
+    pad = FEATHER_PX + 2
     cx0 = int(max(0, origin_x + int(xs.min()) - pad))
     cy0 = int(max(0, origin_y + int(ys.min()) - pad))
     cx1 = int(min(width, origin_x + int(xs.max()) + 1 + pad))
@@ -476,12 +500,7 @@ def _feather_piece(
         return None
     alpha = np.zeros((cy1 - cy0, cx1 - cx0), np.uint8)
     _paste(alpha, cx0, cy0, mask * 255, origin_x, origin_y)
-    erode = max(1, feather // 4)
-    alpha = cv2.erode(
-        alpha,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode + 1, 2 * erode + 1)),
-    )
-    alpha = cv2.GaussianBlur(alpha, (feather, feather), 0)
+    alpha = solid_feather(alpha)
     if int(alpha.max()) < 8:
         return None
     return {
@@ -860,8 +879,7 @@ def parked_car_ghost(
         255,
         -1,
     )
-    kernel = max(3, int(min(crop.shape[:2]) * 0.16) | 1)
-    alpha = cv2.GaussianBlur(alpha, (kernel, kernel), 0)
+    alpha = solid_feather(alpha)
     return {
         "x": x0,
         "y": y0,

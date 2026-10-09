@@ -193,7 +193,7 @@ class RecapConfig(FrigateBaseModel):
         le=80,
     )
     fade_seconds: float = Field(
-        default=0.35,
+        default=0.2,
         title="Fade in and out duration for a ghost, its line, and its label.",
         ge=0.0,
         le=2.0,

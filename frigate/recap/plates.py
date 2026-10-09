@@ -28,6 +28,8 @@ CLASSIFY_STEP = 600.0
 BRIGHT_DELTA = 24.0
 # Crossfade when the recap moves to another plate.
 PLATE_FADE_SECONDS = 0.5
+# How much saturation and brightness to take off the plate so cutouts pop.
+PLATE_RECEDE = 0.18
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,23 @@ def frame_is_ir(image: np.ndarray) -> bool:
         float(np.median(sat)) <= IR_SAT_MEDIAN
         and float(np.percentile(sat, 90)) <= IR_SAT_P90
     )
+
+
+def recede_plate(image: np.ndarray, amount: float = PLATE_RECEDE) -> np.ndarray:
+    """Dim and desaturate a background so the cutouts read first.
+
+    ``amount`` is the fraction removed from saturation and value, about
+    15 to 20 percent. Cutouts are matched to the original plate, then
+    drawn on top of this quieter copy.
+    """
+    if image.size == 0 or amount <= 0:
+        return image
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    keep = 1.0 - float(amount)
+    hsv[..., 1] *= keep
+    hsv[..., 2] *= keep
+    np.clip(hsv, 0, 255, out=hsv)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
 
 def frame_is_dark(image: np.ndarray) -> bool:
