@@ -2081,49 +2081,57 @@ class TestLightingPlates(unittest.TestCase):
 
         box = (100.0, 40.0, 180.0, 120.0)
         crop = np.full((80, 80, 3), (40, 90, 210), np.uint8)
-        ghost = GhostFrame(
-            x=100,
-            y=40,
-            box=box,
-            crop=crop,
-            alpha=np.full((80, 80), 100, np.uint8),
-        )
-        unit = ScheduledUnit(
-            event_id="car",
-            clip_event_id="car",
-            label="car",
-            category="vehicle",
-            start_time=0.0,
-            boxes=[box],
-            text="4:40 PM",
-        )
-        tube = Tube(
-            event_id="car",
-            clip_event_id="car",
-            label="car",
-            category="vehicle",
-            start_time=0.0,
-            frames=[ghost],
-        )
-        drawn = compose_frame(
-            plate,
-            [unit],
-            [tube],
-            [0],
-            [(8, 8, 90, 36)],
-            0,
-            header="",
-            header_h=0,
-            fade_frames=1,
-            label_opacity=0.5,
-            font_scale=1.0,
-            repeats=[1],
-        )
-        center = drawn[70, 140].astype(int)
-        # Fully opaque: the pixel is the car, not a blend with the plate.
-        self.assertGreater(int(center[2]), 180)
-        self.assertLess(int(center[0]), 80)
-        self.assertTrue(np.array_equal(drawn[170, 300], quiet[170, 300]))
+        # People were 0.84, vehicles 0.72, and parked cars 0.95. Bikes are
+        # vehicles. All of them have to land fully opaque, not just cars.
+        for category, label in (
+            ("person", "person"),
+            ("animal", "dog"),
+            ("delivery", "package"),
+            ("vehicle", "bicycle"),
+            ("parked", "car"),
+        ):
+            ghost = GhostFrame(
+                x=100,
+                y=40,
+                box=box,
+                crop=crop,
+                alpha=np.full((80, 80), 100, np.uint8),
+            )
+            unit = ScheduledUnit(
+                event_id=label,
+                clip_event_id=label,
+                label=label,
+                category=category,
+                start_time=0.0,
+                boxes=[box],
+                text="4:40 PM",
+            )
+            tube = Tube(
+                event_id=label,
+                clip_event_id=label,
+                label=label,
+                category=category,
+                start_time=0.0,
+                frames=[ghost],
+            )
+            drawn = compose_frame(
+                plate,
+                [unit],
+                [tube],
+                [0],
+                [(8, 8, 90, 36)],
+                0,
+                header="",
+                header_h=0,
+                fade_frames=1,
+                label_opacity=0.5,
+                font_scale=1.0,
+                repeats=[1],
+            )
+            center = drawn[70, 140].astype(int)
+            self.assertGreater(int(center[2]), 180, category)
+            self.assertLess(int(center[0]), 80, category)
+            self.assertTrue(np.array_equal(drawn[170, 300], quiet[170, 300]), category)
 
     def test_off_frame_box_does_not_become_a_cutout(self):
         frame = _ir_frame(100, 160, 80)

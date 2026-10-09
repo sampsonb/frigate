@@ -464,8 +464,9 @@ def compose_frame(
                 for other in active
             ):
                 continue
-        # Full opacity once the short fade finishes. A standing 0.72
-        # left cars looking like stickers on the plate.
+        # Every moving object is fully opaque once the short fade
+        # finishes: people, animals, bikes, deliveries, and vehicles.
+        # A standing partial alpha left the plate showing through.
         ghost_alpha = fade[index]
         tube = tube_by_id.get(unit.event_id)
         if tube is None or not tube.frames:
