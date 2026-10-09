@@ -38,6 +38,7 @@ from frigate.recap.layout import (
     repeat_for_min_show,
     schedule_units,
 )
+from frigate.recap.plates import TimedPlate, build_timed_plates, cutout_is_visible
 from frigate.recap.render import GhostFrame, Tube, encode_video, layout_labels
 
 logger = logging.getLogger(__name__)
@@ -216,15 +217,58 @@ def vehicle_is_parked(
     return is_stationary(track.boxes, width, height, threshold)
 
 
-def _median_plate(frames: Sequence[np.ndarray]) -> np.ndarray | None:
-    usable = [frame for frame in frames if frame is not None and frame.size]
-    if not usable:
-        return None
-    height, width = usable[0].shape[:2]
-    same = [frame for frame in usable if frame.shape[:2] == (height, width)]
-    if len(same) == 1:
-        return same[0]
-    return np.median(np.stack(same), axis=0).astype(np.uint8)
+def _plate_samples(
+    plate_frames: Sequence[np.ndarray] | Sequence[tuple[float, np.ndarray]],
+    after: float,
+    before: float,
+) -> list[tuple[float, np.ndarray]]:
+    """Normalize bare frames or ``(time, frame)`` pairs into timed samples."""
+    if not plate_frames:
+        return []
+    first = plate_frames[0]
+    if isinstance(first, tuple):
+        samples = []
+        for moment, frame in plate_frames:  # type: ignore[misc]
+            if frame is not None and frame.size:
+                samples.append((float(moment), frame))
+        return samples
+    frames = [frame for frame in plate_frames if frame is not None and frame.size]  # type: ignore[union-attr]
+    if not frames:
+        return []
+    if before <= after or len(frames) == 1:
+        times = [float(after)] * len(frames)
+    else:
+        times = [float(item) for item in np.linspace(after, before, len(frames))]
+    return list(zip(times, frames, strict=True))
+
+
+def _background(
+    plate_frames: Sequence[np.ndarray] | Sequence[tuple[float, np.ndarray]],
+    after: float,
+    before: float,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, list[TimedPlate]]:
+    """Plates split by day versus infrared, sized to the synopsis."""
+    timed = build_timed_plates(_plate_samples(plate_frames, after, before))
+    fitted: list[TimedPlate] = []
+    for plate in timed:
+        image = plate.image
+        if image.shape[1] != width or image.shape[0] != height:
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+        fitted.append(
+            TimedPlate(
+                image=image,
+                time=plate.time,
+                start=plate.start,
+                end=plate.end,
+                is_ir=plate.is_ir,
+                is_dark=plate.is_dark,
+            )
+        )
+    if not fitted:
+        raise RuntimeError("No recordings to build a background from")
+    return fitted[len(fitted) // 2].image, fitted
 
 
 def _overlap_time(left: MotionTrack, right: MotionTrack) -> bool:
@@ -287,7 +331,7 @@ def generate_recap(
     zone: tzinfo,
     events: list[dict[str, Any]],
     load_clip: LoadClip,
-    plate_frames: list[np.ndarray],
+    plate_frames: list[np.ndarray] | list[tuple[float, np.ndarray]],
     out_dir: Path,
     ffmpeg: str,
     cancel: Callable[[], bool],
@@ -377,11 +421,13 @@ def generate_recap(
                 }
             )
 
-    plate = _median_plate(plate_frames)
-    if plate is None:
-        raise RuntimeError("No recordings to build a background from")
-    if plate.shape[1] != width or plate.shape[0] != height:
-        plate = cv2.resize(plate, (width, height), interpolation=cv2.INTER_AREA)
+    plate, timed_plates = _background(plate_frames, after, before, width, height)
+    logger.info(
+        "Recap background for %s: %d plates, %d infrared",
+        camera,
+        len(timed_plates),
+        sum(1 for item in timed_plates if item.is_ir),
+    )
 
     tubes: list[Tube] = []
     tracks: list[MotionTrack] = []
@@ -524,6 +570,7 @@ def generate_recap(
     progress(78, "Placing labels")
     units: list[ScheduledUnit] = []
     repeats: list[int] = []
+    # Chronological, so the plate moves from afternoon into night.
     for track in sorted(tracks, key=lambda item: item.start):
         tube = by_id.get(track.id)
         if tube is None:
@@ -661,6 +708,8 @@ def generate_recap(
         font_scale=settings.font_scale,
         repeats=repeats,
         cancel_check=cancel,
+        plates=timed_plates,
+        plate_fade_frames=max(1, int(round(0.5 * settings.output_fps))),
     )
     if thumb is None:
         raise RecapCancelled()
@@ -711,6 +760,56 @@ class _Cut:
     from_cache: bool = False
 
 
+def _ghost_from_packed(item: dict[str, Any]) -> GhostFrame:
+    return GhostFrame(
+        x=int(item["x"]),
+        y=int(item["y"]),
+        box=tuple(item["box"]),  # type: ignore[arg-type]
+        jpeg=item.get("jpeg"),
+        alpha_shape=tuple(item["alpha_shape"]) if item.get("alpha_shape") else None,  # type: ignore[arg-type]
+        alpha_bytes=item.get("alpha_bytes"),
+        crop=item.get("crop"),
+        alpha=item.get("alpha"),
+    )
+
+
+def _keep_visible(cut: _Cut, width: int, height: int) -> _Cut:
+    """Drop empty masks and boxes that sit mostly off the frame.
+
+    Those frames used to keep a label and a leader with nothing under them.
+    """
+    if cut.status != "ok":
+        return cut
+    frames: list[dict[str, Any]] = []
+    boxes: list[tuple[float, float, float, float]] = []
+    times: list[float] = []
+    for item, box, moment in zip(cut.frames, cut.boxes, cut.times, strict=False):
+        ghost = _ghost_from_packed(item)
+        pixels = ghost.pixels()
+        if pixels is None:
+            continue
+        _crop, alpha = pixels
+        visible, _tip = cutout_is_visible(
+            alpha, ghost.box, ghost.x, ghost.y, width, height
+        )
+        if not visible:
+            continue
+        frames.append(item)
+        boxes.append(tuple(float(value) for value in box))
+        times.append(float(moment))
+    if not frames:
+        return _Cut(status="no_cutout", from_cache=cut.from_cache)
+    return _Cut(
+        status="ok",
+        frames=frames,
+        boxes=boxes,
+        times=times,
+        context_first=cut.context_first,
+        context_last=cut.context_last,
+        from_cache=cut.from_cache,
+    )
+
+
 def _cutouts_for(
     event: dict[str, Any],
     category: str,
@@ -741,14 +840,18 @@ def _cutouts_for(
         hit = cutcache.load(key, cache_root)
         if hit is not None and hit.status in ("ok", "no_frames", "no_cutout"):
             stats.hits += 1
-            return _Cut(
-                status=hit.status,
-                frames=hit.frames,
-                boxes=list(hit.boxes),
-                times=list(hit.times),
-                context_first=hit.context_first,
-                context_last=hit.context_last,
-                from_cache=True,
+            return _keep_visible(
+                _Cut(
+                    status=hit.status,
+                    frames=hit.frames,
+                    boxes=list(hit.boxes),
+                    times=list(hit.times),
+                    context_first=hit.context_first,
+                    context_last=hit.context_last,
+                    from_cache=True,
+                ),
+                width,
+                height,
             )
         stats.misses += 1
 
@@ -817,13 +920,17 @@ def _cutouts_for(
     if not packed:
         return remember(_Cut(status="no_cutout"))
     return remember(
-        _Cut(
-            status="ok",
-            frames=packed,
-            boxes=kept_boxes,
-            times=kept_times,
-            context_first=context_first,
-            context_last=context_last,
+        _keep_visible(
+            _Cut(
+                status="ok",
+                frames=packed,
+                boxes=kept_boxes,
+                times=kept_times,
+                context_first=context_first,
+                context_last=context_last,
+            ),
+            width,
+            height,
         )
     )
 

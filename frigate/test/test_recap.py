@@ -50,6 +50,15 @@ from frigate.recap.layout import (
     schedule_due,
     schedule_units,
 )
+from frigate.recap.plates import (
+    PlateFade,
+    build_timed_plates,
+    cutout_is_visible,
+    frame_is_ir,
+    gap_sample_times,
+    plate_index_at,
+    prepare_cutout,
+)
 from frigate.recap.render import (
     GhostFrame,
     Tube,
@@ -1792,6 +1801,269 @@ class TestIntervalRecap(unittest.TestCase):
                         (root / camera / recap_id / "manifest.json").is_file(),
                         recap_id,
                     )
+
+
+def _color_frame(height: int, width: int, tone: tuple[int, int, int]) -> np.ndarray:
+    frame = np.zeros((height, width, 3), np.uint8)
+    frame[: height // 2] = (210, 140, 70)
+    frame[height // 2 :] = tone
+    return frame
+
+
+def _ir_frame(height: int, width: int, level: int) -> np.ndarray:
+    return np.full((height, width, 3), level, np.uint8)
+
+
+class TestLightingPlates(unittest.TestCase):
+    def test_color_and_infrared_are_not_mixed(self):
+        day = [
+            (0.0, _color_frame(40, 60, (40, 160, 40))),
+            (600.0, _color_frame(40, 60, (50, 170, 40))),
+            (1200.0, _color_frame(40, 60, (40, 150, 30))),
+        ]
+        night = [
+            (3600.0, _ir_frame(40, 60, 28)),
+            (4200.0, _ir_frame(40, 60, 32)),
+        ]
+        plates = build_timed_plates(day + night)
+        self.assertEqual([plate.is_ir for plate in plates], [False, True])
+        self.assertFalse(frame_is_ir(plates[0].image))
+        self.assertTrue(frame_is_ir(plates[1].image))
+        # The daytime plate keeps the green ground instead of the night gray.
+        self.assertGreater(int(plates[0].image[-1, -1, 1]), 100)
+
+    def test_plate_follows_the_lighting_period_then_the_nearest_time(self):
+        samples = []
+        for moment in (0, 600, 1200, 1800, 2400):
+            samples.append((float(moment), _color_frame(20, 30, (40, 150, 40))))
+        for moment in (3000, 3600, 4200):
+            samples.append((float(moment), _ir_frame(20, 30, 30)))
+        plates = build_timed_plates(samples)
+        self.assertGreaterEqual(len(plates), 3)
+        self.assertFalse(plates[plate_index_at(plates, 1000)].is_ir)
+        self.assertFalse(plates[plate_index_at(plates, 2000)].is_ir)
+        # Halfway between the last day sample (2400) and the first night (3000).
+        self.assertFalse(plates[plate_index_at(plates, 2600)].is_ir)
+        self.assertTrue(plates[plate_index_at(plates, 2800)].is_ir)
+        self.assertTrue(plates[plate_index_at(plates, 4000)].is_ir)
+        early = plate_index_at(plates, 200)
+        later = plate_index_at(plates, 2200)
+        self.assertLess(plates[early].time, plates[later].time)
+
+    def test_lighting_gap_asks_for_the_midpoint(self):
+        samples = [
+            (0.0, _color_frame(16, 16, (40, 140, 40))),
+            (600.0, _ir_frame(16, 16, 20)),
+        ]
+        self.assertEqual(gap_sample_times(samples), [300.0])
+        self.assertEqual(
+            gap_sample_times(
+                [
+                    (0.0, _ir_frame(16, 16, 20)),
+                    (600.0, _ir_frame(16, 16, 25)),
+                ]
+            ),
+            [],
+        )
+
+    def test_plate_crossfade_covers_about_half_a_second(self):
+        fade = PlateFade(6)
+        self.assertEqual(fade.step(0), (0, None, 1.0))
+        current, previous, amount = fade.step(1)
+        self.assertEqual((current, previous), (1, 0))
+        self.assertAlmostEqual(amount, 1 / 6)
+        amounts = [amount]
+        for _ in range(5):
+            current, previous, amount = fade.step(1)
+            amounts.append(amount)
+            self.assertEqual(current, 1)
+        self.assertEqual(previous, 0)
+        self.assertAlmostEqual(amounts[-1], 1.0)
+        self.assertEqual(fade.step(1), (1, None, 1.0))
+
+    def test_color_cutout_on_an_infrared_plate_is_matched(self):
+        plate = _ir_frame(40, 50, 40)
+        crop = np.zeros((40, 50, 3), np.uint8)
+        crop[8:32, 10:40] = (30, 40, 220)
+        alpha = np.zeros((40, 50), np.uint8)
+        alpha[8:32, 10:40] = 255
+        matched = prepare_cutout(
+            crop, alpha, plate, plate_is_ir=True, plate_is_dark=True
+        )
+        body = matched[8:32, 10:40].astype(np.int16)
+        # Gray: the three channels sit together, unlike the red source.
+        spread = int(np.max(body, axis=2).max() - np.min(body, axis=2).min())
+        self.assertLess(spread, 12)
+        source_luma = float(crop[8:32, 10:40, 2].mean())
+        matched_luma = float(body.mean())
+        self.assertGreater(source_luma, 180)
+        self.assertLess(abs(matched_luma - 40), abs(source_luma - 40))
+
+    def test_similar_daylight_cutout_keeps_its_color(self):
+        plate = _color_frame(40, 50, (80, 150, 60))
+        crop = plate.copy()
+        crop[8:32, 10:40] = (40, 80, 200)
+        alpha = np.zeros((40, 50), np.uint8)
+        alpha[8:32, 10:40] = 255
+        matched = prepare_cutout(
+            crop, alpha, plate, plate_is_ir=False, plate_is_dark=False
+        )
+        self.assertGreater(int(matched[16, 20, 2]), int(matched[16, 20, 1]) + 40)
+
+    def test_empty_mask_and_edge_box_get_no_label(self):
+        plate = np.zeros((180, 320, 3), np.uint8)
+        box = (100.0, 40.0, 180.0, 120.0)
+        unit = ScheduledUnit(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            boxes=[box],
+            text="6:09 PM",
+        )
+        empty = GhostFrame(
+            x=100,
+            y=40,
+            box=box,
+            crop=np.zeros((80, 80, 3), np.uint8),
+            alpha=np.zeros((80, 80), np.uint8),
+        )
+        tube = Tube(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            frames=[empty],
+        )
+        rect = (10, 10, 90, 40)
+        vehicle = np.array((40, 165, 255), np.uint8)
+
+        def orange(image: np.ndarray) -> int:
+            return int((image == vehicle).all(axis=2).sum())
+
+        blank = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [rect],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        self.assertEqual(orange(blank), 0)
+        visible, _tip = cutout_is_visible(empty.alpha, box, 100, 40, 320, 180)
+        self.assertFalse(visible)
+
+        edge_box = (300.0, 40.0, 460.0, 140.0)
+        edge = GhostFrame(
+            x=300,
+            y=40,
+            box=edge_box,
+            crop=np.full((80, 20, 3), (20, 20, 20), np.uint8),
+            alpha=np.full((80, 20), 255, np.uint8),
+        )
+        unit.boxes = [edge_box]
+        tube.frames = [edge]
+        edged = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [rect],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        self.assertEqual(orange(edged), 0)
+
+    def test_night_cutout_gets_an_outline_and_the_leader_hits_the_object(self):
+        plate = _ir_frame(180, 320, 30)
+        box = (80.0, 20.0, 200.0, 150.0)
+        alpha = np.zeros((90, 100), np.uint8)
+        # The detector box reaches into the top of the frame. The car itself
+        # is only the lower part of the crop, which is what the line must hit.
+        alpha[40:88, 10:90] = 255
+        crop = np.full((90, 100, 3), 25, np.uint8)
+        crop[40:88, 10:90] = (28, 28, 28)
+        ghost = GhostFrame(x=90, y=30, box=box, crop=crop, alpha=alpha)
+        unit = ScheduledUnit(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            boxes=[box],
+            text="6:09 PM",
+        )
+        tube = Tube(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            frames=[ghost],
+        )
+        drawn = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [(8, 8, 80, 36)],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        edge = drawn[80:110, 96:102].astype(np.int16)
+        # Outline just left of the car body: orange, not the gray plate.
+        self.assertGreater(float(edge[:, :, 2].mean()), 70)
+        self.assertGreater(
+            float(edge[:, :, 2].mean()), float(edge[:, :, 0].mean()) + 30
+        )
+        # The old leader aimed at the box top (y=20). That row stays the plate.
+        self.assertTrue(np.all(drawn[16:24, 130:160] == plate[16:24, 130:160]))
+        # The line ends on the car, whose opaque top is y=70.
+        car_top = drawn[64:74, 130:160].astype(np.int16)
+        self.assertGreater(float(car_top[:, :, 2].mean()), 70)
+
+    def test_a_mask_must_touch_the_box_but_may_extend_past_it(self):
+        alpha = np.zeros((80, 40), np.uint8)
+        alpha[10:70, 5:35] = 255
+        visible, tip = cutout_is_visible(
+            alpha, (10.0, 10.0, 50.0, 40.0), 10, 10, 200, 200
+        )
+        self.assertTrue(visible)
+        self.assertIsNotNone(tip)
+        missed = np.zeros((40, 40), np.uint8)
+        missed[5:35, 5:35] = 255
+        visible, tip = cutout_is_visible(
+            missed, (100.0, 100.0, 140.0, 140.0), 0, 0, 200, 200
+        )
+        self.assertFalse(visible)
+        self.assertIsNone(tip)
+
+    def test_off_frame_box_does_not_become_a_cutout(self):
+        frame = _ir_frame(100, 160, 80)
+        box = (140.0, 20.0, 220.0, 90.0)
+        ghosts = build_cutouts([frame.copy() for _ in range(4)], [box] * 4, "vehicle")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        for ghost in ghosts:
+            self.assertEqual(int(np.asarray(ghost["alpha"]).sum()), 0)
 
 
 if __name__ == "__main__":

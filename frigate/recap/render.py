@@ -2,6 +2,8 @@
 
 Labels stay put for the whole appearance of an object. Only the thin
 leader and its dot follow the ghost. Vehicles are drawn under people.
+A label and its leader are drawn only when the cutout is actually on
+screen. The background can crossfade when the lighting period changes.
 """
 
 from __future__ import annotations
@@ -17,6 +19,15 @@ import numpy as np
 
 from frigate.recap.categories import CAT_COLOR
 from frigate.recap.layout import ScheduledUnit, plan_label_rects
+from frigate.recap.plates import (
+    PlateFade,
+    TimedPlate,
+    cutout_is_visible,
+    frame_is_dark,
+    frame_is_ir,
+    plate_index_at,
+    prepare_cutout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -248,33 +259,103 @@ def draw_label(
     )
 
 
-def _paste_ghost(canvas: np.ndarray, ghost: GhostFrame, alpha_scale: float) -> bool:
+def _paint_outline(
+    canvas: np.ndarray,
+    x0: int,
+    y0: int,
+    alpha: np.ndarray,
+    color: tuple[int, int, int],
+    alpha_scale: float,
+) -> None:
+    """Thin category-colored ring, plus a soft glow, around a night cutout.
+
+    The ring is about 2 px. It is drawn outside the opaque pixels so a
+    dark car on a dark road still has an edge.
+    """
+    if alpha_scale <= 0.01 or alpha.size == 0:
+        return
+    pad = 3
+    crop_h, crop_w = alpha.shape[:2]
+    opaque = np.zeros((crop_h + 2 * pad, crop_w + 2 * pad), np.uint8)
+    opaque[pad : pad + crop_h, pad : pad + crop_w] = np.where(alpha >= 64, 255, 0)
+    if int(opaque.max()) == 0:
+        return
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilated = cv2.dilate(opaque, kernel)
+    ring = cv2.subtract(dilated, opaque).astype(np.float32)
+    glow = cv2.GaussianBlur(dilated, (5, 5), 0).astype(np.float32)
+    glow = np.where(opaque > 0, 0, glow)
+    strength = np.maximum(ring, glow * 0.4) * (alpha_scale / 255.0)
+    dest_x = x0 - pad
+    dest_y = y0 - pad
+    src_x = 0
+    src_y = 0
+    if dest_x < 0:
+        src_x = -dest_x
+        dest_x = 0
+    if dest_y < 0:
+        src_y = -dest_y
+        dest_y = 0
+    copy_w = min(strength.shape[1] - src_x, canvas.shape[1] - dest_x)
+    copy_h = min(strength.shape[0] - src_y, canvas.shape[0] - dest_y)
+    if copy_w <= 0 or copy_h <= 0:
+        return
+    factor = strength[src_y : src_y + copy_h, src_x : src_x + copy_w][..., None]
+    region = canvas[dest_y : dest_y + copy_h, dest_x : dest_x + copy_w]
+    color_arr = np.array(color, np.float32)
+    mixed = region.astype(np.float32) * (1 - factor) + color_arr * factor
+    region[:] = mixed.astype(np.uint8)
+
+
+def _paste_ghost(
+    canvas: np.ndarray,
+    ghost: GhostFrame,
+    alpha_scale: float,
+    *,
+    plate_is_ir: bool,
+    plate_is_dark: bool,
+    outline: tuple[int, int, int] | None,
+) -> tuple[bool, tuple[int, int] | None]:
     """Paint a ghost. False when nothing visible landed on the canvas.
 
-    Callers use that to skip the leader. A line with no object under it
-    looks like the track is still there.
+    The tip is the top of the opaque cutout, which is where the leader
+    should end. An empty mask or a box that is mostly off the frame
+    returns no tip, and the caller skips the label and the leader.
     """
     pixels = ghost.pixels()
     if pixels is None or alpha_scale <= 0.01:
-        return False
+        return False, None
     crop, alpha = pixels
-    height, width = crop.shape[:2]
+    height, width = canvas.shape[:2]
     y0, x0 = ghost.y, ghost.x
-    y1 = min(canvas.shape[0], y0 + height)
-    x1 = min(canvas.shape[1], x0 + width)
+    y1 = min(height, y0 + crop.shape[0])
+    x1 = min(width, x0 + crop.shape[1])
     if y0 < 0 or x0 < 0 or y1 <= y0 or x1 <= x0:
-        return False
-    region = canvas[y0:y1, x0:x1]
+        return False, None
     crop_h = y1 - y0
     crop_w = x1 - x0
-    factor = (alpha[:crop_h, :crop_w].astype(np.float32) * (alpha_scale / 255.0))[
-        ..., None
-    ]
-    if float(factor.max()) < 0.04:
-        return False
-    blended = crop[:crop_h, :crop_w] * factor + region * (1 - factor)
+    crop = crop[:crop_h, :crop_w]
+    alpha = alpha[:crop_h, :crop_w]
+    visible, tip = cutout_is_visible(alpha, ghost.box, x0, y0, width, height)
+    if not visible or tip is None:
+        return False, None
+    region = canvas[y0:y1, x0:x1]
+    fitted = prepare_cutout(
+        crop,
+        alpha,
+        region,
+        plate_is_ir=plate_is_ir,
+        plate_is_dark=plate_is_dark,
+    )
+    if outline is not None:
+        _paint_outline(canvas, x0, y0, alpha, outline, alpha_scale)
+        region = canvas[y0:y1, x0:x1]
+    factor = (alpha.astype(np.float32) * (alpha_scale / 255.0))[..., None]
+    blended = fitted.astype(np.float32) * factor + region.astype(np.float32) * (
+        1 - factor
+    )
     region[:] = blended.astype(np.uint8)
-    return True
+    return True, tip
 
 
 def leader_without_ghost(
@@ -328,10 +409,17 @@ def compose_frame(
     label_opacity: float,
     font_scale: float,
     repeats: list[int],
+    plate_is_ir: bool | None = None,
+    plate_is_dark: bool | None = None,
 ) -> np.ndarray:
     """One synopsis frame. ``repeats[i]`` is how many output frames share a source frame."""
     canvas = plate.copy()
     height, width = canvas.shape[:2]
+    if plate_is_ir is None:
+        plate_is_ir = frame_is_ir(plate)
+    if plate_is_dark is None:
+        plate_is_dark = frame_is_dark(plate)
+    night = plate_is_ir or plate_is_dark
     thickness = max(1, int(round(height / 1080 * 2)))
     scale = max(0.45, height / 1080 * font_scale)
     line_w = max(1, int(round(height / 1080 * 1.5)))
@@ -357,6 +445,7 @@ def compose_frame(
             active.append(index)
     tube_by_id = {tube.event_id: tube for tube in tubes}
     shown: set[int] = set()
+    tips: dict[int, tuple[int, int]] = {}
     for index in active:
         unit = units[index]
         if unit.category == "parked":
@@ -379,16 +468,25 @@ def compose_frame(
         source_index = min(
             len(tube.frames) - 1, (frame_index - starts[index]) // repeat
         )
-        if _paste_ghost(canvas, tube.frames[source_index], ghost_alpha):
+        color = CAT_COLOR.get(unit.category, (255, 255, 255))
+        drawn, tip = _paste_ghost(
+            canvas,
+            tube.frames[source_index],
+            ghost_alpha,
+            plate_is_ir=plate_is_ir,
+            plate_is_dark=plate_is_dark,
+            outline=color if night else None,
+        )
+        if drawn and tip is not None:
             shown.add(index)
+            tips[index] = tip
 
     for index in active:
         if index not in shown:
             continue
-        local = frame_index - starts[index]
-        box = units[index].boxes[min(local, len(units[index].boxes) - 1)]
-        head = ((box[0] + box[2]) / 2, box[1])
-        tip = (int(head[0]), int(head[1]) - 2)
+        raw_tip = tips[index]
+        head = (float(raw_tip[0]), float(raw_tip[1]))
+        tip = (raw_tip[0], raw_tip[1] - 2)
         rect = rects[index]
         anchor = _leader_anchor(rect, head)
         bounds = (
@@ -419,7 +517,7 @@ def compose_frame(
         if unit.link_index is not None
     }
     for index, partner in partners.items():
-        if index not in fade or partner not in fade:
+        if index not in shown or partner not in shown:
             continue
         left, right = rects[index], rects[partner]
         left_c = ((left[0] + left[2]) / 2, (left[1] + left[3]) / 2)
@@ -449,6 +547,8 @@ def compose_frame(
             _blend(canvas, before, bounds, amount)
 
     for index in active:
+        if index not in shown:
+            continue
         rect = rects[index]
         bounds = (
             max(0, rect[0] - 2),
@@ -531,6 +631,41 @@ def layout_labels(
     )
 
 
+def _story_moment(
+    units: Sequence[ScheduledUnit], starts: Sequence[int], frame_index: int
+) -> float | None:
+    """Median start time of the objects on this synopsis frame.
+
+    Events are placed in chronological order, so this moves from afternoon
+    into night instead of jumping back to an earlier plate.
+    """
+    active = [
+        unit.start_time
+        for unit, start in zip(units, starts, strict=True)
+        if start <= frame_index < start + len(unit.boxes)
+    ]
+    if not active:
+        return None
+    return float(np.median(active))
+
+
+def _plate_for_frame(
+    plates: Sequence[TimedPlate],
+    fade: PlateFade,
+    moment: float,
+) -> tuple[np.ndarray, bool, bool]:
+    """Background for one frame, crossfaded when the plate changes."""
+    index = plate_index_at(plates, moment)
+    current, previous, amount = fade.step(index)
+    chosen = plates[current]
+    if previous is None or amount >= 0.999:
+        return chosen.image, chosen.is_ir, chosen.is_dark
+    older = plates[previous]
+    image = cv2.addWeighted(older.image, 1 - amount, chosen.image, amount, 0)
+    shown = chosen if amount >= 0.5 else older
+    return image, shown.is_ir, shown.is_dark
+
+
 def encode_video(
     plate: np.ndarray,
     units: list[ScheduledUnit],
@@ -549,6 +684,8 @@ def encode_video(
     font_scale: float,
     repeats: list[int],
     cancel_check,
+    plates: Sequence[TimedPlate] | None = None,
+    plate_fade_frames: int = 6,
 ) -> np.ndarray | None:
     """Pipe raw frames to ffmpeg. Returns a thumbnail frame, or None if cancelled."""
     height, width = plate.shape[:2]
@@ -584,11 +721,24 @@ def encode_video(
     assert process.stdin is not None
     thumb: np.ndarray | None = None
     busiest = -1
+    timed = [item for item in (plates or []) if item.image.shape[:2] == (height, width)]
+    fade = PlateFade(plate_fade_frames)
+    moment = timed[0].time if timed else 0.0
     try:
         for frame_index in range(max(1, frame_count)):
             if cancel_check():
                 process.kill()
                 return None
+            if timed:
+                story = _story_moment(units, starts, frame_index)
+                if story is not None:
+                    moment = story
+                plate, plate_is_ir, plate_is_dark = _plate_for_frame(
+                    timed, fade, moment
+                )
+            else:
+                plate_is_ir = None
+                plate_is_dark = None
             image = compose_frame(
                 plate,
                 units,
@@ -602,6 +752,8 @@ def encode_video(
                 label_opacity=label_opacity,
                 font_scale=font_scale,
                 repeats=repeats,
+                plate_is_ir=plate_is_ir,
+                plate_is_dark=plate_is_dark,
             )
             visible = sum(
                 1

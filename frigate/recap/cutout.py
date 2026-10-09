@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from frigate.recap.layout import MotionTrack
+from frigate.recap.plates import mostly_off_frame
 
 # Vehicle masks wider than this are computed on a smaller image and scaled
 # back. A distant car stays at full resolution so its few pixels are not lost.
@@ -37,7 +38,11 @@ def clean_background(
     if not frames:
         raise ValueError("clean_background requires at least one frame")
     height, width = frames[0].shape[:2]
-    chosen = np.linspace(0, len(frames) - 1, min(len(frames), _PLATE_SAMPLES)).round().astype(int)
+    chosen = (
+        np.linspace(0, len(frames) - 1, min(len(frames), _PLATE_SAMPLES))
+        .round()
+        .astype(int)
+    )
     stack = np.stack([frames[index] for index in chosen]).astype(np.float32)
     exclude = np.zeros((len(chosen), height, width), dtype=bool)
     for sample, index in enumerate(chosen):
@@ -329,7 +334,7 @@ def _soft_box(
     height, width = frame.shape[:2]
     box_w = box[2] - box[0]
     box_h = box[3] - box[1]
-    if box_w < 4 or box_h < 4:
+    if box_w < 4 or box_h < 4 or mostly_off_frame(box, width, height):
         return None
     x0 = int(max(0, box[0]))
     y0 = int(max(0, box[1]))
@@ -765,6 +770,14 @@ def build_cutouts(
     cached: dict[str, object] | None = None
     cached_box: tuple[float, float, float, float] | None = None
     for index, (frame, box) in enumerate(zip(frames, boxes, strict=True)):
+        if mostly_off_frame(box, width, height):
+            # A box sitting on the frame edge used to keep a sliver and a
+            # leader that pointed at the border. Leave a blank so the
+            # caller can drop the frame instead of drawing that line.
+            ghosts.append(_blank_ghost(box))
+            cached = None
+            cached_box = None
+            continue
         if (
             cached is not None
             and cached_box is not None

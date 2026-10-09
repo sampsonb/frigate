@@ -40,10 +40,10 @@ from frigate.recap.frames import (
 from frigate.recap.generate import (
     RecapCancelled,
     generate_recap,
-    plate_timestamps,
     sample_times,
 )
 from frigate.recap.layout import rolling_decision, rolling_slot_key, schedule_due
+from frigate.recap.plates import gap_sample_times, plate_sample_times
 from frigate.recap.queries import (
     event_fingerprint,
     fingerprint_changed,
@@ -768,25 +768,59 @@ class RecapJob(threading.Thread):
                 dogs.add(event_id)
         return delivery, dogs
 
+    def _grab_plate(
+        self,
+        ffmpeg: str,
+        rows: list[dict[str, Any]],
+        moment: float,
+        width: int,
+        height: int,
+    ):
+        segment = _segment_at(rows, moment)
+        if segment is None:
+            return None
+        path, offset = segment
+        return grab_frame(ffmpeg, path, offset, width, height)
+
     def _plate(
         self,
         ffmpeg: str,
         rows: list[dict[str, Any]],
         width: int,
         height: int,
-    ) -> list:
-        frames = []
-        for moment in plate_timestamps(self.after, self.before, 12):
+    ) -> list[tuple[float, Any]]:
+        """Frames about every 10 minutes, plus extra grabs at a day/night switch.
+
+        Each sample keeps its timestamp so the synopsis can use a plate from
+        the same lighting period as the objects on screen.
+        """
+        samples: list[tuple[float, Any]] = []
+        for moment in plate_sample_times(self.after, self.before):
             if self._cancel.is_set():
                 raise RecapCancelled()
-            segment = _segment_at(rows, moment)
-            if segment is None:
-                continue
-            path, offset = segment
-            frame = grab_frame(ffmpeg, path, offset, width, height)
+            frame = self._grab_plate(ffmpeg, rows, moment, width, height)
             if frame is not None:
-                frames.append(frame)
-        return frames
+                samples.append((moment, frame))
+        # A 10 minute step can jump over the infrared switch. Bisect the
+        # gaps whose neighbors disagree, a few times, so the plate changes
+        # near the real switch instead of half an hour later.
+        for _pass in range(3):
+            extras = gap_sample_times(samples)
+            if not extras:
+                break
+            added = False
+            for moment in extras:
+                if self._cancel.is_set():
+                    raise RecapCancelled()
+                frame = self._grab_plate(ffmpeg, rows, moment, width, height)
+                if frame is None:
+                    continue
+                samples.append((moment, frame))
+                added = True
+            if not added:
+                break
+            samples.sort(key=lambda item: item[0])
+        return samples
 
 
 class RecapMaintainer(threading.Thread):
