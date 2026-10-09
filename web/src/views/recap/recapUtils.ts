@@ -4,6 +4,12 @@ import { formatUnixTimestampToDateTime } from "@/utils/dateUtil";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import useSWR from "swr";
+import {
+  compactClock,
+  compactDay,
+  compactDuration,
+  sameLocalDay,
+} from "./compactTime";
 
 export const LONGER_CHOICES = [12, 24, 48, 72] as const;
 export type LongerChoice = (typeof LONGER_CHOICES)[number];
@@ -182,19 +188,43 @@ export function useRecapTime() {
     [dayTime, format, t, time],
   );
 
+  const range = useCallback(
+    (after?: number, before?: number) => {
+      if (!after || !before) {
+        return "";
+      }
+      const start = compactClock(after, timezone, hour24);
+      const end = compactClock(before, timezone, hour24);
+      const startDay = compactDay(after, timezone);
+      if (sameLocalDay(after, before, timezone)) {
+        return t("rangeSameDay", { day: startDay, start, end });
+      }
+      return t("rangeCrossDay", {
+        startDay,
+        start,
+        endDay: compactDay(before, timezone),
+        end,
+      });
+    },
+    [hour24, t, timezone],
+  );
+
   const duration = useCallback(
     (after?: number, before?: number) => {
       if (!after || !before) {
         return "";
       }
-      const hours = (before - after) / HOUR;
-      if (Math.abs(hours - Math.round(hours)) < 0.05 && hours >= 1) {
-        return t("hoursLong", { count: Math.round(hours) });
+      const parts = compactDuration(after, before);
+      if (parts.kind === "minutes") {
+        return t("minutesShort", { count: parts.count });
       }
-      if (hours >= 1) {
-        return t("hoursLong", { count: Math.round(hours * 10) / 10 });
+      if (parts.kind === "hours") {
+        return t("hoursShort", { count: parts.count });
       }
-      return t("minutesLong", { count: Math.max(1, Math.round(hours * 60)) });
+      return t("durationHoursMinutes", {
+        hours: parts.hours,
+        minutes: parts.minutes,
+      });
     },
     [t],
   );
@@ -220,8 +250,18 @@ export function useRecapTime() {
   );
 
   return useMemo(
-    () => ({ dayTime, time, day, span, duration, relative, hour24, timezone }),
-    [dayTime, time, day, span, duration, relative, hour24, timezone],
+    () => ({
+      dayTime,
+      time,
+      day,
+      span,
+      range,
+      duration,
+      relative,
+      hour24,
+      timezone,
+    }),
+    [dayTime, time, day, span, range, duration, relative, hour24, timezone],
   );
 }
 

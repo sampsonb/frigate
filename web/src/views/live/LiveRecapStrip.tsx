@@ -3,7 +3,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { useCameraFriendlyName } from "@/hooks/use-camera-friendly-name";
 import { CameraConfig } from "@/types/frigateConfig";
 import { RecapSummary } from "@/types/recap";
-import { compareRecapNewest } from "@/views/recap/recapUtils";
+import { compareRecapNewest, useRecapTime } from "@/views/recap/recapUtils";
 import axios from "axios";
 import { useMemo } from "react";
 import { LuClapperboard } from "react-icons/lu";
@@ -114,7 +114,13 @@ function RecapStripCard({
   hourLabel: (hours: number, short: boolean) => string;
 }) {
   const { t } = useTranslation(["views/live"]);
+  const times = useRecapTime();
   const cameraName = useCameraFriendlyName(camera);
+  const range =
+    latest?.after && latest?.before
+      ? times.range(latest.after, latest.before)
+      : "";
+  const length = times.duration(latest?.after, latest?.before);
   return (
     <div className="flex w-[15.5rem] shrink-0 items-center gap-2 rounded-lg border border-secondary bg-background_alt p-1.5">
       <button
@@ -138,20 +144,34 @@ function RecapStripCard({
       <div className="min-w-0 flex-1">
         <button
           type="button"
-          className="block w-full truncate text-left text-xs font-medium"
+          className="block w-full text-left text-xs font-medium"
           onClick={onOpen}
         >
-          {t("recapStrip.title")}
-          <span className="font-normal text-muted-foreground">
-            {" "}
-            · {cameraName}
+          <span className="block truncate">
+            {t("recapStrip.title")}
+            <span className="font-normal text-muted-foreground">
+              {" "}
+              · {cameraName}
+            </span>
           </span>
+          {range ? (
+            <span className="mt-0.5 line-clamp-2 text-[11px] font-medium leading-tight">
+              {range}
+              {length ? (
+                <span className="font-normal text-muted-foreground">
+                  {" "}
+                  · {length}
+                </span>
+              ) : null}
+            </span>
+          ) : (
+            !latest && (
+              <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                {t("recapStrip.none")}
+              </span>
+            )
+          )}
         </button>
-        {!latest && (
-          <div className="truncate text-[10px] text-muted-foreground">
-            {t("recapStrip.none")}
-          </div>
-        )}
         <div className="mt-1 flex gap-1">
           {HOURS.map((hours) => (
             <button

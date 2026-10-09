@@ -37,6 +37,11 @@ export default function RecapListItem({
   );
   const showThumb = item.status === "complete" && !thumbFailed;
   const version = item.finished || item.created || 0;
+  const title =
+    item.after && item.before
+      ? times.range(item.after, item.before)
+      : times.dayTime(item.before || item.created);
+  const length = times.duration(item.after, item.before);
 
   return (
     <div
@@ -86,33 +91,31 @@ export default function RecapListItem({
           )}
         </span>
         <span className="flex min-w-0 flex-1 flex-col justify-center gap-0.5">
-          <span className="flex items-center gap-1.5 truncate text-sm font-medium">
-            {nightly && (
-              <LuMoon
-                className="size-3.5 shrink-0 text-muted-foreground"
-                aria-label={t("nightly")}
-              />
-            )}
-            {savedRolling && (
-              <LuHistory
-                className="size-3.5 shrink-0 text-muted-foreground"
-                aria-label={t("savedRolling")}
-              />
-            )}
-            <span className="truncate">
-              {times.dayTime(item.before || item.created)}
+          <span className="line-clamp-2 text-[13px] font-medium leading-snug">
+            {title}
+          </span>
+          {(length || nightly || savedRolling || badge) && (
+            <span className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-muted-foreground">
+              {nightly && (
+                <LuMoon
+                  className="size-3.5 shrink-0"
+                  aria-label={t("nightly")}
+                />
+              )}
+              {savedRolling && (
+                <LuHistory
+                  className="size-3.5 shrink-0"
+                  aria-label={t("savedRolling")}
+                />
+              )}
+              {length && <span>{length}</span>}
+              {(badge || nightly) && (
+                <span className="shrink-0 rounded bg-secondary px-1.5 py-0.5 text-[10px] font-normal text-secondary-foreground">
+                  {badge || t("nightlyBadge")}
+                </span>
+              )}
             </span>
-            {(badge || nightly) && (
-              <span className="shrink-0 rounded bg-secondary px-1.5 py-0.5 text-[10px] font-normal text-secondary-foreground">
-                {badge || t("nightlyBadge")}
-              </span>
-            )}
-          </span>
-          <span className="truncate text-xs text-muted-foreground">
-            {times.duration(item.after, item.before)}
-            {" · "}
-            {times.span(item.after, item.before)}
-          </span>
+          )}
           <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
             {busy ? (
               <span className="truncate text-muted-foreground">
