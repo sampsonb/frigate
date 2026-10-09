@@ -1966,8 +1966,9 @@ paths:
         - Recap
       summary: List recaps
       description: >-
-        Lists saved video synopses for cameras the user can view, newest
-        first, including older recaps on recap.archive when that is set.
+        Lists saved video synopses for cameras the user can view. Newest
+        window end first, then newest creation time, across cameras and
+        kinds. Includes older recaps on recap.archive when that is set.
       operationId: recap_list_recap_get
       responses:
         "200":

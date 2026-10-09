@@ -14,6 +14,12 @@ const NIGHTLY_FRESH_SECONDS = 26 * HOUR;
 // Largest gap or overlap allowed between back-to-back nightly windows.
 const NIGHTLY_JOIN_SLACK_SECONDS = 3 * HOUR;
 
+export function compareRecapNewest(a: RecapSummary, b: RecapSummary) {
+  return (
+    (b.before ?? 0) - (a.before ?? 0) || (b.created ?? 0) - (a.created ?? 0)
+  );
+}
+
 export function isBusy(item?: { status?: string } | null) {
   return item?.status === "queued" || item?.status === "running";
 }

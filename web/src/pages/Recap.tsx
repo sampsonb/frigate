@@ -21,6 +21,7 @@ import RecapRangePicker from "@/views/recap/RecapRangePicker";
 import {
   LongerChoice,
   availableNights,
+  compareRecapNewest,
   isBusy,
   isRolling,
   nightlyPlaylist,
@@ -122,9 +123,10 @@ export default function Recap() {
 
   const forCamera = useMemo(
     () =>
-      (recaps ?? []).filter(
-        (item) => item.camera === camera && !isRolling(item),
-      ),
+      (recaps ?? [])
+        .filter((item) => item.camera === camera && !isRolling(item))
+        .slice()
+        .sort(compareRecapNewest),
     [camera, recaps],
   );
   const featured = forCamera.filter(

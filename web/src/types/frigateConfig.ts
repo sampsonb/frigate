@@ -272,6 +272,7 @@ export interface CameraConfig {
   recap?: {
     enabled: boolean;
     schedule?: string | null;
+    interval_minutes?: number | null;
     window_hours?: number;
     max_window_hours?: number;
   };
@@ -527,6 +528,7 @@ export interface FrigateConfig {
   recap?: {
     enabled: boolean;
     schedule?: string | null;
+    interval_minutes?: number | null;
     window_hours?: number;
     max_window_hours?: number;
     archive?: {

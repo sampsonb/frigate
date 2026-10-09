@@ -26,6 +26,7 @@ Useful knobs:
 | Field | Default | Purpose |
 | --- | --- | --- |
 | `schedule` | none | Daily `HH:MM` in `ui.timezone`. The container clock is often UTC, and this time is not UTC unless that setting is unset. Frigate has to be running within about 90 seconds of this time. |
+| `interval_minutes` | off | Build a recap of the last this many minutes on that interval. The kind is `rolling-<minutes>m`, so the previous one of that kind is replaced when the new one is Ready. A run is skipped while that one is still queued or rendering, and a missed interval is not queued behind it. Separate from the rolling recap that stays ready. |
 | `window_hours` | 24 | How far back a scheduled recap looks. |
 | `max_window_hours` | 48 | Longest on-demand range. |
 | `labels` | people, vehicles, animals, delivery names | Tracked labels to consider. |
@@ -127,6 +128,8 @@ recap:
 Queue rules: one recap is built at a time. A request from the UI (a longer range, a custom range, or Refresh now) runs before scheduled work. A refresh never waits behind another refresh of the same camera, and a request that is already waiting or running is returned instead of being queued twice.
 
 Each event's cutouts are cached under `/media/frigate/recap/.cutcache`, keyed on the event id and end time, output size, sample rate, the per-object time cap, the category, and a cache version. A refresh only decodes events it has not seen. Entries unused for 74 hours are removed after each job, and the size is written to the log. Manifests record `started`, `finished`, `took_s`, the start of each stage, and cache hits and misses.
+
+`interval_minutes` is a separate optional job, off unless you set it. It builds a new recap of only the last that many minutes, with kind `rolling-<minutes>m`. Saved copies of that kind are replaced when the new one is Ready. Each object is still trimmed to `max_object_seconds` of samples, so a 30 minute run is a small fraction of a nightly 24 hour recap. The finished-recap log includes `rendered in` seconds (`took_s` on the manifest). If that render is still going when the next interval opens, that run is skipped instead of queued.
 
 `GET /api/recap/rolling/<camera>` returns the rolling recap, any refresh in progress, and the last outcome. `POST /api/recap/rolling/<camera>/refresh` checks now (`?force=true` rebuilds even when nothing changed).
 

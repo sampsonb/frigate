@@ -3,6 +3,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { useCameraFriendlyName } from "@/hooks/use-camera-friendly-name";
 import { CameraConfig } from "@/types/frigateConfig";
 import { RecapSummary } from "@/types/recap";
+import { compareRecapNewest } from "@/views/recap/recapUtils";
 import axios from "axios";
 import { useMemo } from "react";
 import { LuClapperboard } from "react-icons/lu";
@@ -18,12 +19,14 @@ type LiveRecapStripProps = {
 };
 
 function newestPlayable(items: RecapSummary[], camera: string) {
-  return items.find(
-    (item) =>
-      item.camera === camera &&
-      item.status === "complete" &&
-      (item.event_count ?? 0) > 0,
-  );
+  return items
+    .filter(
+      (item) =>
+        item.camera === camera &&
+        item.status === "complete" &&
+        (item.event_count ?? 0) > 0,
+    )
+    .sort(compareRecapNewest)[0];
 }
 
 export default function LiveRecapStrip({ cameras }: LiveRecapStripProps) {

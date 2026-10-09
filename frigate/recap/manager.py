@@ -43,7 +43,7 @@ from frigate.recap.generate import (
     plate_timestamps,
     sample_times,
 )
-from frigate.recap.layout import schedule_due
+from frigate.recap.layout import rolling_decision, rolling_slot_key, schedule_due
 from frigate.recap.queries import (
     event_fingerprint,
     fingerprint_changed,
@@ -98,6 +98,8 @@ def dedupe_key(
     """Jobs with the same key are the same request and are not queued twice."""
     if reason == ROLLING_REASON:
         return f"{camera}:rolling"
+    if reason == "interval":
+        return f"{camera}:interval:{kind}"
     if explicit_range:
         return f"{camera}:range:{int(round(after))}:{int(round(before))}"
     if reason in ("schedule", "backfill"):
@@ -183,7 +185,7 @@ class RecapManager:
         if priority is None:
             priority = (
                 PRIORITY_SCHEDULED
-                if reason in ("schedule", "backfill")
+                if reason in ("schedule", "backfill", "interval")
                 else PRIORITY_MANUAL
             )
         zone = resolve_zone(self.config)
@@ -232,6 +234,7 @@ class RecapManager:
             directory,
             priority=priority,
             key=key,
+            reason=reason,
         )
         with self._lock:
             self._enqueue_locked(job)
@@ -310,6 +313,7 @@ class RecapManager:
             directory,
             priority=priority,
             key=key,
+            reason=ROLLING_REASON,
             rolling_hours=hours,
         )
         with self._lock:
@@ -373,6 +377,12 @@ class RecapManager:
             "building": building,
             "state": self.rolling_state.get(camera, {}),
         }
+
+    def has_pending(self, camera: str, reason: str) -> bool:
+        """True when this camera already has a queued or running job of ``reason``."""
+        with self._lock:
+            jobs = ([self._running] if self._running else []) + list(self._queue)
+            return any(job.camera == camera and job.reason == reason for job in jobs)
 
     def _find_locked(self, key: str) -> RecapJob | None:
         if self._running is not None and self._running.key == key:
@@ -475,6 +485,7 @@ class RecapJob(threading.Thread):
         *,
         priority: int = PRIORITY_MANUAL,
         key: str = "",
+        reason: str = "",
         rolling_hours: float | None = None,
     ) -> None:
         super().__init__(name=f"recap-{recap_id}", daemon=True)
@@ -487,6 +498,7 @@ class RecapJob(threading.Thread):
         self.directory = directory
         self.priority = priority
         self.key = key or recap_id
+        self.reason = reason
         self.seq = 0
         # Set for a rolling refresh. The window is fixed when the job starts.
         self.rolling_hours = rolling_hours
@@ -713,10 +725,11 @@ class RecapJob(threading.Thread):
         )
         write_manifest(self.directory, current)
         logger.info(
-            "Recap %s ready, %s objects, %ss",
+            "Recap %s ready, %s objects, %ss video, rendered in %ss",
             self.recap_id,
             current.get("event_count"),
             current.get("seconds"),
+            current.get("took_s"),
         )
         # A deletion error must not flip a Ready recap to failed.
         try:
@@ -792,6 +805,7 @@ class RecapMaintainer(threading.Thread):
             try:
                 self._schedule()
                 self._rolling()
+                self._interval()
                 self._ticks += 1
                 if self._ticks % 180 == 1:
                     self._retain()
@@ -827,6 +841,60 @@ class RecapMaintainer(threading.Thread):
             except ValueError as err:
                 logger.info("Skipped rolling recap for %s: %s", name, err)
         return checked
+
+    def _interval(self) -> None:
+        """Start one last-N style recap per camera per ``interval_minutes`` slot.
+
+        The window is the last ``interval_minutes`` of footage. The kind
+        is ``rolling-<minutes>m``, so a Ready copy replaces older ones of
+        that kind only. A slot that arrives while that recap is still
+        queued or rendering is skipped, so missed runs do not pile up.
+        This is separate from the in-place ``rolling_hours`` recap.
+        """
+        zone = resolve_zone(self.config)
+        now = datetime.now(zone)
+        state_file = Path(RECAP_DIR) / ".interval.json"
+        try:
+            state = json.loads(state_file.read_text()) if state_file.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        changed = False
+        for name, camera in self.config.cameras.items():
+            settings = camera.recap
+            minutes = settings.interval_minutes
+            if not camera.enabled or not settings.enabled or not minutes:
+                continue
+            slot = rolling_slot_key(now, minutes)
+            key = f"{name}:{slot}"
+            action = rolling_decision(
+                bool(state.get(key)),
+                self.manager.has_pending(name, "interval"),
+            )
+            if action == "wait":
+                continue
+            if action == "start":
+                before = now.timestamp()
+                after = before - minutes * 60
+                try:
+                    self.manager.start(name, after, before, reason="interval")
+                except ValueError as err:
+                    logger.info("Skipped interval recap for %s: %s", name, err)
+                else:
+                    logger.info("Interval recap started for %s (%sm)", name, minutes)
+            else:
+                logger.info(
+                    "Skipped interval recap for %s because one is still running",
+                    name,
+                )
+            state[key] = now.timestamp()
+            changed = True
+        if changed:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            today = now.date().isoformat()
+            fresh = {key: value for key, value in state.items() if today in str(key)}
+            state_file.write_text(json.dumps(fresh))
 
     def _retain(self) -> None:
         days = {

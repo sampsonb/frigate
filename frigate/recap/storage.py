@@ -139,10 +139,22 @@ def _scan(root: Path) -> list[dict[str, Any]]:
     return found
 
 
+def recap_order_key(item: dict[str, Any]) -> tuple[float, float]:
+    """Newest window end first, then the newest creation time.
+
+    The end of the footage matters more than when the file was written,
+    and the order is the same for every camera and kind.
+    """
+    return (
+        float(item.get("before") or 0),
+        float(item.get("created") or 0),
+    )
+
+
 def list_recaps() -> list[dict[str, Any]]:
-    """Local recaps, newest first. Retention uses this list and ignores the archive."""
+    """Local recaps, newest window first. Retention uses this list and ignores the archive."""
     found = _scan(recap_root())
-    found.sort(key=lambda item: float(item.get("created") or 0), reverse=True)
+    found.sort(key=recap_order_key, reverse=True)
     return found
 
 
@@ -166,7 +178,7 @@ def list_visible_recaps(archive_dirs: list[Path]) -> list[dict[str, Any]]:
                 item["status"] = "complete"
             seen.add(recap_id)
             merged.append(item)
-    merged.sort(key=lambda item: float(item.get("created") or 0), reverse=True)
+    merged.sort(key=recap_order_key, reverse=True)
     return merged
 
 
@@ -337,6 +349,11 @@ def recap_kind(
         end = datetime.fromtimestamp(float(before), tz=zone)
         return f"day:{end.date().isoformat()}"
     span = max(0.0, float(before) - float(after))
+    if reason == "interval":
+        # Separate from last-Nh and from the in-place rolling recap, so
+        # only another run of this same interval replaces it.
+        minutes = max(1, int(round(span / 60)))
+        return f"rolling-{minutes}m"
     nearest_hour = int(round(span / 3600))
     if nearest_hour >= 1 and abs(span - nearest_hour * 3600) <= _HOUR_SLACK_SECONDS:
         return f"last-{nearest_hour}h"

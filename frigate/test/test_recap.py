@@ -45,6 +45,8 @@ from frigate.recap.layout import (
     link_parked_cars,
     plan_label_rects,
     repeat_for_min_show,
+    rolling_decision,
+    rolling_slot_key,
     schedule_due,
     schedule_units,
 )
@@ -119,6 +121,10 @@ class TestRecapLabels(unittest.TestCase):
         RecapConfig = _recap_config()
         config = RecapConfig()
         self.assertFalse(config.enabled)
+        self.assertIsNone(config.interval_minutes)
+        self.assertIsNone(RecapConfig(interval_minutes=0).interval_minutes)
+        self.assertIsNone(RecapConfig(interval_minutes="").interval_minutes)
+        self.assertEqual(RecapConfig(interval_minutes=30).interval_minutes, 30)
         self.assertTrue(config.replace_superseded)
         self.assertFalse(RecapConfig(replace_superseded=False).replace_superseded)
         self.assertIsNone(config.archive.path)
@@ -1656,6 +1662,136 @@ class TestSupersededRecaps(unittest.TestCase):
                 self.assertTrue(
                     (root / "front" / "front_last" / "manifest.json").is_file()
                 )
+
+
+class TestRecapOrder(unittest.TestCase):
+    def test_window_end_then_creation_time_across_cameras(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local"
+            archive = Path(tmp) / "archive"
+            root.mkdir()
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(root, "door", "door_same_end", before=300, created=1)
+                _write_recap(root, "front", "front_same_end", before=300, created=9)
+                _write_recap(
+                    root, "front", "front_older_window", before=100, created=50
+                )
+                _write_recap(root, "yard", "yard_newest", before=400, created=2)
+                _write_recap(
+                    archive,
+                    "front",
+                    "front_archive_later",
+                    before=500,
+                    created=1,
+                )
+                listed = list_visible_recaps([archive])
+                self.assertEqual(
+                    [item["id"] for item in listed],
+                    [
+                        "front_archive_later",
+                        "yard_newest",
+                        "front_same_end",
+                        "door_same_end",
+                        "front_older_window",
+                    ],
+                )
+
+
+class TestIntervalRecap(unittest.TestCase):
+    def test_kind_is_the_interval_not_last_n_hours(self):
+        zone = ZoneInfo("America/New_York")
+        self.assertEqual(recap_kind("interval", 0, 30 * 60, zone), "rolling-30m")
+        self.assertEqual(recap_kind("interval", 0, 90 * 60, zone), "rolling-90m")
+        self.assertEqual(recap_kind("manual", 0, 30 * 60, zone), "last-30m")
+
+    def test_slot_follows_the_local_clock_and_does_not_queue(self):
+        zone = ZoneInfo("America/New_York")
+        ten = datetime(2026, 10, 9, 10, 0, tzinfo=zone)
+        self.assertEqual(rolling_slot_key(ten, 30), "2026-10-09:20")
+        self.assertEqual(
+            rolling_slot_key(ten.replace(minute=29, second=59), 30),
+            "2026-10-09:20",
+        )
+        self.assertEqual(rolling_slot_key(ten.replace(minute=30), 30), "2026-10-09:21")
+        self.assertEqual(
+            rolling_slot_key(ten.replace(hour=0, minute=0), 30),
+            "2026-10-09:0",
+        )
+        self.assertEqual(rolling_decision(False, False), "start")
+        self.assertEqual(rolling_decision(False, True), "skip")
+        self.assertEqual(rolling_decision(True, False), "wait")
+        self.assertEqual(rolling_decision(True, True), "wait")
+
+    def test_a_ready_interval_recap_replaces_only_that_kind(self):
+        zone = ZoneInfo("UTC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(
+                    root,
+                    "front",
+                    "front_new",
+                    created=20,
+                    reason="interval",
+                    after=0,
+                    before=30 * 60,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_old",
+                    created=5,
+                    kind="rolling-30m",
+                    after=0,
+                    before=30 * 60,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_last",
+                    created=4,
+                    kind="last-30m",
+                    after=0,
+                    before=30 * 60,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_hour",
+                    created=3,
+                    kind="rolling-60m",
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_standing",
+                    created=6,
+                    reason="rolling",
+                    kind="rolling",
+                    after=0,
+                    before=6 * 3600,
+                )
+                _write_recap(
+                    root,
+                    "door",
+                    "door_rolling",
+                    created=2,
+                    kind="rolling-30m",
+                )
+                removed = remove_superseded("front", "front_new", zone)
+                self.assertEqual(removed, ["front_old"])
+                for recap_id in (
+                    "front_new",
+                    "front_last",
+                    "front_hour",
+                    "front_standing",
+                    "door_rolling",
+                ):
+                    camera = "door" if recap_id.startswith("door") else "front"
+                    self.assertTrue(
+                        (root / camera / recap_id / "manifest.json").is_file(),
+                        recap_id,
+                    )
 
 
 if __name__ == "__main__":

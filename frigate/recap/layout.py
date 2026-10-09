@@ -91,6 +91,33 @@ def schedule_due(now: datetime, schedule: str, *, window_seconds: float = 90) ->
     return (now - scheduled).total_seconds() <= window_seconds
 
 
+def rolling_slot_key(now: datetime, interval_minutes: int) -> str:
+    """Clock bucket for ``recap.interval_minutes``.
+
+    ``now`` is already in ``ui.timezone``. A 30 minute interval is
+    ``date:0`` from 00:00 through 00:29 and ``date:1`` from 00:30.
+    """
+    if interval_minutes < 1:
+        raise ValueError("interval_minutes must be at least 1")
+    minutes = now.hour * 60 + now.minute
+    slot = minutes // interval_minutes
+    return f"{now.date().isoformat()}:{slot}"
+
+
+def rolling_decision(slot_seen: bool, busy: bool) -> str:
+    """Whether this camera should start an interval recap for the current slot.
+
+    ``wait`` means the slot was already handled. ``skip`` means one is
+    still queued or rendering, so the slot is consumed and nothing is
+    added to the queue. ``start`` means begin the one recap for the slot.
+    """
+    if slot_seen:
+        return "wait"
+    if busy:
+        return "skip"
+    return "start"
+
+
 def assign_label_texts(
     timestamps: Sequence[float],
     suffixes: Sequence[str | None],

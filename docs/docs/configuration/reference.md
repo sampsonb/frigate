@@ -807,6 +807,10 @@ recap:
   enabled: False
   # Optional: Daily local time to generate a recap automatically, HH:MM (default: none)
   # schedule: "02:00"
+  # Optional: Build a recap of the last N minutes on that interval (default: off).
+  # Kind is rolling-<minutes>m. Skipped while the previous one is still
+  # queued or rendering. 0 disables it. Separate from rolling_hours.
+  # interval_minutes: 30
   # Optional: Hours of footage each scheduled recap covers (default: shown below)
   window_hours: 24
   # Optional: Longest on-demand range, in hours (default: shown below)

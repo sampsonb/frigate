@@ -44,6 +44,7 @@ from frigate.recap.storage import (
     find_manifest,
     list_visible_recaps,
     read_manifest,
+    recap_order_key,
     safe_id,
 )
 
@@ -100,7 +101,8 @@ def _is_local(directory: Path | None) -> bool:
     dependencies=[Depends(allow_any_authenticated())],
     summary="List recaps",
     description=(
-        "Lists saved video synopses for cameras the user can view, newest first. "
+        "Lists saved video synopses for cameras the user can view. Newest "
+        "window end first, then newest creation time, across cameras and kinds. "
         "Includes older recaps stored on recap.archive when that is configured."
     ),
 )
@@ -122,7 +124,7 @@ def recap_list(
             continue
         items.append(item)
         seen.add(recap_id)
-    items.sort(key=lambda item: float(item.get("created") or 0), reverse=True)
+    items.sort(key=recap_order_key, reverse=True)
     return JSONResponse(content=items)
 
 

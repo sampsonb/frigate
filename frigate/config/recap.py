@@ -140,6 +140,19 @@ class RecapConfig(FrigateBaseModel):
         ge=0,
         le=1440,
     )
+    interval_minutes: Optional[int] = Field(
+        default=None,
+        title="Minutes between automatic short recaps. 0 disables them.",
+        description=(
+            "When set, Frigate builds a recap of the last this many minutes "
+            "on that interval. The kind is rolling-<minutes>m, so the previous "
+            "one is replaced when the new one is ready. A run is skipped while "
+            "the previous one is still queued or rendering. This is separate "
+            "from the rolling recap that stays ready."
+        ),
+        ge=1,
+        le=1440,
+    )
     labels: list[str] = Field(
         default_factory=lambda: list(DEFAULT_RECAP_LABELS),
         title="Tracked labels to include.",
@@ -290,6 +303,21 @@ class RecapConfig(FrigateBaseModel):
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             raise ValueError("recap schedule must be HH:MM in 24-hour local time")
         return f"{hour:02d}:{minute:02d}"
+
+    @field_validator("interval_minutes", mode="before")
+    @classmethod
+    def validate_interval(cls, value: object) -> object:
+        """Blank and 0 both leave the short interval recap off."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            if text == "":
+                return None
+            value = text
+        if value == 0 or value == "0":
+            return None
+        return value
 
     @field_validator("labels", mode="before")
     @classmethod
