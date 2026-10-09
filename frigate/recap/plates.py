@@ -130,25 +130,18 @@ def cutout_is_visible(
     origin_y: int,
     width: int,
     height: int,
-    crop: np.ndarray | None = None,
-    plate: np.ndarray | None = None,
 ) -> tuple[bool, tuple[int, int] | None]:
-    """Whether this ghost should be drawn, and where its leader ends.
+    """Whether this ghost should get a label and a leader.
 
     Returns the tip of the leader (top of the opaque pixels) when the
     cutout is on screen. An empty mask, a box that is mostly off the
-    frame, a mask that misses the detector box, a speck under about
-    0.15% of the frame, or a cutout with no contrast against the plate
-    returns no tip. The caller then skips the ghost, the label, and
-    the leader.
+    frame, or a mask that misses the detector box returns no tip.
     """
     if alpha.size == 0 or mostly_off_frame(box, width, height):
         return False, None
     opaque = alpha >= 64
     count = int(opaque.sum())
     if count < 48:
-        return False, None
-    if width > 0 and height > 0 and count < MIN_VISIBLE_AREA * width * height:
         return False, None
     ys, xs = np.nonzero(opaque)
     span_w = int(xs.max() - xs.min() + 1)
@@ -173,45 +166,67 @@ def cutout_is_visible(
     )
     if int(inset.sum()) < 48:
         return False, None
-    if not _contrasts_with_plate(crop, plate, opaque):
-        return False, None
     top_band = ys <= int(ys.min()) + max(1, span_h // 6)
     tip_x = int(origin_x + round(float(xs[top_band].mean())))
     tip_y = int(origin_y + int(ys.min()))
     return True, (tip_x, tip_y)
 
 
-def _contrasts_with_plate(
-    crop: np.ndarray | None,
-    plate: np.ndarray | None,
-    opaque: np.ndarray,
-) -> bool:
-    """True when the cutout actually reads against the plate under it.
+def mask_centroid(
+    alpha: np.ndarray, origin_x: int, origin_y: int
+) -> tuple[int, int] | None:
+    """Frame point at the middle of the opaque mask."""
+    ys, xs = np.nonzero(alpha >= 64)
+    if len(xs) == 0:
+        return None
+    return (
+        int(origin_x + round(float(xs.mean()))),
+        int(origin_y + round(float(ys.mean()))),
+    )
 
-    Without a plate, only the shape checks apply. With one, the median
-    gap on the opaque pixels has to be large enough to see.
+
+def label_should_draw(
+    alpha: np.ndarray,
+    width: int,
+    height: int,
+    crop: np.ndarray | None = None,
+    plate: np.ndarray | None = None,
+) -> bool:
+    """False when a label would point at a speck or at the plate.
+
+    The ghost can still be drawn. The label and its leader are not.
     """
+    opaque = alpha >= 64
+    count = int(opaque.sum())
+    if count < 48:
+        return False
+    if width > 0 and height > 0 and count < MIN_VISIBLE_AREA * width * height:
+        return False
     if crop is None or plate is None:
         return True
-    if crop.shape[:2] != opaque.shape[:2] or plate.shape[:2] != opaque.shape[:2]:
+    if crop.shape[:2] != alpha.shape[:2] or plate.shape[:2] != alpha.shape[:2]:
         return True
-    if not np.any(opaque):
-        return False
     diff = cv2.absdiff(crop, plate).max(axis=2)
     return float(np.median(diff[opaque])) >= MIN_CONTRAST
 
 
-def tighten_against_plate(
+def tighten_night_vehicle(
     crop: np.ndarray,
     alpha: np.ndarray,
     plate_patch: np.ndarray,
+    box: tuple[float, float, float, float],
+    origin_x: int,
+    origin_y: int,
 ) -> np.ndarray | None:
-    """Keep the part of a mask that is not the plate. None if that is most of it.
+    """Tighten an infrared vehicle mask against the plate.
 
-    A night fallback fills the detector box, so the outline wraps the
-    road and a flower pot beside the car. Pixels close to the plate are
-    removed and the contour of what remains is the mask. The outline is
-    drawn on that contour. A mask that is mostly the plate is dropped.
+    Day cutouts and people never call this. Headlights light up the yard,
+    so a raw difference spreads into the flower pot and the grass. The
+    kept pixels have to sit in a slightly dilated detector box, survive
+    an open and close, and belong to the largest component that covers
+    the box center. Smooth bright ground is rejected. None drops the
+    cutout (the mask is the plate). Any other implausible result returns
+    ``alpha`` unchanged, which is the mask from before this pass.
     """
     if (
         crop.size == 0
@@ -219,43 +234,89 @@ def tighten_against_plate(
         or crop.shape[:2] != plate_patch.shape[:2]
     ):
         return alpha
-    mask = alpha >= 32
-    count = int(mask.sum())
+    base = alpha >= 32
+    count = int(base.sum())
     if count < 8:
         return alpha
     diff = cv2.absdiff(crop, plate_patch).max(axis=2)
-    changed = mask & (diff >= PLATE_DIFF)
-    changed_count = int(changed.sum())
-    if changed_count < MIN_OBJECT_FRACTION * count:
+    changed = base & (diff >= PLATE_DIFF)
+    # A box of road, with almost nothing that differs, is not a car.
+    if int(changed.sum()) < MIN_OBJECT_FRACTION * count:
         return None
-    # The motion mask is already the object. Leave its feather alone.
-    if changed_count >= 0.85 * count:
+
+    limit, expected, center = _vehicle_limit(alpha.shape, box, origin_x, origin_y)
+    luma = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    plate_luma = cv2.cvtColor(plate_patch, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    blur = cv2.GaussianBlur(luma, (9, 9), 0)
+    texture = cv2.GaussianBlur(np.abs(luma - blur), (9, 9), 0)
+    # Lit concrete and plants are bright and smooth. A car has edges.
+    lit_ground = (luma >= np.maximum(plate_luma + 28.0, 70.0)) & (texture < 7.0)
+    kept = changed & (limit > 0) & ~lit_ground
+    binary = kept.astype(np.uint8)
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    closed = cv2.morphologyEx(
+        opened, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    )
+    _n, labels = cv2.connectedComponents(closed)
+    component = _component_at_center(labels, center)
+    if component is None:
         return alpha
-    binary = changed.astype(np.uint8)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    areas = [cv2.contourArea(contour) for contour in contours]
-    largest = max(areas)
-    if largest < 8:
-        return None
-    filled = np.zeros_like(binary)
-    cv2.drawContours(
-        filled,
-        [
-            contour
-            for contour, area in zip(contours, areas, strict=True)
-            if area >= 0.08 * largest
-        ],
-        -1,
+    area = int(component.sum())
+    # Too small, or grown past the box, means the difference went wrong.
+    if area < 0.30 * expected or area > 1.10 * expected:
+        return alpha
+    out = np.zeros_like(alpha)
+    out[component] = 255
+    return out
+
+
+def _vehicle_limit(
+    shape: tuple[int, int],
+    box: tuple[float, float, float, float],
+    origin_x: int,
+    origin_y: int,
+) -> tuple[np.ndarray, float, tuple[int, int]]:
+    """Slightly dilated detector box, its area, and its center in the crop."""
+    height, width = shape
+    x0 = int(round(box[0])) - int(origin_x)
+    y0 = int(round(box[1])) - int(origin_y)
+    x1 = int(round(box[2])) - int(origin_x)
+    y1 = int(round(box[3])) - int(origin_y)
+    box_w = max(1, x1 - x0)
+    box_h = max(1, y1 - y0)
+    pad = int(np.clip(round(0.04 * min(box_w, box_h)), 2, 6))
+    limit = np.zeros(shape, np.uint8)
+    cv2.rectangle(
+        limit,
+        (x0 - pad, y0 - pad),
+        (x1 - 1 + pad, y1 - 1 + pad),
         255,
         -1,
     )
-    # Filling the car's contour must not grow back out to the old box.
-    filled[alpha < 32] = 0
-    if int((filled > 0).sum()) < 8:
+    center = (
+        int(np.clip((x0 + x1) // 2, 0, width - 1)),
+        int(np.clip((y0 + y1) // 2, 0, height - 1)),
+    )
+    return limit, float(box_w * box_h), center
+
+
+def _component_at_center(
+    labels: np.ndarray, center: tuple[int, int]
+) -> np.ndarray | None:
+    """Largest component that covers the box center. None when nothing does."""
+    height, width = labels.shape[:2]
+    cx, cy = center
+    radius = 3
+    y0 = max(0, cy - radius)
+    y1 = min(height, cy + radius + 1)
+    x0 = max(0, cx - radius)
+    x1 = min(width, cx + radius + 1)
+    present = labels[y0:y1, x0:x1]
+    ids = [int(item) for item in np.unique(present) if int(item) != 0]
+    if not ids:
         return None
-    return filled
+    best = max(ids, key=lambda item: int((labels == item).sum()))
+    return labels == best
 
 
 def plate_sample_times(

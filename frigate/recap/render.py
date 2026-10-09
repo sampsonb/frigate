@@ -26,10 +26,12 @@ from frigate.recap.plates import (
     cutout_is_visible,
     frame_is_dark,
     frame_is_ir,
+    label_should_draw,
+    mask_centroid,
     plate_index_at,
     prepare_cutout,
     recede_plate,
-    tighten_against_plate,
+    tighten_night_vehicle,
 )
 
 logger = logging.getLogger(__name__)
@@ -319,14 +321,15 @@ def _paste_ghost(
     plate_is_dark: bool,
     outline: tuple[int, int, int] | None,
     plate: np.ndarray | None = None,
+    category: str = "",
 ) -> tuple[bool, tuple[int, int] | None]:
     """Paint a ghost. False when nothing visible landed on the canvas.
 
-    The tip is the top of the opaque cutout, which is where the leader
-    should end. An empty mask or a box that is mostly off the frame
-    returns no tip, and the caller skips the label and the leader.
-    ``plate`` is the undimmed background used to match the cutout. The
-    ghost is painted onto ``canvas``, which may already be dimmed.
+    The returned point is the centroid of the mask that was painted,
+    which is where the leader should end. None with a True result means
+    the ghost was painted but it is too small or too close to the plate
+    for a label. ``plate`` is the undimmed background used to match the
+    cutout. The ghost is painted onto ``canvas``, which may already be dimmed.
     """
     pixels = ghost.pixels()
     if pixels is None or alpha_scale <= 0.01:
@@ -342,20 +345,22 @@ def _paste_ghost(
     crop_w = x1 - x0
     crop = crop[:crop_h, :crop_w]
     alpha = solid_feather(alpha[:crop_h, :crop_w])
+    visible, _tip = cutout_is_visible(alpha, ghost.box, x0, y0, width, height)
+    if not visible:
+        return False, None
     source = plate if plate is not None else canvas
     region = source[y0:y1, x0:x1]
-    # A cached night ghost may still be the detector box. Keep the pixels
-    # that differ from this plate, and drop the cutout when the box is
-    # mostly background. The outline then follows the object, not the box.
-    tightened = tighten_against_plate(crop, alpha, region)
-    if tightened is None:
-        return False, None
-    alpha = solid_feather(tightened)
-    visible, tip = cutout_is_visible(
-        alpha, ghost.box, x0, y0, width, height, crop=crop, plate=region
-    )
-    if not visible or tip is None:
-        return False, None
+    # Difference tightening is only for infrared vehicles. Day cutouts
+    # and people keep the mask they were stored with.
+    if plate_is_ir and category == "vehicle":
+        tightened = tighten_night_vehicle(crop, alpha, region, ghost.box, x0, y0)
+        if tightened is None:
+            return False, None
+        if tightened is not alpha:
+            alpha = solid_feather(tightened)
+            visible, _tip = cutout_is_visible(alpha, ghost.box, x0, y0, width, height)
+            if not visible:
+                return False, None
     fitted = prepare_cutout(
         crop,
         alpha,
@@ -371,7 +376,10 @@ def _paste_ghost(
         1 - factor
     )
     dest[:] = blended.astype(np.uint8)
-    return True, tip
+    anchor = mask_centroid(alpha, x0, y0)
+    if anchor is None or not label_should_draw(alpha, width, height, crop, region):
+        return True, None
+    return True, anchor
 
 
 def leader_without_ghost(
@@ -494,6 +502,7 @@ def compose_frame(
             plate_is_dark=plate_is_dark,
             outline=color if night else None,
             plate=plate,
+            category=unit.category,
         )
         if drawn and tip is not None:
             shown.add(index)
@@ -504,7 +513,8 @@ def compose_frame(
             continue
         raw_tip = tips[index]
         head = (float(raw_tip[0]), float(raw_tip[1]))
-        tip = (raw_tip[0], raw_tip[1] - 2)
+        # The dot sits on the mask centroid, not above the box.
+        tip = (raw_tip[0], raw_tip[1])
         rect = rects[index]
         anchor = _leader_anchor(rect, head)
         bounds = (
