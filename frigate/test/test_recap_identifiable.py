@@ -19,6 +19,7 @@ from frigate.recap.cutout import (
 from frigate.recap.frames import concat_sample
 from frigate.recap.generate import (
     _cutouts_for,
+    _merge_dog_walkers,
     boxes_at,
     clip_window,
     fit_snapshot,
@@ -27,7 +28,7 @@ from frigate.recap.generate import (
     still_cut,
     too_small,
 )
-from frigate.recap.layout import ScheduledUnit, schedule_units
+from frigate.recap.layout import MotionTrack, ScheduledUnit, schedule_units
 from frigate.recap.manager import clip_segments
 from frigate.recap.plates import label_should_draw
 
@@ -249,6 +250,60 @@ class TestWindows(unittest.TestCase):
         self.assertLess(int(alpha[0, 0]), 8)
 
 
+class TestDaylightCutouts(unittest.TestCase):
+    def _moving(self, present, box_pad=0, step=8):
+        frames, boxes = [], []
+        for index in range(len(present)):
+            frame = np.full((HEIGHT, WIDTH, 3), DAYLIGHT, np.uint8)
+            x = 20 + index * step
+            if present[index]:
+                frame[CAR_TOP : CAR_TOP + CAR_H, x : x + CAR_W] = RED
+            frames.append(frame)
+            boxes.append(
+                (
+                    float(x - box_pad),
+                    float(CAR_TOP - box_pad),
+                    float(x + CAR_W + box_pad),
+                    float(CAR_TOP + CAR_H + box_pad),
+                )
+            )
+        return frames, boxes
+
+    def test_a_missing_frame_holds_the_car_instead_of_an_empty_window(self):
+        present = [index < 5 for index in range(24)]
+        frames, boxes = self._moving(present)
+        ghosts = build_cutouts(frames, boxes, "vehicle")
+        assert ghosts is not None
+        for index, ghost in enumerate(ghosts):
+            self.assertFalse(ghost.get("window"), index)
+            crop = np.asarray(ghost["crop"])
+            alpha = np.asarray(ghost["alpha"])
+            strong = alpha > 200
+            self.assertGreater(int(strong.sum()), 50, index)
+            # Red car pixels, not road, wherever the ghost is drawn.
+            self.assertGreater(float(crop[strong][:, 2].mean()), 150, index)
+        self.assertTrue(all(ghost.get("held") for ghost in ghosts[14:]))
+        self.assertFalse(any(ghost.get("held") for ghost in ghosts[:5]))
+
+    def test_a_loose_box_does_not_bring_road_along(self):
+        # A street car crosses most of its own length every frame.
+        frames, boxes = self._moving([True] * 10, box_pad=14, step=24)
+        ghosts = build_cutouts(frames, boxes, "vehicle")
+        assert ghosts is not None
+        ghost = ghosts[4]
+        alpha = np.asarray(ghost["alpha"])
+        x0, y0 = int(ghost["x"]), int(ghost["y"])
+        box = boxes[4]
+        # A corner of the loose box is road. It must not be painted.
+        corner_x = int(box[0]) + 3 - x0
+        corner_y = int(box[1]) + 3 - y0
+        if 0 <= corner_y < alpha.shape[0] and 0 <= corner_x < alpha.shape[1]:
+            self.assertLess(int(alpha[corner_y, corner_x]), 64)
+        car_x = int(box[0]) + 14 + CAR_W // 2 - x0
+        car_y = int(box[1]) + 14 + CAR_H // 2 - y0
+        self.assertEqual(int(alpha[car_y, car_x]), 255)
+
+
 class TestSnapshots(unittest.TestCase):
     def test_a_cropped_snapshot_is_not_used(self):
         self.assertIsNone(
@@ -302,6 +357,42 @@ class TestSnapshots(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertGreater(len(cut.frames), 8)
 
+    def test_object_missing_from_much_of_its_clip_is_its_snapshot(self):
+        event = _event()
+        # The recording loses the car after half a second (a hole the path
+        # does not know about), so most frames would only repeat it.
+        calls: list = []
+
+        def load_clip(evt, fps, width, height):
+            calls.append(evt["id"])
+            count = int((evt["end_time"] - evt["start_time"]) * fps) + 1
+            times = frame_times(evt["start_time"], fps, count)
+            frames = []
+            for moment in times:
+                frame = _scene(moment)
+                if moment > 0.5:
+                    frame[:] = DAYLIGHT
+                frames.append(frame)
+            return frames, times
+
+        settings = RecapConfig(enabled=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            cut = _cutouts_for(
+                event,
+                "vehicle",
+                8.0,
+                settings,
+                WIDTH,
+                HEIGHT,
+                load_clip,
+                use_cache=True,
+                cache_root=Path(tmp),
+                stats=cutcache.CacheStats(),
+                load_snapshot=lambda _event: _scene(1.0),
+            )
+        self.assertEqual(cut.status, "ok")
+        self.assertTrue(cut.still)
+
     def test_path_that_does_not_line_up_falls_back_to_the_snapshot(self):
         cut, calls = self._cut(_event(path_moves=False), DAYLIGHT)
         self.assertEqual(cut.status, "ok")
@@ -319,6 +410,31 @@ class TestSnapshots(unittest.TestCase):
             loaded = cutcache.load(a, root)
         assert loaded is not None
         self.assertTrue(loaded.still)
+
+
+class TestDogWalkers(unittest.TestCase):
+    def test_a_walker_and_their_dog_are_one_label(self):
+        person = MotionTrack(
+            id="p",
+            label="person",
+            category="person",
+            start=0.0,
+            end=3.0,
+            boxes=[(100.0, 40.0, 140.0, 140.0)] * 4,
+            times=[0.0, 1.0, 2.0, 3.0],
+        )
+        # The dog walks beside the person: under half of it overlaps.
+        dog = MotionTrack(
+            id="d",
+            label="dog",
+            category="animal",
+            start=0.0,
+            end=3.0,
+            boxes=[(120.0, 110.0, 170.0, 140.0)] * 4,
+            times=[0.2, 1.2, 2.2, 3.2],
+        )
+        self.assertEqual(_merge_dog_walkers([person, dog]), {"d"})
+        self.assertEqual(person.category, "animal")
 
 
 class TestPacing(unittest.TestCase):

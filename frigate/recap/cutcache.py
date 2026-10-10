@@ -29,7 +29,9 @@ logger = logging.getLogger(__name__)
 # Bump when cutout, sampling, or the stored layout changes.
 # 2: path boxes aligned to the recording, clip window around the best view,
 # window ghosts for infrared and dusk.
-CACHE_VERSION = 2
+# 3: no empty windows inside a moving track, vehicle masks without the road
+# halo, clips cut at retention holes.
+CACHE_VERSION = 3
 # Longest window a cached cutout is useful for (72 hours) plus slack.
 MAX_AGE_HOURS = 74.0
 # A failed cutout is only cached once the recording is surely written.

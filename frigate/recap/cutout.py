@@ -348,9 +348,20 @@ def attach_motion(
         added = int((component & (core == 0)).sum())
         if added < extra_limit:
             extra |= component.astype(np.uint8)
+    kept_core = core
     if category == "vehicle":
         extra = cv2.morphologyEx(extra, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    mask = _smooth_contour(((core > 0) | (extra > 0)).astype(np.uint8))
+        # Only the part of the detector box that differs from the plate. A
+        # loose box otherwise brings a rectangle of road along, which shows
+        # as a pale halo around the car on the recap's plate. A car that has
+        # stood still long enough to be in the plate keeps the whole box.
+        differs = cv2.dilate(
+            (diff >= max(6, thresh // 2)).astype(np.uint8), np.ones((5, 5), np.uint8)
+        )
+        trimmed = core & differs
+        if int(trimmed.sum()) >= 0.25 * core_area:
+            kept_core = trimmed
+    mask = _smooth_contour(((kept_core > 0) | (extra > 0)).astype(np.uint8))
     if mask.shape[:2] != crop.shape[:2]:
         mask = cv2.resize(
             mask,
@@ -581,19 +592,6 @@ def masks_plausible(
     if counted == 0:
         return False
     return good >= _PLAUSIBLE_SHARE * counted
-
-
-def _soft_box(
-    frame: np.ndarray,
-    box: tuple[float, float, float, float],
-    category: str = "vehicle",
-) -> dict[str, object] | None:
-    """A window ghost when the motion mask fails for one frame.
-
-    A car that has sat still long enough is in the background plate, so
-    the difference mask is empty. The car is still in this frame.
-    """
-    return window_ghost(frame, box, category)
 
 
 def _smooth_centers(boxes: list[tuple[float, float, float, float]]) -> np.ndarray:
@@ -917,9 +915,10 @@ def build_cutouts(
 
     A bad mask is repaired from a neighbor a few frames away. The crop
     comes from that neighbor, shifted with the box, so a short detection
-    gap still shows the object. If nothing nearby is usable, the detector
-    box is feathered out of the current frame. That covers a car that has
-    sat still long enough to match the background plate.
+    gap still shows the object. If nothing nearby is usable, the nearest
+    good ghost is held there and marked ``held``. When no frame has a good
+    mask, the whole track is drawn as windows and the caller can fall back
+    to Frigate's snapshot.
     """
     if len(frames) < 3 or len(frames) != len(boxes):
         return None
@@ -994,6 +993,7 @@ def build_cutouts(
                 continue
             made["x"] = int(made["x"]) + dx  # type: ignore[arg-type]
             made["y"] = int(made["y"]) + dy  # type: ignore[arg-type]
+            made["repaired"] = True
             clipped = _clip_ghost(made, width, height)
             if clipped is None:
                 continue
@@ -1003,9 +1003,11 @@ def build_cutouts(
         if len(parts) == 1:
             return parts[0][0]
         blended = _blend_ghosts(parts, box)
+        blended["repaired"] = True
         return _clip_ghost(blended, width, height)
 
     ghosts: list[dict[str, object]] = []
+    missing: list[int] = []
     cached: dict[str, object] | None = None
     cached_box: tuple[float, float, float, float] | None = None
     for index, (frame, box) in enumerate(zip(frames, boxes, strict=True)):
@@ -1041,12 +1043,36 @@ def build_cutouts(
         else:
             ghost = repair(index, box)
         if ghost is None:
-            ghost = _soft_box(frame, box, category)
-        if ghost is None:
-            ghost = _blank_ghost(box)
+            # The object is not in this frame where the box says. A window
+            # here is a patch of empty road, drawn with an outline: the
+            # flashing empty boxes. Hold the nearest good ghost instead.
+            missing.append(index)
+            ghosts.append(_blank_ghost(box))
+            cached = None
+            cached_box = None
+            continue
         cached = ghost
         cached_box = box
         ghosts.append(ghost)
+    if missing:
+        skipped = set(missing)
+        drawn = [
+            index
+            for index, ghost in enumerate(ghosts)
+            if index not in skipped
+            and isinstance(ghost["alpha"], np.ndarray)
+            and ghost["alpha"].size > 1
+        ]
+        if not drawn:
+            return window_ghosts(frames, boxes, category)
+        for index in missing:
+            donor = min(drawn, key=lambda item: abs(item - index))
+            held = _reuse_ghost(
+                ghosts[donor], boxes[donor], boxes[index], width, height
+            )
+            if held is not None:
+                held["held"] = True
+                ghosts[index] = held
     return ghosts
 
 

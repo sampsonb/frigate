@@ -460,8 +460,8 @@ def _overlap_time(left: MotionTrack, right: MotionTrack) -> bool:
 def _merge_dog_walkers(tracks: list[MotionTrack]) -> set[str]:
     """A person overlapping a dog or cat is the dog-walker, drawn in green.
 
-    The animal track is dropped when it stays inside the person's boxes,
-    because the person's cutout already includes whatever moves with them.
+    The animal's own track is dropped, because the person's cutout already
+    includes whatever moves with them.
     """
     drop: set[str] = set()
     people = [track for track in tracks if track.label == "person"]
@@ -487,9 +487,10 @@ def _merge_dog_walkers(tracks: list[MotionTrack]) -> set[str]:
                 )
                 scores.append(ix * iy / area)
             if scores and float(np.mean(scores)) >= 0.2:
+                # One walker, one label. Keeping the dog's own track drew
+                # the same walker twice, once moving and once held.
                 person.category = "animal"
-                if float(np.mean(scores)) >= 0.45:
-                    drop.add(animal.id)
+                drop.add(animal.id)
     return drop
 
 
@@ -1082,6 +1083,19 @@ def still_cut(
     )
 
 
+def _too_many_held(ghosts: list[dict[str, object]]) -> bool:
+    """True when the object was missing from many frames of its clip.
+
+    Those frames reuse a neighbor's ghost (repaired) or the nearest good
+    one (held). A few are invisible. More than about a third looks like a
+    sticker sliding along the road.
+    """
+    if not ghosts:
+        return False
+    filled = sum(1 for ghost in ghosts if ghost.get("held") or ghost.get("repaired"))
+    return filled * 10 > 3 * len(ghosts)
+
+
 def _mostly_windows(ghosts: list[dict[str, object]]) -> bool:
     """True when most drawn frames fell back to windows."""
     drawn = [
@@ -1248,6 +1262,10 @@ def _cutouts_for(
         held = still("mask did not hold")
         if held is not None and held.status == "ok":
             return held
+    if ghosts and _too_many_held(ghosts):
+        held = still("object missing from much of the clip")
+        if held is not None and held.status == "ok":
+            return held
     logger.debug(
         "Recap cutout %s %s: %d frames, time shift %.2fs, fill %.2f, %s",
         event.get("id"),
@@ -1285,7 +1303,8 @@ def _cutouts_for(
             continue
         packed.append(item[0])
         kept_boxes.append(tuple(float(v) for v in box))  # type: ignore[arg-type]
-        kept_times.append(float(moment))
+        # Detector time, like a still's best moment, so tracks compare.
+        kept_times.append(float(moment) + shift)
     if not packed:
         return remember(_Cut(status="no_cutout"))
     return remember(
