@@ -453,6 +453,35 @@ def _background(
     return fitted[len(fitted) // 2].image, fitted
 
 
+def path_track(
+    event: dict[str, Any],
+    track: MotionTrack,
+    width: int,
+    height: int,
+    samples: int = 16,
+) -> MotionTrack:
+    """``track`` with boxes from the event's own path, in detector time.
+
+    Used to decide whether two events are the same object or a walker and
+    their dog, whatever frames their cutouts happened to keep.
+    """
+    start, _end = _event_span(event)
+    end = max(last_seen(event), start + 0.5)
+    times = [float(item) for item in np.linspace(start, end, samples)]
+    boxes = boxes_at(event, times, width, height)
+    if not boxes:
+        return track
+    return MotionTrack(
+        id=track.id,
+        label=track.label,
+        category=track.category,
+        start=track.start,
+        end=track.end,
+        boxes=boxes,
+        times=times,
+    )
+
+
 def _overlap_time(left: MotionTrack, right: MotionTrack) -> bool:
     return left.start <= right.end and right.start <= left.end
 
@@ -715,7 +744,19 @@ def generate_recap(
         if settings.pause_seconds and not cut.from_cache:
             time.sleep(settings.pause_seconds)
 
-    dropped_animals = _merge_dog_walkers(tracks)
+    # Overlaps are judged on each event's own path, not on the frames its
+    # cutout kept. A snapshot held in place has one box, and a clip only
+    # the frames around its best view, so the two rarely share a moment.
+    events_by_id = {str(event["id"]): event for event, _category, _preview in active}
+    paths = {
+        track.id: path_track(events_by_id[track.id], track, width, height)
+        for track in tracks
+        if track.id in events_by_id
+    }
+    judged = [paths.get(track.id, track) for track in tracks]
+    dropped_animals = _merge_dog_walkers(judged)
+    for track, path in zip(tracks, judged, strict=True):
+        track.category = path.category
     for track in tracks:
         if track.id in dropped_animals:
             continue
@@ -724,8 +765,8 @@ def generate_recap(
                 tube.category = track.category
 
     keep_ids = {track.id for track in tracks if track.id not in dropped_animals}
-    drop_map = dedupe_tracks([track for track in tracks if track.id in keep_ids])
     ordered = [track for track in tracks if track.id in keep_ids]
+    drop_map = dedupe_tracks([paths.get(track.id, track) for track in ordered])
     dropped_ids = {ordered[index].id for index in drop_map}
     for event_id in dropped_ids | dropped_animals:
         excluded.append(

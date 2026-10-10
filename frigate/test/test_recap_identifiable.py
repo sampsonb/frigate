@@ -25,6 +25,7 @@ from frigate.recap.generate import (
     fit_snapshot,
     frame_times,
     last_seen,
+    path_track,
     still_cut,
     too_small,
 )
@@ -435,6 +436,49 @@ class TestDogWalkers(unittest.TestCase):
         )
         self.assertEqual(_merge_dog_walkers([person, dog]), {"d"})
         self.assertEqual(person.category, "animal")
+
+    def test_a_held_walker_is_judged_on_its_path(self):
+        # The person is a snapshot (one box, one moment); the dog is a clip
+        # from other seconds. Their paths still overlap the whole time.
+        def event(event_id, label, box):
+            return {
+                "id": event_id,
+                "label": label,
+                "start_time": 10.0,
+                "end_time": 20.0,
+                "data": {"box": box, "path_data": []},
+                "timeline": [
+                    [10.0, "visible", box],
+                    [16.0, "gone", box],
+                ],
+            }
+
+        person_event = event("p", "person", [0.40, 0.20, 0.10, 0.50])
+        dog_event = event("d", "dog", [0.45, 0.55, 0.12, 0.15])
+        held = MotionTrack(
+            id="p",
+            label="person",
+            category="person",
+            start=10.0,
+            end=20.0,
+            boxes=[(128.0, 36.0, 160.0, 126.0)],
+            times=[19.5],
+        )
+        clip = MotionTrack(
+            id="d",
+            label="dog",
+            category="animal",
+            start=10.0,
+            end=20.0,
+            boxes=[(144.0, 99.0, 182.0, 126.0)] * 3,
+            times=[10.0, 10.5, 11.0],
+        )
+        self.assertEqual(_merge_dog_walkers([held, clip]), set())
+        judged = [
+            path_track(person_event, held, WIDTH, HEIGHT),
+            path_track(dog_event, clip, WIDTH, HEIGHT),
+        ]
+        self.assertEqual(_merge_dog_walkers(judged), {"d"})
 
 
 class TestPacing(unittest.TestCase):
