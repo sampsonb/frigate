@@ -212,7 +212,6 @@ export default function RecapPlayer({
     video.pause();
     video.currentTime = track.out_start / fps;
     setCurrent(track.out_start / fps);
-    setPaused(true);
   };
 
   const openClip = async (track: RecapTrack) => {
@@ -220,7 +219,6 @@ export default function RecapPlayer({
     if (video) {
       video.pause();
     }
-    setPaused(true);
     const eventId = track.clip_event_id || track.event_id;
     try {
       const response = await axios.get<RecapClipSource>(
