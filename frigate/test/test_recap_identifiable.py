@@ -28,6 +28,7 @@ from frigate.recap.generate import (
     too_small,
 )
 from frigate.recap.layout import ScheduledUnit, schedule_units
+from frigate.recap.manager import clip_segments
 from frigate.recap.plates import label_should_draw
 
 WIDTH, HEIGHT = 320, 180
@@ -352,6 +353,36 @@ class TestPacing(unittest.TestCase):
             self._units(), WIDTH, HEIGHT, 10, max_delay=30, max_overlap=64
         )
         self.assertLessEqual(stacked, 12)
+
+
+class TestRetentionHoles(unittest.TestCase):
+    def _rows(self) -> list[dict]:
+        # 100 to 110 kept, 110 to 120 deleted (no motion), then 120 to 140.
+        return [
+            {"path": "/a.mp4", "start": 100.0, "end": 110.0},
+            {"path": "/c.mp4", "start": 120.0, "end": 130.0},
+            {"path": "/d.mp4", "start": 130.0, "end": 140.0},
+        ]
+
+    def test_a_hole_is_not_joined_over(self):
+        segments, first = clip_segments(self._rows(), 105.0, 135.0)
+        self.assertEqual([item[0] for item in segments], ["/c.mp4", "/d.mp4"])
+        self.assertEqual(first, 120.0)
+        self.assertEqual(segments[0][1], 0.0)
+
+    def test_first_frame_time_skips_a_missing_start(self):
+        segments, first = clip_segments(self._rows(), 115.0, 125.0)
+        self.assertEqual([item[0] for item in segments], ["/c.mp4"])
+        self.assertEqual(first, 120.0)
+
+    def test_rounding_between_segments_is_not_a_hole(self):
+        rows = [
+            {"path": "/a.mp4", "start": 100.0, "end": 109.6},
+            {"path": "/b.mp4", "start": 111.0, "end": 121.0},
+        ]
+        segments, first = clip_segments(rows, 104.0, 115.0)
+        self.assertEqual([item[0] for item in segments], ["/a.mp4", "/b.mp4"])
+        self.assertEqual(first, 104.0)
 
 
 class TestSegmentJoin(unittest.TestCase):

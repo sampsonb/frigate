@@ -639,14 +639,14 @@ class RecapJob(threading.Thread):
         ) -> tuple[list, list[float]] | None:
             if self._cancel.is_set():
                 raise RecapCancelled()
-            segments = _segments(
+            segments, first = clip_segments(
                 rows, float(event["start_time"]), float(event["end_time"])
             )
             if not segments:
                 return None
             work = Path(CACHE_DIR)
             work.mkdir(parents=True, exist_ok=True)
-            span = float(event["end_time"]) - float(event["start_time"])
+            span = sum(item[2] for item in segments)
             max_frames = max(4, int(span * sample_fps) + 2)
             frames = concat_sample(
                 ffmpeg,
@@ -662,7 +662,7 @@ class RecapJob(threading.Thread):
             # ffmpeg's fps filter emits frame k at k / fps from the seek
             # point. Spreading the frames over the event span instead put
             # every box of a long event on the wrong frame.
-            times = frame_times(float(event["start_time"]), sample_fps, len(frames))
+            times = frame_times(first, sample_fps, len(frames))
             return frames, times
 
         body = generate_recap(
@@ -1051,6 +1051,50 @@ def _segments(
         if duration > 0.05:
             segments.append((row["path"], offset, duration))
     return segments
+
+
+# A hole between recording rows longer than this is a missing file, not
+# the whole-second rounding of segment start times.
+_HOLE_SECONDS = 5.0
+
+
+def clip_segments(
+    rows: list[dict[str, Any]], start: float, end: float
+) -> tuple[list[tuple[str, float, float]], float]:
+    """Segments for ``[start, end]`` from one unbroken run of recordings.
+
+    Returns the segments and the recording time of the first decoded frame.
+    With motion-only retention Frigate deletes 10 second files that had no
+    motion, even inside an event while a car sits still. Joining the files
+    on both sides of that hole played them as one continuous clip, so every
+    frame after it was labeled with the wrong time. The run that covers the
+    middle of the window is kept, or the nearest one when none does.
+    """
+    picked = [row for row in rows if row["end"] > start and row["start"] < end]
+    if not picked:
+        return [], start
+    runs: list[list[dict[str, Any]]] = [[picked[0]]]
+    for row in picked[1:]:
+        if row["start"] - runs[-1][-1]["end"] > _HOLE_SECONDS:
+            runs.append([row])
+        else:
+            runs[-1].append(row)
+    middle = (start + end) / 2
+
+    def rank(run: list[dict[str, Any]]) -> tuple[float, float]:
+        first = max(start, run[0]["start"])
+        last = min(end, run[-1]["end"])
+        distance = (
+            0.0
+            if first <= middle <= last
+            else min(abs(middle - first), abs(middle - last))
+        )
+        return distance, -(last - first)
+
+    best = min(runs, key=rank)
+    first = max(start, best[0]["start"])
+    last = min(end, best[-1]["end"])
+    return _segments(best, first, last), first
 
 
 def _segment_at(rows: list[dict[str, Any]], moment: float) -> tuple[str, float] | None:
