@@ -22,9 +22,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import cv2
+
 from frigate.config import FrigateConfig
 from frigate.config.recap import RecapConfig
-from frigate.const import CACHE_DIR, RECAP_DIR
+from frigate.const import CACHE_DIR, CLIPS_DIR, RECAP_DIR
 from frigate.recap import cutcache
 from frigate.recap.categories import (
     DELIVERY_QUERIES_PERSON,
@@ -39,12 +41,13 @@ from frigate.recap.frames import (
 )
 from frigate.recap.generate import (
     RecapCancelled,
+    frame_times,
     generate_recap,
-    sample_times,
 )
 from frigate.recap.layout import rolling_decision, rolling_slot_key, schedule_due
 from frigate.recap.plates import gap_sample_times, plate_sample_times
 from frigate.recap.queries import (
+    attach_timeline,
     event_fingerprint,
     fingerprint_changed,
     load_events,
@@ -606,6 +609,11 @@ class RecapJob(threading.Thread):
         ffmpeg = config.ffmpeg.ffmpeg_path
         ffprobe = config.ffmpeg.ffprobe_path
         events = load_events(self.camera, self.after, self.before, self.settings.labels)
+        try:
+            attach_timeline(events)
+        except Exception:
+            # Boxes fall back to the path and the snapshot alone.
+            logger.exception("Could not read the timeline for recap %s", self.recap_id)
         if self._cancel.is_set():
             raise RecapCancelled()
         self._progress(4, f"Found {len(events)} events")
@@ -638,7 +646,8 @@ class RecapJob(threading.Thread):
                 return None
             work = Path(CACHE_DIR)
             work.mkdir(parents=True, exist_ok=True)
-            max_frames = max(4, int(self.settings.max_object_seconds * sample_fps) + 2)
+            span = float(event["end_time"]) - float(event["start_time"])
+            max_frames = max(4, int(span * sample_fps) + 2)
             frames = concat_sample(
                 ffmpeg,
                 segments,
@@ -650,9 +659,10 @@ class RecapJob(threading.Thread):
             )
             if len(frames) < 3:
                 return None
-            times = sample_times(
-                float(event["start_time"]), float(event["end_time"]), len(frames)
-            )
+            # ffmpeg's fps filter emits frame k at k / fps from the seek
+            # point. Spreading the frames over the event span instead put
+            # every box of a long event on the wrong frame.
+            times = frame_times(float(event["start_time"]), sample_fps, len(frames))
             return frames, times
 
         body = generate_recap(
@@ -674,6 +684,8 @@ class RecapJob(threading.Thread):
             height=height,
             use_cache=True,
             cache_stats=self._cache_stats,
+            time_shift=camera_time_shift(config, self.camera),
+            load_snapshot=lambda event: load_snapshot(self.camera, str(event["id"])),
         )
         finished = time.time()
         current = read_manifest(self.directory) or {}
@@ -996,6 +1008,35 @@ class RecapMaintainer(threading.Thread):
                 if len(str(key).split(":")) >= 2 and str(key).split(":")[1] == today
             }
             state_file.write_text(json.dumps(fresh))
+
+
+def load_snapshot(camera: str, event_id: str) -> Any:
+    """Frigate's clean snapshot for an event, or the boxed one, as BGR."""
+    for suffix in ("-clean.webp", "-clean.png", ".jpg"):
+        path = os.path.join(CLIPS_DIR, f"{camera}-{event_id}{suffix}")
+        if not os.path.isfile(path):
+            continue
+        image = cv2.imread(path, cv2.IMREAD_COLOR)
+        if image is not None:
+            return image
+    return None
+
+
+def camera_time_shift(config: FrigateConfig, camera: str) -> float:
+    """Starting guess, in seconds, from recording time to detector time.
+
+    Frigate's ``detect.annotation_offset`` lines the review overlay up
+    with the recording: the frame at recording time ``t`` shows what the
+    detector saw at ``t - offset``. Each event refines this guess.
+    """
+    camera_config = config.cameras.get(camera)
+    if camera_config is None:
+        return 0.0
+    try:
+        offset_ms = float(camera_config.detect.annotation_offset or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    return -offset_ms / 1000.0
 
 
 def _segments(

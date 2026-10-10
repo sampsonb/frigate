@@ -30,13 +30,15 @@ Useful knobs:
 | `window_hours` | 24 | How far back a scheduled recap looks. |
 | `max_window_hours` | 48 | Longest on-demand range. |
 | `labels` | people, vehicles, animals, delivery names | Tracked labels to consider. |
-| `target_length` | 120 | Aim for this many seconds. Busy hours run longer rather than merging objects into one label. |
+| `target_length` | 120 | Aim for this many seconds. Busy hours run longer rather than stacking objects on each other. |
 | `label_opacity` | 0.5 | Time-label background. |
-| `max_labels` | 8 | Most labels on screen at once. |
+| `max_labels` | 4 | Most objects, and time labels, on screen at once. |
+| `max_overlap` | 0.3 | Most of an object's footprint that others may cover when a busy window does not fit `target_length`. Past this the recap runs longer. Raise it (or `max_labels`) for shorter, busier recaps. |
+| `min_object_area` | 0.0012 | Smallest vehicle shown, as a fraction of the frame, measured on Frigate's snapshot box. People and animals use a third of it. Far-street traffic below this is left out. `0` shows everything. |
 | `fade_seconds` | 0.2 | Fade for the ghost, the leader line, and the label. |
 | `retain_days` | 14 | Delete local recaps after this many days. `0` keeps them. |
 | `replace_superseded` | true | When a recap is Ready, delete older completed recaps of the same camera and kind. Last-N-hours buttons group by that length. An explicit range that is one local midnight-to-midnight day groups with the nightly recap for that date (`day:<date>`, including older `backfill-day:<date>` copies). Any other explicit range is kept on its own and is not treated as last-N hours. Running, failed, and archive copies are kept. |
-| `min_show_seconds` | 2.5 | Shortest time a ghost stays readable. |
+| `min_show_seconds` | 2.5 | Shortest time a ghost stays readable. A snapshot held in place stays at least 3 seconds. |
 | `output_fps` | 12 | Synopsis frame rate. |
 | `max_width` | 1280 | Frames are scaled down to this. |
 | `pause_seconds` | 0.02 | Sleep between events so live detection keeps the CPU. |
@@ -55,12 +57,17 @@ Files are stored at `/media/frigate/recap/<camera>/<id>/` (`manifest.json`, `vid
 - A person overlapping a dog or cat is drawn as an animal, which is how a dog walker stays one green label.
 - Anything that moves with a person, and is connected to them against a clean background, is part of their cutout. That includes a golf cart, bicycle, scooter, or stroller the detector does not know as its own object.
 - Times are local, without seconds (`5:50 PM`). If two labels fall in the same clock minute, those labels show seconds (`5:50:12 PM`, `5:50:47 PM`). Labels are not grouped with a count.
-- The background matches the lighting of the objects on screen. A frame with almost no color is treated as infrared. Color and infrared are never averaged into one plate. Within one lighting period the plate is the sample nearest those objects, refreshed about every 30 minutes. Objects stay in time order, so a dusk recap moves from afternoon to night, and the plate crossfades for about half a second when the lighting changes.
-- A cutout that is still color on an infrared plate is turned gray, and its brightness and contrast are matched to the local plate. On an infrared or dark plate the cutout also gets a mild contrast boost and a thin outline in its category color, so a dark car on a dark road stays visible. Only an infrared vehicle is tightened against the plate, and only inside the padded cutout window. Lit ground is left out. A mask that is mostly the plate is left out. Day cutouts and people are not rewritten.
-- Every moving cutout is fully opaque inside the mask: people, animals, bikes, deliveries, and vehicles. Only a 2 to 3 pixel edge is soft, and the fade in and out is 0.2 seconds. The background plate is dimmed and desaturated by about 18% so the objects read first.
+- The background matches the lighting of the objects on screen. A frame with almost no color is treated as infrared. Color and infrared are never averaged into one plate. Within one lighting period the plate is the sample nearest those objects, refreshed about every 30 minutes. Objects stay in time order, so a dusk recap moves from afternoon to night, and the plate crossfades for about half a second when the lighting changes. The plate is dimmed and desaturated by about 18% so the objects read first.
+- Each object's position comes from every exact sample Frigate kept: the timeline rows (first seen, entered a zone, stopped, last seen) and the path. Sizes follow the timeline, so a car coming up the street grows. A clip ends at the last sighting. Frigate keeps an event open a few seconds after the object leaves, and those frames are empty road.
+- The recording and the detector run on different clocks. Recording segments are dated to the whole second, so a frame can be anywhere from a fraction of a second to about two seconds away from the detector's time for the same moment. Each event is lined up with its own frames: the path is slid in time until it covers the most motion. `detect.annotation_offset` is the starting guess.
+- Objects are drawn as recorded. Nothing is brightened or darkened to match the plate. A color object on an infrared plate is only turned gray.
+- In daylight, an object that lines up is a moving cutout: fully opaque inside its mask, with a 2 to 3 pixel soft edge and a 0.2 second fade in and out.
+- At night, at dusk, or when the path does not line up with the recording or the mask leaks into the road, the object is shown as Frigate's snapshot of it (its best view, measured on that exact frame), held in place for at least 3 seconds in a rounded window with a thin outline in its category color.
+- At most `max_labels` objects are on screen at once, and objects on the same spot wait for each other instead of stacking. A busy six hours can run three or four minutes. The player's own speed control plays it faster.
+- Vehicles smaller than `min_object_area` (far-street traffic) and people smaller than a third of it are left out. They are listed with the reason "too small to see".
 - The cutout window is the union of the detector boxes in that clip, plus about 12% on the sides. People and animals also get about 20% above the box, and a vehicle gets extra room in the direction it is moving, so a nose or a head is not cropped off. The outline follows a closed, simplified contour rather than every jagged pixel.
 - Each time label is drawn once. The player does not paint the same words again on top of the frame.
-- A label and its leader are drawn only when the cutout is on screen and readable against the plate. The leader ends on the centroid of the mask that was painted. An empty mask, a box that sits mostly off the frame, a cutout under about 0.15% of the frame, or one with almost no contrast against the plate does not get a line.
+- Every object that is drawn keeps its time label and leader. The leader ends on the centroid of the mask that was painted. Only a ghost of a few dozen pixels, or a box that sits mostly off the frame, gets no line.
 
 Tap a time on the video, or a row in the event list, to pause and open that clip. The dialog has download, previous, and next, and a link to Frigate review at that time. While the synopsis is paused, every time on screen can be tapped. Live clips play from the camera's HLS VOD playlist (`/vod/<camera>/start/<ts>/end/<ts>/index.m3u8`), which Safari plays natively. Archived files are served as a faststart H.264 MP4 with range requests. If Frigate has already deleted the recording, and `recap.archive` is set, the player uses the archived file for the same event.
 
@@ -176,7 +183,7 @@ A GitHub Actions workflow on this fork can also push `ghcr.io/sampsonb/frigate:r
 
 ## Performance
 
-Recap is meant for a small Intel machine that is also running detection. It does not load a second detector. Cutouts are motion against a background plate, on the CPU, with a short pause between events. Output is 1280px wide H.264. One recap runs at a time, and the worker lowers its priority.
+Recap is meant for a small Intel machine that is also running detection. It does not load a second detector. Cutouts are motion against a background plate, on the CPU, with a short pause between events. Night objects reuse Frigate's snapshot, so their clips are not decoded at all. Output is 1280px wide H.264. One recap runs at a time, and the worker lowers its priority.
 
 Semantic search, when enabled, only looks at the nearest thumbnails Frigate already computed. It is skipped when semantic search is off.
 
@@ -185,6 +192,7 @@ Semantic search, when enabled, only looks at the nearest thumbnails Frigate alre
 - Filters hide labels and the event list. They do not erase ghosts already drawn into the video.
 - A parked car is shown only when Frigate tracked that stationary vehicle. A car the detector never saw cannot be labeled.
 - Cutouts are weaker than a segmentation model on a cluttered background. A connected moving object is included. A shadow or a full-frame lighting change is not.
+- A snapshot held in place shows the object at its best moment, not its movement. Tap its time to play the clip.
 - The schedule is a single daily time, not a cron expression. If Frigate is down at that minute, that day's recap is skipped.
 - Label times and the nightly schedule use `ui.timezone`. The container clock is often UTC. If `ui.timezone` is unset, both fall back to the container's local time.
 - At most `max_events` events are processed (default 400). When a window has more, the newest are kept, after parked vehicles are set aside.

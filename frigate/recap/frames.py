@@ -156,7 +156,10 @@ def concat_sample(
 ) -> list[np.ndarray]:
     """Sample an event that spans more than one recording segment.
 
-    ``segments`` is ``(path, offset_into_file, duration)`` in order.
+    ``segments`` is ``(path, offset_into_file, duration)`` in order. The
+    files are joined whole and the start is found with an accurate seek.
+    A concat ``inpoint`` lands on the keyframe before it, so frames from
+    up to a few seconds early came out first and every box was late.
     """
     if not segments:
         return []
@@ -167,17 +170,15 @@ def concat_sample(
         )
     playlist = work_dir / "recap-concat.txt"
     lines = []
-    for path, offset, duration in segments:
+    for path, _offset, _duration in segments:
         escaped = path.replace("'", "'\\''")
         lines.append(f"file '{escaped}'")
-        lines.append(f"inpoint {max(0.0, offset):.3f}")
-        lines.append(f"outpoint {max(0.0, offset + duration):.3f}")
     playlist.write_text("\n".join(lines) + "\n")
     duration = sum(item[2] for item in segments)
     return read_raw(
         ffmpeg,
         str(playlist),
-        0.0,
+        segments[0][1],
         duration,
         width,
         height,

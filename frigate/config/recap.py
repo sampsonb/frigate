@@ -181,10 +181,30 @@ class RecapConfig(FrigateBaseModel):
         le=1.0,
     )
     max_labels: int = Field(
-        default=8,
-        title="Maximum number of time labels on screen at once.",
+        default=4,
+        title="Maximum number of objects (and time labels) on screen at once.",
         ge=1,
         le=30,
+    )
+    max_overlap: float = Field(
+        default=0.3,
+        title="Most of an object's footprint another object may cover.",
+        description=(
+            "When a busy window does not fit in target_length, objects may "
+            "overlap up to this share before the recap runs longer instead."
+        ),
+        ge=0.0,
+        le=1.0,
+    )
+    min_object_area: float = Field(
+        default=0.0012,
+        title="Smallest vehicle shown, as a fraction of the frame.",
+        description=(
+            "Measured on Frigate's snapshot box, the object's best view. "
+            "People and animals use a third of this. 0 shows everything."
+        ),
+        ge=0.0,
+        le=0.2,
     )
     min_label_gap: int = Field(
         default=12,

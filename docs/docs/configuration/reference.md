@@ -824,8 +824,15 @@ recap:
   target_length: 120
   # Optional: Opacity of the time-label background (default: shown below)
   label_opacity: 0.5
-  # Optional: Maximum number of time labels on screen at once (default: shown below)
-  max_labels: 8
+  # Optional: Maximum number of objects, and time labels, on screen at once (default: shown below)
+  max_labels: 4
+  # Optional: Most of an object's footprint other objects may cover before
+  # a busy recap runs longer instead (default: shown below)
+  max_overlap: 0.3
+  # Optional: Smallest vehicle shown, as a fraction of the frame, measured on
+  # Frigate's snapshot box. People and animals use a third of it. 0 shows
+  # everything (default: shown below)
+  min_object_area: 0.0012
   # Optional: Fade in and out, in seconds (default: shown below)
   fade_seconds: 0.2
   # Optional: Days to keep generated recaps. 0 keeps them until deleted (default: shown below)

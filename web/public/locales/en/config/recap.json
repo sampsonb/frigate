@@ -46,7 +46,15 @@
       "label": "Opacity of the time-label background."
     },
     "max_labels": {
-      "label": "Maximum number of time labels on screen at once."
+      "label": "Maximum number of objects (and time labels) on screen at once."
+    },
+    "max_overlap": {
+      "label": "Most of an object's footprint another object may cover.",
+      "description": "When a busy window does not fit target_length, objects may overlap up to this share before the recap runs longer instead."
+    },
+    "min_object_area": {
+      "label": "Smallest vehicle shown, as a fraction of the frame.",
+      "description": "Measured on Frigate's snapshot box, the object's best view. People and animals use a third of this. 0 shows everything."
     },
     "min_label_gap": {
       "label": "Minimum gap between labels, in pixels at 1080p."

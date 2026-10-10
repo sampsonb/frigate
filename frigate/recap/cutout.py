@@ -5,6 +5,12 @@ against a clean background plate is kept: a golf cart, bicycle, scooter,
 or stroller the model does not know still belongs to the person riding
 or pushing it. Edges are feathered and single-frame glitches are
 replaced from neighboring frames.
+
+A motion mask needs a clean, well lit picture. In infrared, at dusk, or
+when the mask spreads far past the object, the ghost is a window instead:
+the padded detector box with rounded corners, copied as recorded. A
+window never loses part of the object and never turns into see-through
+road.
 """
 
 from __future__ import annotations
@@ -15,7 +21,7 @@ import cv2
 import numpy as np
 
 from frigate.recap.layout import MotionTrack
-from frigate.recap.plates import mostly_off_frame
+from frigate.recap.plates import frame_is_ir, mostly_off_frame
 
 # Vehicle masks wider than this are computed on a smaller image and scaled
 # back. A distant car stays at full resolution so its few pixels are not lost.
@@ -25,6 +31,14 @@ FEATHER_PX = 3
 # Median plate samples. More frames do not make a cleaner plate once the
 # object has moved, and each extra frame is a full-resolution partition.
 _PLATE_SAMPLES = 9
+# Below this median brightness (0 to 255) the clip is dusk or night. Gain
+# noise and headlights make the motion mask unreliable, so windows are used.
+DIM_LUMA = 80.0
+# Mask area over detector box area. Past this the mask has spread into the
+# road or the yard, and the track is drawn as windows instead.
+_MAX_MASK_RATIO = {"vehicle": 1.8, "person": 3.2, "animal": 3.2, "delivery": 3.2}
+# Share of frames that must have a believable mask to keep the mask look.
+_PLAUSIBLE_SHARE = 0.6
 
 
 def _half_extents(
@@ -445,42 +459,141 @@ def solid_feather(alpha: np.ndarray, radius: int = FEATHER_PX) -> np.ndarray:
     return soft
 
 
-def _soft_box(
-    frame: np.ndarray, box: tuple[float, float, float, float]
+def window_rect(
+    box: tuple[float, float, float, float],
+    category: str,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    """Padded detector box for a window ghost, clipped to the frame.
+
+    The path box can trail or lead the object by a few pixels, and a head
+    or a side mirror sits outside a loose detector box, so the window is
+    roomier than the box.
+    """
+    box_w = max(1.0, box[2] - box[0])
+    box_h = max(1.0, box[3] - box[1])
+    if category in ("person", "animal", "delivery"):
+        pad_x = max(4.0, 0.16 * box_w)
+        pad_top = max(4.0, 0.16 * box_h)
+    else:
+        pad_x = max(4.0, 0.10 * box_w)
+        pad_top = max(4.0, 0.12 * box_h)
+    pad_bottom = max(3.0, 0.06 * box_h)
+    return (
+        int(max(0, np.floor(box[0] - pad_x))),
+        int(max(0, np.floor(box[1] - pad_top))),
+        int(min(width, np.ceil(box[2] + pad_x))),
+        int(min(height, np.ceil(box[3] + pad_bottom))),
+    )
+
+
+def rounded_alpha(height: int, width: int) -> np.ndarray:
+    """Opaque rounded rectangle with the usual soft rim."""
+    alpha = np.zeros((height, width), np.uint8)
+    if height < 4 or width < 4:
+        return alpha
+    radius = int(max(2, min(14, 0.14 * min(height, width))))
+    inset = 1
+    x0, y0, x1, y1 = inset, inset, width - 1 - inset, height - 1 - inset
+    cv2.rectangle(alpha, (x0 + radius, y0), (x1 - radius, y1), 255, -1)
+    cv2.rectangle(alpha, (x0, y0 + radius), (x1, y1 - radius), 255, -1)
+    for cx, cy in (
+        (x0 + radius, y0 + radius),
+        (x1 - radius, y0 + radius),
+        (x0 + radius, y1 - radius),
+        (x1 - radius, y1 - radius),
+    ):
+        cv2.circle(alpha, (cx, cy), radius, 255, -1, cv2.LINE_AA)
+    return solid_feather(alpha)
+
+
+def window_ghost(
+    frame: np.ndarray,
+    box: tuple[float, float, float, float],
+    category: str,
 ) -> dict[str, object] | None:
-    """Feathered crop of the detector box when the motion mask fails.
+    """The padded box copied straight from ``frame``, with rounded corners."""
+    height, width = frame.shape[:2]
+    if box[2] - box[0] < 4 or box[3] - box[1] < 4:
+        return None
+    if mostly_off_frame(box, width, height):
+        return None
+    x0, y0, x1, y1 = window_rect(box, category, width, height)
+    if x1 - x0 < 6 or y1 - y0 < 6:
+        return None
+    return {
+        "x": x0,
+        "y": y0,
+        "crop": frame[y0:y1, x0:x1].copy(),
+        "alpha": rounded_alpha(y1 - y0, x1 - x0),
+        "box": (float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+        "window": True,
+    }
+
+
+def window_ghosts(
+    frames: list[np.ndarray],
+    boxes: list[tuple[float, float, float, float]],
+    category: str,
+) -> list[dict[str, object]]:
+    """One window ghost per frame. Off-frame boxes become blanks."""
+    ghosts: list[dict[str, object]] = []
+    for frame, box in zip(frames, boxes, strict=True):
+        ghost = window_ghost(frame, box, category)
+        ghosts.append(ghost if ghost is not None else _blank_ghost(box))
+    return ghosts
+
+
+def needs_window(background: np.ndarray) -> bool:
+    """True when a motion mask cannot be trusted for this clip.
+
+    Infrared frames have almost no color. Dusk frames are dim and full of
+    gain noise before the camera switches. Either way the difference
+    image picks up glare and grain instead of the object's outline.
+    """
+    if background.size == 0:
+        return False
+    if frame_is_ir(background):
+        return True
+    luma = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
+    return float(np.median(luma)) < DIM_LUMA
+
+
+def masks_plausible(
+    pieces: list[tuple[int, int, np.ndarray]],
+    boxes: list[tuple[float, float, float, float]],
+    category: str,
+) -> bool:
+    """True when most masks stay about the size of the detector box.
+
+    A mask several times the box has leaked into the road, a lawn, or a
+    second object. Drawing that leak is what looks like a smeared ghost.
+    """
+    limit = _MAX_MASK_RATIO.get(category, 3.2)
+    good = 0
+    counted = 0
+    for (_x, _y, mask), box in zip(pieces, boxes, strict=True):
+        area = max(1.0, (box[2] - box[0]) * (box[3] - box[1]))
+        counted += 1
+        if int(mask.sum()) <= limit * area:
+            good += 1
+    if counted == 0:
+        return False
+    return good >= _PLAUSIBLE_SHARE * counted
+
+
+def _soft_box(
+    frame: np.ndarray,
+    box: tuple[float, float, float, float],
+    category: str = "vehicle",
+) -> dict[str, object] | None:
+    """A window ghost when the motion mask fails for one frame.
 
     A car that has sat still long enough is in the background plate, so
     the difference mask is empty. The car is still in this frame.
     """
-    height, width = frame.shape[:2]
-    box_w = box[2] - box[0]
-    box_h = box[3] - box[1]
-    if box_w < 4 or box_h < 4 or mostly_off_frame(box, width, height):
-        return None
-    x0 = int(max(0, box[0]))
-    y0 = int(max(0, box[1]))
-    x1 = int(min(width, box[2]))
-    y1 = int(min(height, box[3]))
-    if x1 - x0 < 4 or y1 - y0 < 4:
-        return None
-    crop = frame[y0:y1, x0:x1].copy()
-    alpha = np.zeros(crop.shape[:2], np.uint8)
-    cv2.rectangle(
-        alpha,
-        (int(0.06 * crop.shape[1]), int(0.08 * crop.shape[0])),
-        (max(2, int(0.94 * crop.shape[1])), max(2, int(0.92 * crop.shape[0]))),
-        255,
-        -1,
-    )
-    alpha = solid_feather(alpha)
-    return {
-        "x": x0,
-        "y": y0,
-        "crop": crop,
-        "alpha": alpha,
-        "box": (float(box[0]), float(box[1]), float(box[2]), float(box[3])),
-    }
+    return window_ghost(frame, box, category)
 
 
 def _smooth_centers(boxes: list[tuple[float, float, float, float]]) -> np.ndarray:
@@ -814,9 +927,13 @@ def build_cutouts(
     travel = _horizontal_travel(boxes)
     background = clean_background(frames, boxes, category, span, travel)
     height, width = background.shape[:2]
+    if needs_window(background):
+        return window_ghosts(frames, boxes, category)
     pieces = _motion_pieces(
         frames, boxes, background, category, fg_thresh, span, travel
     )
+    if not masks_plausible(pieces, boxes, category):
+        return window_ghosts(frames, boxes, category)
     areas = np.array([int(piece[2].sum()) for piece in pieces], np.float32)
     bad = [
         bool(area < 8) or not _object_is_visible(frame, background, piece)
@@ -924,7 +1041,7 @@ def build_cutouts(
         else:
             ghost = repair(index, box)
         if ghost is None:
-            ghost = _soft_box(frame, box)
+            ghost = _soft_box(frame, box, category)
         if ghost is None:
             ghost = _blank_ghost(box)
         cached = ghost
@@ -989,6 +1106,7 @@ def parked_car_ghost(
         "crop": crop,
         "alpha": alpha,
         "box": tuple(float(v) for v in box),
+        "window": True,
     }
 
 

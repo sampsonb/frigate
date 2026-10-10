@@ -67,7 +67,6 @@ from frigate.recap.plates import (
     plate_index_at,
     prepare_cutout,
     recede_plate,
-    tighten_night_vehicle,
 )
 from frigate.recap.render import (
     GhostFrame,
@@ -78,6 +77,9 @@ from frigate.recap.render import (
     leader_without_ghost,
 )
 from frigate.recap.storage import list_visible_recaps, recap_kind, remove_superseded
+
+# A green and gray daytime tone. Flat gray reads as infrared.
+DAYLIGHT = (80, 140, 70)
 
 
 def _recap_config():
@@ -403,7 +405,7 @@ class TestCutout(unittest.TestCase):
 
     def test_a_moving_vehicles_nose_is_not_cropped(self):
         height, width = 160, 420
-        plate = np.full((height, width, 3), 80, np.uint8)
+        plate = np.full((height, width, 3), DAYLIGHT, np.uint8)
         frames = []
         boxes = []
         for index in range(5):
@@ -436,7 +438,7 @@ class TestCutout(unittest.TestCase):
 
     def test_moving_cart_survives_the_background_plate(self):
         height, width = 160, 320
-        plate = np.full((height, width, 3), 90, np.uint8)
+        plate = np.full((height, width, 3), DAYLIGHT, np.uint8)
         frames = []
         boxes = []
         for index in range(6):
@@ -467,7 +469,7 @@ class TestCutout(unittest.TestCase):
 
     def test_vehicle_gap_is_repaired_from_a_neighbor(self):
         height, width = 180, 320
-        plate = np.full((height, width, 3), (90, 90, 90), np.uint8)
+        plate = np.full((height, width, 3), DAYLIGHT, np.uint8)
         car = np.array((0, 0, 220), np.uint8)
         frames = []
         boxes = []
@@ -520,7 +522,7 @@ class TestCutout(unittest.TestCase):
 
     def test_moving_vehicle_is_measured_on_each_frame(self):
         height, width = 160, 320
-        plate = np.full((height, width, 3), 90, np.uint8)
+        plate = np.full((height, width, 3), DAYLIGHT, np.uint8)
         frames = []
         boxes = []
         for index in range(4):
@@ -1948,34 +1950,34 @@ class TestLightingPlates(unittest.TestCase):
         self.assertAlmostEqual(amounts[-1], 1.0)
         self.assertEqual(fade.step(1), (1, None, 1.0))
 
-    def test_color_cutout_on_an_infrared_plate_is_matched(self):
-        plate = _ir_frame(40, 50, 40)
+    def test_color_cutout_on_an_infrared_plate_turns_gray_but_keeps_its_light(self):
         crop = np.zeros((40, 50, 3), np.uint8)
         crop[8:32, 10:40] = (30, 40, 220)
         alpha = np.zeros((40, 50), np.uint8)
         alpha[8:32, 10:40] = 255
-        matched = prepare_cutout(
-            crop, alpha, plate, plate_is_ir=True, plate_is_dark=True
-        )
-        body = matched[8:32, 10:40].astype(np.int16)
+        fitted = prepare_cutout(crop, alpha, plate_is_ir=True)
+        body = fitted[8:32, 10:40].astype(np.int16)
         # Gray: the three channels sit together, unlike the red source.
         spread = int(np.max(body, axis=2).max() - np.min(body, axis=2).min())
         self.assertLess(spread, 12)
-        source_luma = float(crop[8:32, 10:40, 2].mean())
-        matched_luma = float(body.mean())
-        self.assertGreater(source_luma, 180)
-        self.assertLess(abs(matched_luma - 40), abs(source_luma - 40))
+        # The brightness is the object's own. Matching it to a dark plate
+        # is what made night cars the same gray as the road.
+        own = float(cv2.cvtColor(crop[8:32, 10:40], cv2.COLOR_BGR2GRAY).mean())
+        self.assertAlmostEqual(float(body.mean()), own, delta=2)
 
-    def test_similar_daylight_cutout_keeps_its_color(self):
-        plate = _color_frame(40, 50, (80, 150, 60))
-        crop = plate.copy()
+    def test_daylight_and_infrared_cutouts_are_drawn_as_recorded(self):
+        crop = np.full((40, 50, 3), (80, 150, 60), np.uint8)
         crop[8:32, 10:40] = (40, 80, 200)
         alpha = np.zeros((40, 50), np.uint8)
         alpha[8:32, 10:40] = 255
-        matched = prepare_cutout(
-            crop, alpha, plate, plate_is_ir=False, plate_is_dark=False
+        self.assertTrue(
+            np.array_equal(prepare_cutout(crop, alpha, plate_is_ir=False), crop)
         )
-        self.assertGreater(int(matched[16, 20, 2]), int(matched[16, 20, 1]) + 40)
+        gray = np.full((40, 50, 3), 70, np.uint8)
+        gray[8:32, 10:40] = 160
+        self.assertTrue(
+            np.array_equal(prepare_cutout(gray, alpha, plate_is_ir=True), gray)
+        )
 
     def test_empty_mask_and_edge_box_get_no_label(self):
         plate = np.zeros((180, 320, 3), np.uint8)
@@ -2285,64 +2287,18 @@ def _checker(height: int, width: int, dark: int, light: int) -> np.ndarray:
     return image
 
 
-class TestTightNightMasks(unittest.TestCase):
-    def test_headlights_do_not_spread_into_the_yard(self):
-        plate = _ir_frame(180, 320, 30)
-        # The box covers the car, a flower pot, and the lit corner.
-        box = (40.0, 30.0, 200.0, 150.0)
-        crop = np.full((120, 160, 3), 190, np.uint8)
-        crop[20:100, 30:130] = 48
-        crop[20:100:7, 30:130] = 150
-        # Pot and the bottom-right corner stay smooth and bright.
-        crop[40:70, 140:155] = 170
-        alpha = np.full(crop.shape[:2], 255, np.uint8)
-        tight = tighten_night_vehicle(crop, alpha, plate[30:150, 40:200], box, 40, 30)
-        self.assertIsNotNone(tight)
-        assert tight is not None
-        self.assertGreater(int((tight[30:90, 40:120] >= 64).sum()), 500)
-        self.assertEqual(int(tight[40:70, 140:155].sum()), 0)
-        self.assertEqual(int(tight[100:118, 140:158].sum()), 0)
-        # The car is a plausible fraction of the box, so the old mask is not restored.
-        self.assertLess(int((tight >= 64).sum()), int(0.9 * alpha.size))
-
-        ghost = GhostFrame(x=40, y=30, box=box, crop=crop, alpha=alpha)
-        drawn = _vehicle_frame(plate, ghost, box)
-        quiet = recede_plate(plate)
-        self.assertTrue(np.array_equal(drawn[85, 188], quiet[85, 188]))
-        self.assertTrue(np.array_equal(drawn[140, 190], quiet[140, 190]))
-        anchor = mask_centroid(tight, 40, 30)
-        self.assertIsNotNone(anchor)
-        assert anchor is not None
-        self.assertFalse(
-            np.array_equal(drawn[anchor[1], anchor[0]], quiet[anchor[1], anchor[0]])
-        )
-
-    def test_implausible_tighten_falls_back_to_the_stored_mask(self):
-        plate = _ir_frame(120, 200, 40)
-        box = (20.0, 20.0, 160.0, 100.0)
-        # Headlights wash the whole box. The only textured piece is too
-        # small to be the car, so the stored rectangle is kept.
-        crop = np.full((80, 140, 3), 180, np.uint8)
-        crop[30:42, 60:72] = _checker(12, 12, 20, 40)
-        alpha = np.full(crop.shape[:2], 255, np.uint8)
-        tight = tighten_night_vehicle(crop, alpha, plate[20:100, 20:160], box, 20, 20)
-        self.assertIsNotNone(tight)
-        assert tight is not None
-        self.assertEqual(int((tight >= 32).sum()), int((alpha >= 32).sum()))
-
-    def test_a_mask_that_matches_the_plate_is_dropped(self):
+class TestNightAndLabels(unittest.TestCase):
+    def test_a_night_ghost_close_to_the_plate_keeps_its_label(self):
+        # A dark car on a dark road used to lose its label and leader.
         plate = _ir_frame(180, 320, 40)
         box = (80.0, 40.0, 200.0, 140.0)
         crop = plate[40:140, 80:200].copy()
-        crop[8:16, 8:16] = 200
+        crop[30:80, 20:100] = 52
         alpha = np.full(crop.shape[:2], 255, np.uint8)
-        self.assertIsNone(
-            tighten_night_vehicle(crop, alpha, plate[40:140, 80:200], box, 80, 40)
-        )
-        ghost = GhostFrame(x=80, y=40, box=box, crop=crop, alpha=alpha)
+        ghost = GhostFrame(x=80, y=40, box=box, crop=crop, alpha=alpha, window=True)
         drawn = _vehicle_frame(plate, ghost, box)
         vehicle = np.array((40, 165, 255), np.uint8)
-        self.assertEqual(int((drawn == vehicle).all(axis=2).sum()), 0)
+        self.assertGreater(int((drawn == vehicle).all(axis=2).sum()), 20)
 
     def test_day_person_is_not_tightened(self):
         plate = np.full((180, 320, 3), (80, 150, 70), np.uint8)
@@ -2355,39 +2311,23 @@ class TestTightNightMasks(unittest.TestCase):
         quiet = recede_plate(plate)
         # Plate-colored corners of the stored mask are still painted.
         self.assertFalse(np.array_equal(drawn[50, 110], quiet[50, 110]))
-        self.assertGreater(int(drawn[90, 140, 2]), 150)
+        self.assertGreater(int(drawn[70, 125, 2]), 150)
 
-    def test_tiny_or_low_contrast_cutouts_are_not_labeled(self):
+    def test_a_faint_cutout_keeps_its_label_and_a_speck_does_not(self):
         plate = np.full((180, 320, 3), (80, 140, 70), np.uint8)
         vehicle = np.array((40, 165, 255), np.uint8)
-        # 8 x 10 is under 0.15% of 180 x 320 (about 86 pixels).
-        tiny_box = (150.0, 80.0, 158.0, 90.0)
-        tiny = GhostFrame(
-            x=150,
-            y=80,
-            box=tiny_box,
-            crop=np.full((10, 8, 3), (20, 20, 220), np.uint8),
-            alpha=np.full((10, 8), 255, np.uint8),
-        )
-        self.assertFalse(
-            label_should_draw(tiny.alpha, 320, 180, tiny.crop, plate[80:90, 150:158])
-        )
-        drawn = _vehicle_frame(plate, tiny, tiny_box)
-        self.assertEqual(int((drawn == vehicle).all(axis=2).sum()), 0)
-        # The ghost itself is still there.
-        self.assertGreater(int(drawn[84, 154, 2]), 150)
-
         faint_box = (80.0, 40.0, 150.0, 110.0)
         faint_crop = np.full((70, 70, 3), (82, 142, 74), np.uint8)
         faint_alpha = np.full((70, 70), 255, np.uint8)
-        self.assertFalse(
-            label_should_draw(faint_alpha, 320, 180, faint_crop, plate[40:110, 80:150])
-        )
+        self.assertTrue(label_should_draw(faint_alpha))
         faint = GhostFrame(
             x=80, y=40, box=faint_box, crop=faint_crop, alpha=faint_alpha
         )
         drawn = _vehicle_frame(plate, faint, faint_box)
-        self.assertEqual(int((drawn == vehicle).all(axis=2).sum()), 0)
+        self.assertGreater(int((drawn == vehicle).all(axis=2).sum()), 20)
+        # A few dozen pixels is a speck. It can be drawn, but no label
+        # points at it. Objects too small to see are left out earlier.
+        self.assertFalse(label_should_draw(np.full((6, 7), 255, np.uint8)))
 
     def test_label_text_is_drawn_once(self):
         image = np.full((100, 400, 3), 18, np.uint8)
@@ -2427,13 +2367,13 @@ class TestTightNightMasks(unittest.TestCase):
         # The old leader ended in the trees at the top of the box.
         self.assertTrue(np.array_equal(drawn[24, 130], quiet[24, 130]))
         # A second, empty-street cutout does not get a label either.
-        distant_box = (20.0, 20.0, 28.0, 30.0)
+        distant_box = (20.0, 20.0, 27.0, 26.0)
         distant = GhostFrame(
             x=20,
             y=20,
             box=distant_box,
-            crop=np.full((10, 8, 3), (20, 20, 200), np.uint8),
-            alpha=np.full((10, 8), 255, np.uint8),
+            crop=np.full((6, 7, 3), (20, 20, 200), np.uint8),
+            alpha=np.full((6, 7), 255, np.uint8),
         )
         both = compose_frame(
             plate,

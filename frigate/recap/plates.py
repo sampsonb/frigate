@@ -24,22 +24,10 @@ DARK_LUMA = 60.0
 PLATE_INTERVAL = 1800.0
 # How often recordings are sampled while looking for the day/night switch.
 CLASSIFY_STEP = 600.0
-# Mean luminance gap that counts as a cutout pasted onto the wrong plate.
-BRIGHT_DELTA = 24.0
 # Crossfade when the recap moves to another plate.
 PLATE_FADE_SECONDS = 0.5
 # How much saturation and brightness to take off the plate so cutouts pop.
 PLATE_RECEDE = 0.18
-# Smaller than this on screen, a cutout is a speck. 0.15% of a 1280x720
-# frame is about 1400 pixels. Skip it instead of pointing a label at it.
-MIN_VISIBLE_AREA = 0.0015
-# Median channel gap against the plate, below which the object does not
-# read and should not be labeled.
-MIN_CONTRAST = 12.0
-# A mask pixel this close to the plate is background, not the object.
-PLATE_DIFF = 10
-# Below this share of the mask, the cutout is the plate with a box around it.
-MIN_OBJECT_FRACTION = 0.25
 
 
 @dataclass(frozen=True)
@@ -185,139 +173,14 @@ def mask_centroid(
     )
 
 
-def label_should_draw(
-    alpha: np.ndarray,
-    width: int,
-    height: int,
-    crop: np.ndarray | None = None,
-    plate: np.ndarray | None = None,
-) -> bool:
-    """False when a label would point at a speck or at the plate.
+def label_should_draw(alpha: np.ndarray) -> bool:
+    """False when the painted mask is only a few pixels.
 
-    The ghost can still be drawn. The label and its leader are not.
+    Objects too small to recognize are left out of the recap before any
+    cutting, so a ghost that is drawn keeps its time label. Skipping the
+    label of a faint or small ghost left objects on screen with no time.
     """
-    opaque = alpha >= 64
-    count = int(opaque.sum())
-    if count < 48:
-        return False
-    if width > 0 and height > 0 and count < MIN_VISIBLE_AREA * width * height:
-        return False
-    if crop is None or plate is None:
-        return True
-    if crop.shape[:2] != alpha.shape[:2] or plate.shape[:2] != alpha.shape[:2]:
-        return True
-    diff = cv2.absdiff(crop, plate).max(axis=2)
-    return float(np.median(diff[opaque])) >= MIN_CONTRAST
-
-
-def tighten_night_vehicle(
-    crop: np.ndarray,
-    alpha: np.ndarray,
-    plate_patch: np.ndarray,
-    box: tuple[float, float, float, float],
-    origin_x: int,
-    origin_y: int,
-) -> np.ndarray | None:
-    """Tighten an infrared vehicle mask against the plate.
-
-    Day cutouts and people never call this. Headlights light up the yard,
-    so a raw difference spreads into the flower pot and the grass. The
-    kept pixels have to sit in the padded cutout window, survive
-    an open and close, and belong to the largest component that covers
-    the box center. Smooth bright ground is rejected. None drops the
-    cutout (the mask is the plate). Any other implausible result returns
-    ``alpha`` unchanged, which is the mask from before this pass.
-    """
-    if (
-        crop.size == 0
-        or crop.shape[:2] != alpha.shape[:2]
-        or crop.shape[:2] != plate_patch.shape[:2]
-    ):
-        return alpha
-    base = alpha >= 32
-    count = int(base.sum())
-    if count < 8:
-        return alpha
-    diff = cv2.absdiff(crop, plate_patch).max(axis=2)
-    changed = base & (diff >= PLATE_DIFF)
-    # A box of road, with almost nothing that differs, is not a car.
-    if int(changed.sum()) < MIN_OBJECT_FRACTION * count:
-        return None
-
-    limit, expected, center = _vehicle_limit(alpha.shape, box, origin_x, origin_y)
-    luma = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    plate_luma = cv2.cvtColor(plate_patch, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    blur = cv2.GaussianBlur(luma, (9, 9), 0)
-    texture = cv2.GaussianBlur(np.abs(luma - blur), (9, 9), 0)
-    # Lit concrete and plants are bright and smooth. A car has edges.
-    lit_ground = (luma >= np.maximum(plate_luma + 28.0, 70.0)) & (texture < 7.0)
-    kept = changed & (limit > 0) & ~lit_ground
-    binary = kept.astype(np.uint8)
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    closed = cv2.morphologyEx(
-        opened, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    )
-    _n, labels = cv2.connectedComponents(closed)
-    component = _component_at_center(labels, center)
-    if component is None:
-        return alpha
-    area = int(component.sum())
-    # Too small, or grown past the box, means the difference went wrong.
-    if area < 0.30 * expected or area > 1.10 * expected:
-        return alpha
-    out = np.zeros_like(alpha)
-    out[component] = 255
-    return out
-
-
-def _vehicle_limit(
-    shape: tuple[int, int],
-    box: tuple[float, float, float, float],
-    origin_x: int,
-    origin_y: int,
-) -> tuple[np.ndarray, float, tuple[int, int]]:
-    """Slightly dilated detector box, its area, and its center in the crop."""
-    height, width = shape
-    x0 = int(round(box[0])) - int(origin_x)
-    y0 = int(round(box[1])) - int(origin_y)
-    x1 = int(round(box[2])) - int(origin_x)
-    y1 = int(round(box[3])) - int(origin_y)
-    box_w = max(1, x1 - x0)
-    box_h = max(1, y1 - y0)
-    # Match the cutout window: about 12% past the box, not a few pixels.
-    pad = max(2, int(round(0.12 * min(box_w, box_h))))
-    limit = np.zeros(shape, np.uint8)
-    cv2.rectangle(
-        limit,
-        (x0 - pad, y0 - pad),
-        (x1 - 1 + pad, y1 - 1 + pad),
-        255,
-        -1,
-    )
-    center = (
-        int(np.clip((x0 + x1) // 2, 0, width - 1)),
-        int(np.clip((y0 + y1) // 2, 0, height - 1)),
-    )
-    return limit, float(box_w * box_h), center
-
-
-def _component_at_center(
-    labels: np.ndarray, center: tuple[int, int]
-) -> np.ndarray | None:
-    """Largest component that covers the box center. None when nothing does."""
-    height, width = labels.shape[:2]
-    cx, cy = center
-    radius = 3
-    y0 = max(0, cy - radius)
-    y1 = min(height, cy + radius + 1)
-    x0 = max(0, cx - radius)
-    x1 = min(width, cx + radius + 1)
-    present = labels[y0:y1, x0:x1]
-    ids = [int(item) for item in np.unique(present) if int(item) != 0]
-    if not ids:
-        return None
-    best = max(ids, key=lambda item: int((labels == item).sum()))
-    return labels == best
+    return int((alpha >= 64).sum()) >= 48
 
 
 def plate_sample_times(
@@ -474,10 +337,6 @@ class PlateFade:
         return self.index, None, 1.0
 
 
-def _luma(image: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
-
-
 def _region_is_color(image: np.ndarray, mask: np.ndarray) -> bool:
     sat = frame_saturation(image)
     values = sat[mask]
@@ -486,71 +345,25 @@ def _region_is_color(image: np.ndarray, mask: np.ndarray) -> bool:
     return float(np.percentile(values, 90)) > IR_SAT_P90
 
 
-def _match_luma(crop: np.ndarray, plate: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Move the cutout's mean and spread toward the plate under it."""
-    src = _luma(crop)
-    dst = _luma(plate)
-    source = src[mask]
-    target = dst[mask]
-    src_mean = float(source.mean())
-    dst_mean = float(target.mean())
-    src_std = max(float(source.std()), 1.0)
-    # A flat night road has almost no spread. Matching that exactly would
-    # erase the car before the contrast boost can bring it back.
-    dst_std = max(float(target.std()), 6.0)
-    gain = min(dst_std / src_std, 3.0)
-    scaled = np.clip((src - src_mean) * gain + dst_mean, 0, 255)
-    safe = np.maximum(src, 1.0)
-    ratio = (scaled / safe)[..., None]
-    return np.clip(crop.astype(np.float32) * ratio, 0, 255).astype(np.uint8)
-
-
-def _clahe(crop: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Mild local contrast on the cutout. The feathered edge is left alone."""
-    height, width = crop.shape[:2]
-    tile = 8
-    while tile > 1 and (height < tile * 2 or width < tile * 2):
-        tile //= 2
-    if tile < 2:
-        return crop
-    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
-    lightness, channel_a, channel_b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(tile, tile))
-    boosted = clahe.apply(lightness)
-    lightness = lightness.copy()
-    lightness[mask] = boosted[mask]
-    merged = cv2.merge((lightness, channel_a, channel_b))
-    return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
-
-
 def prepare_cutout(
     crop: np.ndarray,
     alpha: np.ndarray,
-    plate_patch: np.ndarray,
     *,
     plate_is_ir: bool,
-    plate_is_dark: bool,
 ) -> np.ndarray:
     """Fit a cutout to the plate it is about to be pasted on.
 
-    Color on an infrared plate becomes gray. A large brightness gap is
-    closed by matching mean and contrast to the local plate. Infrared and
-    dark plates then get a mild contrast boost.
+    A color cutout on an infrared plate becomes gray, which happens for a
+    few seconds around the switch. Nothing else changes. Brightness and
+    contrast used to be matched to the plate under the object, which made
+    a car on a dark road the same gray as the road.
     """
-    if crop.shape[:2] != plate_patch.shape[:2] or crop.shape[:2] != alpha.shape[:2]:
+    if crop.shape[:2] != alpha.shape[:2]:
         return crop
     mask = alpha >= 32
     if not np.any(mask):
         return crop
-    work = crop
-    if plate_is_ir and _region_is_color(work, mask):
-        gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
-        work = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    source = _luma(work)[mask]
-    target = _luma(plate_patch)[mask]
-    bright_gap = abs(float(source.mean()) - float(target.mean()))
-    if plate_is_ir or bright_gap >= BRIGHT_DELTA:
-        work = _match_luma(work, plate_patch, mask)
-    if plate_is_ir or plate_is_dark:
-        work = _clahe(work, mask)
-    return work
+    if plate_is_ir and _region_is_color(crop, mask):
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    return crop

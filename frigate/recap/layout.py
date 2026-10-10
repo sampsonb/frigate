@@ -389,11 +389,18 @@ def schedule_units(
     cell: int = 24,
     max_delay: int = 30,
     max_active: int = 8,
+    max_overlap: float = 0.1,
 ) -> tuple[list[int], int]:
     """Place units on the synopsis timeline with little spatial overlap.
 
     Linked units (a parked car tied to a person) start on the same frame
     as the person. Returns ``(start frame per unit, total frames)``.
+
+    When the objects do not fit in ``target_frames`` without touching,
+    some overlap is allowed, but never more than ``max_overlap`` of an
+    object's own footprint. Past that the video runs longer instead.
+    Stacking cars on the same stretch of road is what made a busy
+    afternoon unreadable.
     """
     if not units:
         return [], 1
@@ -493,15 +500,14 @@ def schedule_units(
         return starts, min(length, horizon)
 
     starts, length = place(0.0)
-    if length <= target_frames:
+    cap = max(0.0, float(max_overlap))
+    if length <= target_frames or cap <= 0:
         return starts, length
-    low, high = 0.0, 0.5
-    placed = place(high)
-    while placed[1] > target_frames and high <= 64:
-        low, high = high, high * 2
-        placed = place(high)
-    best = placed
-    for _ in range(7):
+    placed = place(cap)
+    if placed[1] > target_frames:
+        return placed
+    low, high, best = 0.0, cap, placed
+    for _ in range(6):
         mid = (low + high) / 2
         trial = place(mid)
         if trial[1] <= target_frames:

@@ -5,8 +5,8 @@ overlaps the last build. Cutting an object out of its recording is the
 slow part, so the finished ghost frames for each event are kept on disk
 and reused. The key covers everything that changes the pixels: the
 event id and end time, the output size, the sample rate, the per-object
-time cap, the category, and ``CACHE_VERSION``. Entries not used for
-``MAX_AGE_HOURS`` are deleted.
+time cap, the category, the camera's time shift, and ``CACHE_VERSION``.
+Entries not used for ``MAX_AGE_HOURS`` are deleted.
 """
 
 from __future__ import annotations
@@ -27,7 +27,9 @@ from frigate.const import RECAP_DIR
 logger = logging.getLogger(__name__)
 
 # Bump when cutout, sampling, or the stored layout changes.
-CACHE_VERSION = 1
+# 2: path boxes aligned to the recording, clip window around the best view,
+# window ghosts for infrared and dusk.
+CACHE_VERSION = 2
 # Longest window a cached cutout is useful for (72 hours) plus slack.
 MAX_AGE_HOURS = 74.0
 # A failed cutout is only cached once the recording is surely written.
@@ -46,6 +48,7 @@ def cache_key(
     sample_fps: float,
     max_object_seconds: float,
     category: str,
+    time_shift: float = 0.0,
 ) -> str:
     """Stable digest for one event's cutouts.
 
@@ -63,6 +66,7 @@ def cache_key(
             round(float(sample_fps), 3),
             round(float(max_object_seconds), 3),
             str(category),
+            round(float(time_shift), 3),
         ],
         separators=(",", ":"),
     )
@@ -79,6 +83,7 @@ class CachedCutout:
     times: list[float] = field(default_factory=list)
     context_first: bytes | None = None
     context_last: bytes | None = None
+    still: bool = False
 
 
 @dataclass
@@ -121,6 +126,7 @@ def load(key: str, root: Path | None = None) -> CachedCutout | None:
         times=[float(item) for item in data.get("times") or []],
         context_first=data.get("context_first"),
         context_last=data.get("context_last"),
+        still=bool(data.get("still")),
     )
 
 
@@ -134,6 +140,7 @@ def store(key: str, entry: CachedCutout, root: Path | None = None) -> bool:
         "times": [float(item) for item in entry.times],
         "context_first": entry.context_first,
         "context_last": entry.context_last,
+        "still": bool(entry.still),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,6 +175,7 @@ def pack_frames(ghost_frames: list[Any]) -> list[dict[str, Any]]:
                 "jpeg": ghost.jpeg,
                 "alpha_shape": tuple(int(v) for v in ghost.alpha_shape),
                 "alpha_bytes": ghost.alpha_bytes,
+                "window": bool(getattr(ghost, "window", False)),
             }
         )
     return packed

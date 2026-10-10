@@ -31,7 +31,6 @@ from frigate.recap.plates import (
     plate_index_at,
     prepare_cutout,
     recede_plate,
-    tighten_night_vehicle,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +51,9 @@ class GhostFrame:
     jpeg: bytes | None = None
     alpha_shape: tuple[int, int] | None = None
     alpha_bytes: bytes | None = None
+    # A padded box copied as recorded, rather than a motion mask. It is
+    # drawn with an outline in the category color, day or night.
+    window: bool = False
 
     def pixels(self) -> tuple[np.ndarray, np.ndarray] | None:
         if self.crop is not None and self.alpha is not None:
@@ -96,6 +98,8 @@ class Tube:
     # be cropped from a moment when the person is not standing in front of it.
     context_first: bytes | None = None
     context_last: bytes | None = None
+    # Frigate's snapshot held in place rather than a clip.
+    still: bool = False
 
     def context_image(self, which: str) -> np.ndarray | None:
         raw = self.context_last if which == "last" else self.context_first
@@ -309,18 +313,16 @@ def _paste_ghost(
     alpha_scale: float,
     *,
     plate_is_ir: bool,
-    plate_is_dark: bool,
     outline: tuple[int, int, int] | None,
-    plate: np.ndarray | None = None,
-    category: str = "",
 ) -> tuple[bool, tuple[int, int] | None]:
     """Paint a ghost. False when nothing visible landed on the canvas.
 
     The returned point is the centroid of the mask that was painted,
     which is where the leader should end. None with a True result means
-    the ghost was painted but it is too small or too close to the plate
-    for a label. ``plate`` is the undimmed background used to match the
-    cutout. The ghost is painted onto ``canvas``, which may already be dimmed.
+    the ghost was painted but it is too small for a label. The pixels are
+    drawn as recorded. Only a color cutout on an infrared plate is turned
+    gray. Matching a cutout's brightness to the road under it is what made
+    night cars and people look transparent.
     """
     pixels = ghost.pixels()
     if pixels is None or alpha_scale <= 0.01:
@@ -339,26 +341,7 @@ def _paste_ghost(
     visible, _tip = cutout_is_visible(alpha, ghost.box, x0, y0, width, height)
     if not visible:
         return False, None
-    source = plate if plate is not None else canvas
-    region = source[y0:y1, x0:x1]
-    # Difference tightening is only for infrared vehicles. Day cutouts
-    # and people keep the mask they were stored with.
-    if plate_is_ir and category == "vehicle":
-        tightened = tighten_night_vehicle(crop, alpha, region, ghost.box, x0, y0)
-        if tightened is None:
-            return False, None
-        if tightened is not alpha:
-            alpha = solid_feather(tightened)
-            visible, _tip = cutout_is_visible(alpha, ghost.box, x0, y0, width, height)
-            if not visible:
-                return False, None
-    fitted = prepare_cutout(
-        crop,
-        alpha,
-        region,
-        plate_is_ir=plate_is_ir,
-        plate_is_dark=plate_is_dark,
-    )
+    fitted = prepare_cutout(crop, alpha, plate_is_ir=plate_is_ir)
     if outline is not None:
         _paint_outline(canvas, x0, y0, alpha, outline, alpha_scale)
     dest = canvas[y0:y1, x0:x1]
@@ -368,7 +351,7 @@ def _paste_ghost(
     )
     dest[:] = blended.astype(np.uint8)
     anchor = mask_centroid(alpha, x0, y0)
-    if anchor is None or not label_should_draw(alpha, width, height, crop, region):
+    if anchor is None or not label_should_draw(alpha):
         return True, None
     return True, anchor
 
@@ -485,15 +468,13 @@ def compose_frame(
             len(tube.frames) - 1, (frame_index - starts[index]) // repeat
         )
         color = CAT_COLOR.get(unit.category, (255, 255, 255))
+        ghost = tube.frames[source_index]
         drawn, tip = _paste_ghost(
             canvas,
-            tube.frames[source_index],
+            ghost,
             ghost_alpha,
             plate_is_ir=plate_is_ir,
-            plate_is_dark=plate_is_dark,
-            outline=color if night else None,
-            plate=plate,
-            category=unit.category,
+            outline=color if (night or ghost.window) else None,
         )
         if drawn and tip is not None:
             shown.add(index)

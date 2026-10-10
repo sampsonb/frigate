@@ -13,7 +13,7 @@ import logging
 import time
 from typing import Any
 
-from frigate.models import Event, Recordings
+from frigate.models import Event, Recordings, Timeline
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,47 @@ def load_events(
         if row is not None:
             events.append(row)
     return events
+
+
+def attach_timeline(events: list[dict[str, Any]], chunk: int = 400) -> None:
+    """Add each event's timeline boxes as ``event["timeline"]``.
+
+    Frigate writes a timeline row with the exact detector box when an
+    object is first seen, enters a zone, stops or starts, and is last
+    seen. ``path_data`` only has the foot point, and only after the object
+    moved far enough, so these rows are the only exact sizes. The last
+    row is also the only record of when the object left: the event stays
+    open a few seconds longer. Each entry is
+    ``[timestamp, class_type, [x, y, w, h]]`` in normalized units.
+    """
+    found: dict[str, list[list[Any]]] = {str(event["id"]): [] for event in events}
+    ids = list(found)
+    for first in range(0, len(ids), max(1, chunk)):
+        query = (
+            Timeline.select(
+                Timeline.source_id,
+                Timeline.timestamp,
+                Timeline.class_type,
+                Timeline.data,
+            )
+            .where(Timeline.source_id.in_(ids[first : first + chunk]))
+            .order_by(Timeline.timestamp.asc())
+        )
+        for row in query:
+            box = _event_data(row.data).get("box")
+            if not isinstance(box, (list, tuple)) or len(box) < 4:
+                continue
+            try:
+                entry = [
+                    float(row.timestamp),
+                    str(row.class_type or ""),
+                    [float(value) for value in box[:4]],
+                ]
+            except (TypeError, ValueError):
+                continue
+            found.setdefault(str(row.source_id), []).append(entry)
+    for event in events:
+        event["timeline"] = found.get(str(event["id"]), [])
 
 
 def event_fingerprint(
