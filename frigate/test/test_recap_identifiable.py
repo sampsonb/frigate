@@ -274,7 +274,7 @@ class TestDaylightCutouts(unittest.TestCase):
         return frames, boxes
 
     def test_a_missing_frame_holds_the_car_instead_of_an_empty_window(self):
-        present = [index < 5 for index in range(24)]
+        present = [index < 5 or index >= 19 for index in range(24)]
         frames, boxes = self._moving(present)
         ghosts = build_cutouts(frames, boxes, "vehicle")
         assert ghosts is not None
@@ -286,8 +286,39 @@ class TestDaylightCutouts(unittest.TestCase):
             self.assertGreater(int(strong.sum()), 50, index)
             # Red car pixels, not road, wherever the ghost is drawn.
             self.assertGreater(float(crop[strong][:, 2].mean()), 150, index)
-        self.assertTrue(all(ghost.get("held") for ghost in ghosts[14:]))
+        self.assertTrue(
+            all(ghost.get("held") or ghost.get("repaired") for ghost in ghosts[5:19])
+        )
         self.assertFalse(any(ghost.get("held") for ghost in ghosts[:5]))
+
+    def test_a_car_that_is_gone_is_not_frozen_on_the_road(self):
+        present = [index < 5 for index in range(24)]
+        frames, boxes = self._moving(present)
+        ghosts = build_cutouts(frames, boxes, "vehicle")
+        assert ghosts is not None
+        self.assertTrue(
+            all(int(np.asarray(g["alpha"]).max()) > 200 for g in ghosts[:5])
+        )
+        # Past the few frames a neighbor can fill, the frames are left out.
+        tail = ghosts[13:]
+        self.assertTrue(all(int(np.asarray(g["alpha"]).max()) < 8 for g in tail))
+        self.assertFalse(any(g.get("held") or g.get("window") for g in tail))
+
+    def test_a_box_that_ran_ahead_snaps_back_onto_the_car(self):
+        frames, boxes = self._moving([True] * 12, step=16)
+        # Speeding up between two sparse path points, the box runs a car
+        # length ahead for the last half of the clip.
+        ahead = boxes[:6] + [
+            (b[0] + CAR_W, b[1], b[2] + CAR_W, b[3]) for b in boxes[6:]
+        ]
+        ghosts = build_cutouts(frames, ahead, "vehicle")
+        assert ghosts is not None
+        for index, ghost in enumerate(ghosts):
+            crop = np.asarray(ghost["crop"])
+            alpha = np.asarray(ghost["alpha"])
+            strong = alpha > 200
+            self.assertGreater(int(strong.sum()), 50, index)
+            self.assertGreater(float(crop[strong][:, 2].mean()), 150, index)
 
     def test_a_loose_box_does_not_bring_road_along(self):
         # A street car crosses most of its own length every frame.
@@ -361,7 +392,7 @@ class TestSnapshots(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertGreater(len(cut.frames), 8)
 
-    def test_object_missing_from_much_of_its_clip_is_its_snapshot(self):
+    def test_object_lost_by_the_recording_moves_while_it_is_seen(self):
         event = _event()
         # The recording loses the car after half a second (a hole the path
         # does not know about), so most frames would only repeat it.
@@ -395,13 +426,19 @@ class TestSnapshots(unittest.TestCase):
                 load_snapshot=lambda _event: _scene(1.0),
             )
         self.assertEqual(cut.status, "ok")
-        self.assertTrue(cut.still)
+        # Seeing it move for a moment beats a snapshot frozen in the road.
+        self.assertFalse(cut.still)
+        self.assertLess(max(cut.times) - min(cut.times), 1.6)
 
-    def test_path_that_does_not_line_up_falls_back_to_the_snapshot(self):
+    def test_a_path_that_stands_still_is_followed_to_the_car(self):
+        # The path says the car never moved. The cutout follows the car it
+        # finds next to the box instead of freezing it at the box.
         cut, calls = self._cut(_event(path_moves=False), DAYLIGHT)
         self.assertEqual(cut.status, "ok")
-        self.assertTrue(cut.still)
+        self.assertFalse(cut.still)
         self.assertEqual(len(calls), 1)
+        lefts = [box[0] for box in cut.boxes]
+        self.assertGreater(lefts[-1] - lefts[0], 100)
 
     def test_cache_keeps_the_still_flag_and_the_shift(self):
         a = cutcache.cache_key("e", 1.0, 320, 180, 8.0, 12.0, "vehicle", 0.0)

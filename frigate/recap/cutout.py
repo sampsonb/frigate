@@ -16,6 +16,7 @@ road.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Sequence
 
 import cv2
 import numpy as np
@@ -25,7 +26,7 @@ from frigate.recap.plates import frame_is_ir, mostly_off_frame
 
 # Vehicle masks wider than this are computed on a smaller image and scaled
 # back. A distant car stays at full resolution so its few pixels are not lost.
-_MASK_LONG_SIDE = 160
+_MASK_LONG_SIDE = 256
 # Interior of a cutout is fully opaque. Only this many pixels of edge fade.
 FEATHER_PX = 3
 # Median plate samples. More frames do not make a cleaner plate once the
@@ -35,10 +36,22 @@ _PLATE_SAMPLES = 9
 # noise and headlights make the motion mask unreliable, so windows are used.
 DIM_LUMA = 80.0
 # Mask area over detector box area. Past this the mask has spread into the
-# road or the yard, and the track is drawn as windows instead.
-_MAX_MASK_RATIO = {"vehicle": 1.8, "person": 3.2, "animal": 3.2, "delivery": 3.2}
+# road or the yard, and the track is drawn as windows instead. A vehicle's
+# mask is already held to its own rows and length (``_vehicle_motion``,
+# ``_vehicle_length``), and its box is often much smaller than the vehicle
+# (only the part the detector saw, or a size between two timeline samples).
+_MAX_MASK_RATIO = {"vehicle": 4.5, "person": 3.2, "animal": 3.2, "delivery": 3.2}
 # Share of frames that must have a believable mask to keep the mask look.
 _PLAUSIBLE_SHARE = 0.6
+# A detector box often covers only the part of a vehicle it can see: a
+# planter or a tree trunk in front of a parked truck splits it in two. Its
+# mask looks this many box heights past the box on each side, for pieces at
+# the vehicle's height, while the whole keeps a vehicle's proportions.
+VEHICLE_REACH = 1.3
+VEHICLE_MAX_ASPECT = 3.2
+# A piece of a vehicle's outline smaller than this share of the largest is
+# noise. Anything bigger is part of it: the half on the far side of a pole.
+_PIECE_SHARE = 0.08
 
 
 def _half_extents(
@@ -80,12 +93,14 @@ def search_window(
     height: int,
     span: tuple[float, float, float, float] | None = None,
     travel: float = 0.0,
+    reach: bool = True,
 ) -> tuple[int, int, int, int]:
     """Padded region to segment. The object has to fit inside it.
 
     Sides grow by about 12% of the union box. People and animals also get
     about 20% above the box, and vehicles get more room on the side they
-    are moving toward.
+    are moving toward and, with ``reach``, ``VEHICLE_REACH`` box heights on
+    each side for the pieces of a vehicle the box missed.
     """
     cx = (box[0] + box[2]) * 0.5
     cy = (box[1] + box[3]) * 0.5
@@ -116,6 +131,11 @@ def search_window(
         pad_bottom = max(0.12 * box_h, 0.25 * box_h)
     elif category == "vehicle":
         pad_top = 0.12 * box_h
+        if reach:
+            pad_x = max(pad_x, VEHICLE_REACH * box_h)
+            # Between Frigate's size samples the box can be well short of
+            # the roof.
+            pad_top = 0.6 * box_h
         pad_bottom = 0.12 * box_h
         # The nose sticks out ahead of a lagging detector box.
         if abs(travel) >= 0.5:
@@ -164,7 +184,11 @@ def clean_background(
     exclude = np.zeros((len(chosen), height, width), dtype=bool)
     for sample, index in enumerate(chosen):
         box = boxes[int(index)]
-        x0, y0, x1, y1 = search_window(box, category, width, height, span, travel)
+        # The tight window: a vehicle's wide search window, repeated along
+        # its path, would leave no clean sample anywhere it drove.
+        x0, y0, x1, y1 = search_window(
+            box, category, width, height, span, travel, reach=False
+        )
         if y1 > y0 and x1 > x0:
             exclude[sample, y0:y1, x0:x1] = True
     background = np.median(stack, axis=0)
@@ -292,18 +316,48 @@ def attach_motion(
     fg_thresh: int = 22,
     span: tuple[float, float, float, float] | None = None,
     travel: float = 0.0,
+    avoid: Sequence[tuple[float, float, float, float]] = (),
+    settled: bool = False,
 ) -> tuple[int, int, np.ndarray]:
+    """Mask of the tracked object plus motion connected to it (see ``_attach``)."""
+    x, y, mask, _moved = _attach(
+        frame, background, box, category, fg_thresh, span, travel, avoid, settled
+    )
+    return x, y, mask
+
+
+def _attach(
+    frame: np.ndarray,
+    background: np.ndarray,
+    box: tuple[float, float, float, float],
+    category: str,
+    fg_thresh: int = 22,
+    span: tuple[float, float, float, float] | None = None,
+    travel: float = 0.0,
+    avoid: Sequence[tuple[float, float, float, float]] = (),
+    settled: bool = False,
+) -> tuple[int, int, np.ndarray, tuple[float, float]]:
     """Mask of the tracked object plus motion connected to it.
 
     Returns ``(x, y, mask)`` in full-frame coordinates. The mask is 0/1.
     People search well outside the detector box so a ridden or pushed
-    object is included. Vehicles stay tight so the road is not smeared in.
+    object is included. Vehicles stay tight so the road is not smeared in,
+    but keep their pieces past an occluder (see ``VEHICLE_REACH``). Those
+    pieces are never taken from inside ``avoid``, the boxes of the other
+    objects in the frame. ``settled`` means the box hardly moves between
+    samples (see ``_motion_pieces``). Also returns how far the box was moved
+    onto the object, in frame pixels, ``(0, 0)`` when it was not.
     """
     height, width = frame.shape[:2]
     box_h = max(1.0, box[3] - box[1])
     x0, y0, x1, y1 = search_window(box, category, width, height, span, travel)
     if x1 - x0 < 4 or y1 - y0 < 4:
-        return x0, y0, np.zeros((max(1, y1 - y0), max(1, x1 - x0)), np.uint8)
+        return (
+            x0,
+            y0,
+            np.zeros((max(1, y1 - y0), max(1, x1 - x0)), np.uint8),
+            (0.0, 0.0),
+        )
     crop = frame[y0:y1, x0:x1]
     plate = background[y0:y1, x0:x1]
     local = (box[0] - x0, box[1] - y0, box[2] - x0, box[3] - y0)
@@ -314,9 +368,27 @@ def attach_motion(
     if category == "vehicle":
         diff = cv2.absdiff(work_crop, work_plate).max(axis=2)
         thresh = _object_threshold(diff, core, category, fg_thresh)
-        motion = _foreground(work_crop, work_plate, diff, thresh)
+        motion = _vehicle_motion(diff, thresh, work_box)
     else:
         motion = _motion(work_crop, work_plate, fg_thresh)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        (motion > 0).astype(np.uint8), connectivity=8
+    )
+    work_avoid = _scaled_boxes(avoid, x0, y0, crop.shape[:2], work_crop.shape[:2])
+    snapped = _snap_to_motion(labels, stats, count, core, work_box, motion, work_avoid)
+    moved = (0.0, 0.0)
+    if snapped is not None:
+        moved = (
+            (snapped[0] - work_box[0]) * crop.shape[1] / max(1, work_crop.shape[1]),
+            (snapped[1] - work_box[1]) * crop.shape[0] / max(1, work_crop.shape[0]),
+        )
+        work_box = snapped
+        core = _seed(work_crop.shape[:2], work_box, category)
+        if category == "vehicle":
+            motion = _vehicle_motion(diff, thresh, work_box)
+            count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                (motion > 0).astype(np.uint8), connectivity=8
+            )
     seed = cv2.dilate(core, np.ones((7, 7), np.uint8))
     if category in ("person", "animal"):
         # The head sits above the detector box. Reach into that band so it
@@ -325,9 +397,6 @@ def attach_motion(
         seed = cv2.dilate(
             seed, cv2.getStructuringElement(cv2.MORPH_RECT, (3, reach * 2 + 1))
         )
-    _count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(
-        (motion > 0).astype(np.uint8), connectivity=8
-    )
     extra = np.zeros_like(core)
     core_area = max(1, int(core.sum()))
     touched = np.unique(labels[(seed > 0) & (motion > 0)])
@@ -338,28 +407,63 @@ def attach_motion(
     if category == "person":
         extra_limit = int(0.72 * window_area)
     elif category == "vehicle":
-        extra_limit = max(2 * core_area, int(0.2 * window_area))
+        # Each piece is already held to a vehicle's rows and length. The box
+        # can be a third of the car between Frigate's size samples.
+        extra_limit = max(6 * core_area, int(0.5 * window_area))
     else:
         extra_limit = int(0.5 * window_area)
     for label in touched:
         if int(label) == 0:
             continue
         component = labels == label
+        if category == "vehicle":
+            component = _vehicle_length(component, work_box)
         added = int((component & (core == 0)).sum())
         if added < extra_limit:
             extra |= component.astype(np.uint8)
+    if category == "vehicle":
+        extra |= _vehicle_pieces_beyond(
+            labels,
+            stats,
+            count,
+            set(int(label) for label in touched),
+            core | extra,
+            work_box,
+            work_avoid,
+        )
+        # The far side of an occluder is often black paint over dark road,
+        # well under a threshold set by the bright side. It is looked for
+        # again at half the threshold, held to the same height and length.
+        weak = _vehicle_motion(diff, max(6, thresh // 2), work_box)
+        weak[(core | extra) > 0] = 0
+        weak_count, weak_labels, weak_stats, _weak_centroids = (
+            cv2.connectedComponentsWithStats(weak, connectivity=8)
+        )
+        extra |= _vehicle_pieces_beyond(
+            weak_labels,
+            weak_stats,
+            weak_count,
+            set(),
+            core | extra,
+            work_box,
+            work_avoid,
+        )
     kept_core = core
     if category == "vehicle":
         extra = cv2.morphologyEx(extra, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         # Only the part of the detector box that differs from the plate. A
         # loose box otherwise brings a rectangle of road along, which shows
-        # as a pale halo around the car on the recap's plate. A car that has
-        # stood still long enough to be in the plate keeps the whole box.
+        # as a pale halo around the car on the recap's plate. A box that
+        # hardly differs is either a slow car that is part of its own clip's
+        # plate, kept whole, or a moving box on empty road (the path ran
+        # ahead of the car, or it has left), which is repaired or dropped.
         differs = cv2.dilate(
             (diff >= max(6, thresh // 2)).astype(np.uint8), np.ones((5, 5), np.uint8)
         )
         trimmed = core & differs
-        if int(trimmed.sum()) >= 0.25 * core_area:
+        if settled or int(trimmed.sum()) >= 0.25 * core_area:
+            kept_core = trimmed if int(trimmed.sum()) >= 0.25 * core_area else core
+        else:
             kept_core = trimmed
     mask = _smooth_contour(((kept_core > 0) | (extra > 0)).astype(np.uint8))
     if mask.shape[:2] != crop.shape[:2]:
@@ -368,7 +472,201 @@ def attach_motion(
             (crop.shape[1], crop.shape[0]),
             interpolation=cv2.INTER_NEAREST,
         )
-    return x0, y0, mask
+    return x0, y0, mask, moved
+
+
+def _vehicle_motion(
+    diff: np.ndarray, thresh: int, box: tuple[float, float, float, float]
+) -> np.ndarray:
+    """Where a vehicle differs from the plate, in the rows it spans.
+
+    The plain difference, without the shadow test: a black truck on a gray
+    road passes for a shadow and dropped out in pieces. Rows below the box
+    are left out, so headlight glare on a wet road does not join the car
+    into one huge piece that is then thrown away. Rows above are kept:
+    between Frigate's few size samples the box can be much smaller than the
+    car, and above it there is only the static street.
+    """
+    tall = max(1.0, box[3] - box[1])
+    top = int(max(0, np.floor(box[1] - 0.5 * tall)))
+    # The box bottom is the foot of the path, the one edge Frigate gets right.
+    # Below it is the car's reflection on a wet road, which looks pale.
+    bottom = int(min(diff.shape[0], np.ceil(box[3] + 0.06 * tall)))
+    motion = np.zeros(diff.shape, np.uint8)
+    motion[top:bottom] = (diff[top:bottom] > thresh).astype(np.uint8)
+    return cv2.morphologyEx(motion, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+
+def _vehicle_length(
+    component: np.ndarray, box: tuple[float, float, float, float]
+) -> np.ndarray:
+    """``component`` cut to the longest a vehicle of this height can be.
+
+    The height is the piece's own when it is taller than the box, which is
+    often too small between Frigate's size samples. The cut keeps the box
+    and slides to hold as much of the piece as it can: a box that lags the
+    car would otherwise cut off its front.
+    """
+    rows = np.flatnonzero(component.any(axis=1))
+    tall = max(1.0, box[3] - box[1])
+    if len(rows):
+        tall = max(tall, float(rows[-1] - rows[0] + 1))
+    width = component.shape[1]
+    length = int(np.ceil(VEHICLE_MAX_ASPECT * tall))
+    if length >= width:
+        return component
+    box_left = int(max(0, np.floor(box[0])))
+    box_right = int(min(width, np.ceil(box[2])))
+    lowest = max(0, box_right - length)
+    highest = min(width - length, box_left)
+    if highest < lowest:
+        # The box itself is longer than a vehicle can be: keep its middle.
+        lowest = highest = int(
+            np.clip(round((box[0] + box[2]) / 2 - length / 2), 0, width - length)
+        )
+    mass = np.concatenate(([0], np.cumsum(component.sum(axis=0, dtype=np.int64))))
+    starts = np.arange(lowest, highest + 1)
+    best = int(starts[np.argmax(mass[starts + length] - mass[starts])])
+    cut = np.zeros_like(component)
+    cut[:, best : best + length] = component[:, best : best + length]
+    return cut
+
+
+# Share of the detector box that has to move for the box to be trusted.
+_SNAP_SUPPORT = 0.2
+
+
+def _snap_to_motion(
+    labels: np.ndarray,
+    stats: np.ndarray,
+    count: int,
+    core: np.ndarray,
+    box: tuple[float, float, float, float],
+    motion: np.ndarray,
+    avoid: Sequence[tuple[float, float, float, float]],
+) -> tuple[float, float, float, float] | None:
+    """The box moved onto the object, when the path missed it.
+
+    Frigate's path is sparse, so a car speeding up runs ahead of its box and
+    the box sits on empty road. When almost nothing under the box moves and
+    a piece about the object's size moves nearby, outside the other objects'
+    boxes, the box is moved onto it. None when the box is fine or nothing
+    fits.
+    """
+    inside = core > 0
+    area = int(inside.sum())
+    if area < 16 or float((motion[inside] > 0).mean()) >= _SNAP_SUPPORT:
+        return None
+    box_w = max(1.0, box[2] - box[0])
+    box_h = max(1.0, box[3] - box[1])
+    center_x = (box[0] + box[2]) / 2
+    center_y = (box[1] + box[3]) / 2
+    best: tuple[float, float, float] | None = None
+    for label in range(1, count):
+        x = float(stats[label, cv2.CC_STAT_LEFT])
+        y = float(stats[label, cv2.CC_STAT_TOP])
+        width = float(stats[label, cv2.CC_STAT_WIDTH])
+        height = float(stats[label, cv2.CC_STAT_HEIGHT])
+        piece = int(stats[label, cv2.CC_STAT_AREA])
+        if not 0.25 * area <= piece <= 2.5 * area:
+            continue
+        if width < 0.4 * box_w or height < 0.4 * box_h:
+            continue
+        if any(
+            max(0.0, min(x + width, other[2]) - max(x, other[0]))
+            * max(0.0, min(y + height, other[3]) - max(y, other[1]))
+            > 0.3 * width * height
+            for other in avoid
+        ):
+            continue
+        middle_x, middle_y = x + width / 2, y + height / 2
+        distance = float(
+            np.hypot((middle_x - center_x) / box_w, (middle_y - center_y) / box_h)
+        )
+        if distance <= 1.5 and (best is None or distance < best[0]):
+            best = (distance, middle_x - center_x, middle_y - center_y)
+    if best is None:
+        return None
+    _distance, dx, dy = best
+    return (box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy)
+
+
+def _scaled_boxes(
+    boxes: Sequence[tuple[float, float, float, float]],
+    x0: int,
+    y0: int,
+    crop_shape: tuple[int, int],
+    work_shape: tuple[int, int],
+) -> list[tuple[float, float, float, float]]:
+    """Frame boxes in the coordinates of a (possibly shrunk) crop."""
+    sy = work_shape[0] / max(1, crop_shape[0])
+    sx = work_shape[1] / max(1, crop_shape[1])
+    return [
+        ((box[0] - x0) * sx, (box[1] - y0) * sy, (box[2] - x0) * sx, (box[3] - y0) * sy)
+        for box in boxes
+    ]
+
+
+def _vehicle_pieces_beyond(
+    labels: np.ndarray,
+    stats: np.ndarray,
+    count: int,
+    skip: set[int],
+    body: np.ndarray,
+    box: tuple[float, float, float, float],
+    avoid: Sequence[tuple[float, float, float, float]],
+) -> np.ndarray:
+    """Pieces of a vehicle the detector box missed, past an occluder.
+
+    ``body`` is the vehicle found so far. A piece has to sit at the
+    vehicle's height, be at least about a third of its height tall, stay
+    out of the other objects' boxes, and keep the whole vehicle no longer
+    than ``VEHICLE_MAX_ASPECT`` times its height. Nearest pieces are taken
+    first.
+    """
+    out = np.zeros(labels.shape, np.uint8)
+    top, bottom = box[1], box[3]
+    tall = max(1.0, bottom - top)
+    body_rows = np.flatnonzero(body.any(axis=1))
+    if len(body_rows):
+        tall = max(tall, float(body_rows[-1] - body_rows[0] + 1))
+    area = max(1, int(body.sum()))
+    columns = np.flatnonzero(body.any(axis=0))
+    if len(columns) == 0:
+        return out
+    left, right = float(columns[0]), float(columns[-1] + 1)
+    candidates: list[tuple[float, int]] = []
+    for label in range(1, count):
+        if label in skip:
+            continue
+        x = float(stats[label, cv2.CC_STAT_LEFT])
+        y = float(stats[label, cv2.CC_STAT_TOP])
+        width = float(stats[label, cv2.CC_STAT_WIDTH])
+        height = float(stats[label, cv2.CC_STAT_HEIGHT])
+        piece = int(stats[label, cv2.CC_STAT_AREA])
+        if piece < 0.03 * area or height < 0.35 * (box[3] - box[1]):
+            continue
+        inside = min(y + height, bottom + 0.1 * tall) - max(y, top - 0.6 * tall)
+        if inside < 0.7 * height:
+            continue
+        if any(
+            max(0.0, min(x + width, other[2]) - max(x, other[0]))
+            * max(0.0, min(y + height, other[3]) - max(y, other[1]))
+            > 0.3 * width * height
+            for other in avoid
+        ):
+            continue
+        gap = max(0.0, x - right, left - (x + width))
+        candidates.append((gap, label))
+    for _gap, label in sorted(candidates):
+        x = float(stats[label, cv2.CC_STAT_LEFT])
+        width = float(stats[label, cv2.CC_STAT_WIDTH])
+        new_left, new_right = min(left, x), max(right, x + width)
+        if new_right - new_left > VEHICLE_MAX_ASPECT * tall:
+            continue
+        out |= (labels == label).astype(np.uint8)
+        left, right = new_left, new_right
+    return out
 
 
 def _vehicle_view(
@@ -438,11 +736,18 @@ def _trace_outline(mask: np.ndarray) -> np.ndarray:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return mask
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < 8:
+    largest = max(cv2.contourArea(contour) for contour in contours)
+    if largest < 8:
         return mask
+    # Every sizable piece, not only the largest: a truck behind a planter is
+    # two pieces, and keeping one was the truck losing its front or back.
+    kept = [
+        contour
+        for contour in contours
+        if cv2.contourArea(contour) >= _PIECE_SHARE * largest
+    ]
     traced = np.zeros_like(mask)
-    cv2.drawContours(traced, [largest], -1, 1, -1)
+    cv2.drawContours(traced, kept, -1, 1, -1)
     return cv2.morphologyEx(traced, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
 
@@ -845,6 +1150,13 @@ def _shift_piece(
     return x + dx, y + dy, mask
 
 
+def _ghost_piece(ghost: dict[str, object]) -> tuple[int, int, np.ndarray]:
+    """A ghost's opaque part as a 0/1 mask at its place in the frame."""
+    alpha = ghost["alpha"]
+    assert isinstance(alpha, np.ndarray)
+    return int(ghost["x"]), int(ghost["y"]), (alpha > 128).astype(np.uint8)  # type: ignore[arg-type]
+
+
 def _reuse_ghost(
     cached: dict[str, object],
     source: tuple[float, float, float, float],
@@ -877,6 +1189,41 @@ def _reuse_ghost(
     return _clip_ghost(moved, width, height)
 
 
+def _slow(boxes: Sequence[tuple[float, float, float, float]], index: int) -> bool:
+    """True when the box moves less than a tenth of its size to a neighbor."""
+    box = boxes[index]
+    size = max(1.0, box[2] - box[0], box[3] - box[1])
+    for other in (index - 1, index + 1):
+        if 0 <= other < len(boxes):
+            near = boxes[other]
+            dx = (near[0] + near[2] - box[0] - box[2]) / 2
+            dy = (near[1] + near[3] - box[1] - box[3]) / 2
+            if float(np.hypot(dx, dy)) <= 0.1 * size:
+                return True
+    return False
+
+
+def _still_there(
+    frame: np.ndarray,
+    source: np.ndarray,
+    piece: tuple[int, int, np.ndarray],
+) -> bool:
+    """True when the pixels under a mask still look as they did."""
+    x, y, mask = piece
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 8:
+        return False
+    ys = ys + y
+    xs = xs + x
+    inside = (ys >= 0) & (xs >= 0) & (ys < frame.shape[0]) & (xs < frame.shape[1])
+    if not inside.any():
+        return False
+    ys, xs = ys[inside], xs[inside]
+    diff = np.abs(frame[ys, xs].astype(np.int16) - source[ys, xs].astype(np.int16))
+    # A tenth of the mask changing is a car that moved a few pixels.
+    return float((diff.max(axis=1) > 30).mean()) < 0.1
+
+
 def _motion_pieces(
     frames: list[np.ndarray],
     boxes: list[tuple[float, float, float, float]],
@@ -885,24 +1232,61 @@ def _motion_pieces(
     fg_thresh: int,
     span: tuple[float, float, float, float],
     travel: float,
-) -> list[tuple[int, int, np.ndarray]]:
-    """One mask per frame. Stable boxes reuse the last measured mask."""
+    avoid: Sequence[Sequence[tuple[float, float, float, float]]] | None = None,
+) -> tuple[list[tuple[int, int, np.ndarray]], list[tuple[float, float, float, float]]]:
+    """One mask per frame, and the box each one was cut at.
+
+    When a frame's box is moved onto the object (``_snap_to_motion``), the
+    move carries to the next frames, so the cutout follows the object even
+    where the path keeps missing it. A mask is reused for a box that barely
+    moved, only while the pixels under it still match: a path standing
+    still while the car drives off used to freeze the car in the road.
+    """
     pieces: list[tuple[int, int, np.ndarray]] = []
+    used: list[tuple[float, float, float, float]] = []
     source_piece: tuple[int, int, np.ndarray] | None = None
     source_box: tuple[float, float, float, float] | None = None
-    for frame, box in zip(frames, boxes, strict=True):
+    source_frame: np.ndarray | None = None
+    offset_x = offset_y = 0.0
+    for index, (frame, box) in enumerate(zip(frames, boxes, strict=True)):
+        guess = (
+            box[0] + offset_x,
+            box[1] + offset_y,
+            box[2] + offset_x,
+            box[3] + offset_y,
+        )
         if (
             source_piece is not None
             and source_box is not None
-            and _boxes_are_stable(source_box, box)
+            and source_frame is not None
+            and _boxes_are_stable(source_box, guess)
+            and _still_there(frame, source_frame, source_piece)
         ):
-            pieces.append(_shift_piece(source_piece, source_box, box))
+            pieces.append(_shift_piece(source_piece, source_box, guess))
+            used.append(guess)
             continue
-        piece = attach_motion(frame, background, box, category, fg_thresh, span, travel)
+        x, y, mask, (dx, dy) = _attach(
+            frame,
+            background,
+            guess,
+            category,
+            fg_thresh,
+            span,
+            travel,
+            avoid[index] if avoid is not None and index < len(avoid) else (),
+            _slow(boxes, index),
+        )
+        if dx or dy:
+            offset_x += dx
+            offset_y += dy
+            guess = (guess[0] + dx, guess[1] + dy, guess[2] + dx, guess[3] + dy)
+        piece = (x, y, mask)
         pieces.append(piece)
+        used.append(guess)
         source_piece = piece
-        source_box = box
-    return pieces
+        source_box = guess
+        source_frame = frame
+    return pieces, used
 
 
 def build_cutouts(
@@ -910,8 +1294,11 @@ def build_cutouts(
     boxes: list[tuple[float, float, float, float]],
     category: str,
     fg_thresh: int = 22,
+    avoid: Sequence[Sequence[tuple[float, float, float, float]]] | None = None,
 ) -> list[dict[str, object]] | None:
     """Feathered ghosts for one track, one entry per input frame.
+
+    ``avoid`` holds, per frame, the boxes of the other objects in it.
 
     A bad mask is repaired from a neighbor a few frames away. The crop
     comes from that neighbor, shifted with the box, so a short detection
@@ -928,8 +1315,8 @@ def build_cutouts(
     height, width = background.shape[:2]
     if needs_window(background):
         return window_ghosts(frames, boxes, category)
-    pieces = _motion_pieces(
-        frames, boxes, background, category, fg_thresh, span, travel
+    pieces, boxes = _motion_pieces(
+        frames, boxes, background, category, fg_thresh, span, travel, avoid
     )
     if not masks_plausible(pieces, boxes, category):
         return window_ghosts(frames, boxes, category)
@@ -1010,6 +1397,7 @@ def build_cutouts(
     missing: list[int] = []
     cached: dict[str, object] | None = None
     cached_box: tuple[float, float, float, float] | None = None
+    cached_frame: np.ndarray | None = None
     for index, (frame, box) in enumerate(zip(frames, boxes, strict=True)):
         if mostly_off_frame(box, width, height):
             # A box sitting on the frame edge used to keep a sliver and a
@@ -1022,7 +1410,9 @@ def build_cutouts(
         if (
             cached is not None
             and cached_box is not None
+            and cached_frame is not None
             and _boxes_are_stable(cached_box, box)
+            and _still_there(frame, cached_frame, _ghost_piece(cached))
         ):
             reused = _reuse_ghost(cached, cached_box, box, width, height)
             if reused is not None:
@@ -1053,6 +1443,7 @@ def build_cutouts(
             continue
         cached = ghost
         cached_box = box
+        cached_frame = frame
         ghosts.append(ghost)
     if missing:
         skipped = set(missing)
@@ -1066,6 +1457,10 @@ def build_cutouts(
         if not drawn:
             return window_ghosts(frames, boxes, category)
         for index in missing:
+            if index < drawn[0] or index > drawn[-1]:
+                # Before it is found or after it is gone: leave the frame out
+                # instead of freezing the object there.
+                continue
             donor = min(drawn, key=lambda item: abs(item - index))
             held = _reuse_ghost(
                 ghosts[donor], boxes[donor], boxes[index], width, height

@@ -35,6 +35,7 @@ from frigate.recap.clips import (
     render_faststart_mp4,
 )
 from frigate.recap.cutout import (
+    _attach,
     _smooth_contour,
     attach_motion,
     build_cutouts,
@@ -507,7 +508,7 @@ class TestCutout(unittest.TestCase):
             frame = plate.copy()
             frame[32:88, 42:118] = (0, 0, 210)
             frames.append(frame)
-        with patch("frigate.recap.cutout.attach_motion", wraps=attach_motion) as spy:
+        with patch("frigate.recap.cutout._attach", wraps=_attach) as spy:
             ghosts = build_cutouts(frames, [box] * 8, "vehicle")
         self.assertEqual(spy.call_count, 1)
         self.assertIsNotNone(ghosts)
@@ -531,7 +532,7 @@ class TestCutout(unittest.TestCase):
             frame[40:100, x : x + 50] = (0, 0, 210)
             frames.append(frame)
             boxes.append((float(x), 40.0, float(x + 50), 100.0))
-        with patch("frigate.recap.cutout.attach_motion", wraps=attach_motion) as spy:
+        with patch("frigate.recap.cutout._attach", wraps=_attach) as spy:
             ghosts = build_cutouts(frames, boxes, "vehicle")
         self.assertEqual(spy.call_count, 4)
         self.assertIsNotNone(ghosts)

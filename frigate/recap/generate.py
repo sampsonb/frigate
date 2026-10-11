@@ -493,11 +493,21 @@ def vehicle_pieces(
     pieces: list[tuple[float, float]] = []
     stop_at = _box_foot(first_box)
     if float(np.hypot(feet[0][1] - stop_at[0], feet[0][2] - stop_at[1])) >= MOVE_SPAN:
+        # Frigate marks it stationary about ten seconds after it stops. It
+        # stopped where its path settled at the spot, and ten seconds of a
+        # parked car would swamp the alignment of the drive in.
+        settled = stopped
+        for moment, x, y in reversed(feet):
+            if moment > stopped:
+                continue
+            if float(np.hypot(x - stop_at[0], y - stop_at[1])) >= MOVE_SPAN / 2:
+                break
+            settled = moment
         pieces.append(
             _window_in(
                 event,
                 start,
-                min(end, stopped + PIECE_SETTLE),
+                min(end, settled + PIECE_SETTLE),
                 max_seconds,
                 later_wins=True,
             )
@@ -913,6 +923,19 @@ def _vehicle_stays(
     return joined
 
 
+def _ghost_extent(frame: GhostFrame) -> tuple[float, float, float, float] | None:
+    """Rectangle a ghost frame covers."""
+    shape = frame.alpha.shape[:2] if frame.alpha is not None else frame.alpha_shape
+    if not shape:
+        return None
+    return (
+        float(frame.x),
+        float(frame.y),
+        float(frame.x + shape[1]),
+        float(frame.y + shape[0]),
+    )
+
+
 def _parked_patches(
     stays: Sequence[_Stay],
     units: Sequence[ScheduledUnit],
@@ -933,6 +956,22 @@ def _parked_patches(
     """
     if not stays or not plates:
         return [], list(plates)
+    tube_of = {tube.event_id: tube for tube in tubes}
+    for stay in stays:
+        # Frigate's box is only what it saw. A planter in front of a parked
+        # truck leaves its bed outside the box, but not outside its cutout.
+        for index, which in ((stay.arrival, -1), (stay.departure, 0)):
+            tube = tube_of.get(units[index].event_id) if index is not None else None
+            if tube is None or not tube.frames or tube.frames[which].window:
+                continue
+            extent = _ghost_extent(tube.frames[which])
+            if extent is not None and _box_iou(extent, stay.box) > 0.2:
+                stay.box = (
+                    min(stay.box[0], extent[0]),
+                    min(stay.box[1], extent[1]),
+                    max(stay.box[2], extent[2]),
+                    max(stay.box[3], extent[3]),
+                )
     cleaned = clean_plates(
         plates,
         samples,
@@ -940,7 +979,6 @@ def _parked_patches(
         width,
         height,
     )
-    tube_of = {tube.event_id: tube for tube in tubes}
     lit = [
         (float(moment), frame, frame_is_ir(frame))
         for moment, frame in samples
@@ -1199,6 +1237,16 @@ def generate_recap(
             stats=stats,
             time_shift=time_shift,
             load_snapshot=load_snapshot,
+            others=(
+                [
+                    other
+                    for other, _other_category, _other_track in active
+                    if str(other.get("source_id") or other["id"])
+                    != str(event.get("source_id") or event["id"])
+                ]
+                if category == "vehicle"
+                else ()
+            ),
         )
         if cut.status == "no_frames":
             excluded.append(
@@ -1696,13 +1744,13 @@ def _too_many_held(ghosts: list[dict[str, object]]) -> bool:
     """True when the object was missing from many frames of its clip.
 
     Those frames reuse a neighbor's ghost (repaired) or the nearest good
-    one (held). A few are invisible. More than about a third looks like a
-    sticker sliding along the road.
+    one (held). A few are invisible. More than half looks like a sticker
+    sliding along the road.
     """
     if not ghosts:
         return False
     filled = sum(1 for ghost in ghosts if ghost.get("held") or ghost.get("repaired"))
-    return filled * 10 > 3 * len(ghosts)
+    return filled * 2 > len(ghosts)
 
 
 def _mostly_windows(ghosts: list[dict[str, object]]) -> bool:
@@ -1715,6 +1763,36 @@ def _mostly_windows(ghosts: list[dict[str, object]]) -> bool:
     if not drawn:
         return True
     return sum(1 for ghost in drawn if ghost.get("window")) * 2 > len(drawn)
+
+
+def _others_in(
+    others: Sequence[dict[str, Any]],
+    times: Sequence[float],
+    width: int,
+    height: int,
+    shift: float,
+) -> list[list[tuple[float, float, float, float]]]:
+    """Boxes of the other objects at each recording time."""
+    result: list[list[tuple[float, float, float, float]]] = [[] for _ in times]
+    if not times:
+        return result
+    first, last = min(times) + shift, max(times) + shift
+    for other in others:
+        start, _end = _event_span(other)
+        seen = last_seen(other)
+        if seen < first - 1 or start > last + 1:
+            continue
+        index = [
+            position
+            for position, moment in enumerate(times)
+            if start - 0.5 <= moment + shift <= seen + 0.5
+        ]
+        if not index:
+            continue
+        boxes = boxes_at(other, [times[item] for item in index], width, height, shift)
+        for position, box in zip(index, boxes, strict=False):
+            result[position].append(box)
+    return result
 
 
 def _cutouts_for(
@@ -1731,8 +1809,12 @@ def _cutouts_for(
     stats: cutcache.CacheStats,
     time_shift: float = 0.0,
     load_snapshot: LoadSnapshot | None = None,
+    others: Sequence[dict[str, Any]] = (),
 ) -> _Cut:
     """Ghost frames for one event, from the cache when possible.
+
+    ``others`` are the other events in the recap. A vehicle's cutout never
+    takes a piece from inside one of their boxes.
 
     A moving cutout is used when the clip is well lit and the path lines
     up with the recording. Otherwise, and whenever the clip is infrared
@@ -1843,10 +1925,10 @@ def _cutouts_for(
         valid=(window_start, window_end),
     )
     shift = aligned.seconds
-    if aligned.fill < ALIGNED_FILL:
-        held = still(f"path does not line up, fill {aligned.fill:.2f}")
-        if held is not None and held.status == "ok":
-            return held
+    # A daylight object whose path does not line up is still cut out moving:
+    # each frame's box snaps onto the motion near it (``attach_motion``).
+    # Only when that fails is it held as its snapshot. Seeing it move, even
+    # roughly, beats a car frozen in the road.
     keep = [
         index
         for index, moment in enumerate(times)
@@ -1867,7 +1949,12 @@ def _cutouts_for(
     boxes = boxes_at(event, times, width, height, shift)
     if not boxes:
         return _Cut(status="no_box")
-    ghosts = build_cutouts(frames, boxes, category)
+    avoid = (
+        _others_in(others, times, width, height, shift)
+        if category == "vehicle" and others
+        else None
+    )
+    ghosts = build_cutouts(frames, boxes, category, avoid=avoid)
     if ghosts and _mostly_windows(ghosts):
         held = still("mask did not hold")
         if held is not None and held.status == "ok":
@@ -1908,12 +1995,14 @@ def _cutouts_for(
     packed: list[dict[str, Any]] = []
     kept_boxes: list[tuple[float, float, float, float]] = []
     kept_times: list[float] = []
-    for ghost_frame, box, moment in zip(ghost_frames, boxes, times):
+    for ghost_frame, moment in zip(ghost_frames, times):
         item = cutcache.pack_frames([ghost_frame])
         if not item:
             continue
         packed.append(item[0])
-        kept_boxes.append(tuple(float(v) for v in box))  # type: ignore[arg-type]
+        # The box the ghost was cut at: moved onto the object where the
+        # path missed it, so labels sit by the object.
+        kept_boxes.append(tuple(float(v) for v in ghost_frame.box))  # type: ignore[arg-type]
         # Detector time, like a still's best moment, so tracks compare.
         kept_times.append(float(moment) + shift)
     if not packed:
