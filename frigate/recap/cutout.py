@@ -402,12 +402,7 @@ def _attach_in(
         motion = _motion(work_crop, work_plate, fg_thresh)
     work_avoid = _scaled_boxes(avoid, x0, y0, crop.shape[:2], work_crop.shape[:2])
     if category != "vehicle" and work_avoid:
-        behind, front = _others_masks(motion.shape, work_avoid, work_box)
-        motion = motion.copy()
-        motion[behind | front] = 0
-        # The prior inside the box gives way too: her face inside the box of
-        # the man behind her was pasted with him, a second face beside hers.
-        core = (core.astype(bool) & ~front).astype(np.uint8)
+        motion = _outside_others(motion, work_avoid, work_box)
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
         (motion > 0).astype(np.uint8), connectivity=8
     )
@@ -512,6 +507,19 @@ def _attach_in(
             kept_core = trimmed if int(trimmed.sum()) >= 0.25 * core_area else core
         else:
             kept_core = trimmed
+    elif int(core.sum()):
+        # The same for people: the oval inside a far person's box is most of
+        # the box, and it brought a pale patch of the clip's own pavement
+        # along. Someone who barely differs (standing in their own clip's
+        # plate) keeps the oval.
+        person_diff = cv2.absdiff(work_crop, work_plate).max(axis=2)
+        differs = cv2.dilate(
+            (person_diff >= max(8, fg_thresh // 2)).astype(np.uint8),
+            np.ones((5, 5), np.uint8),
+        )
+        trimmed = core & differs
+        if int(trimmed.sum()) >= 0.25 * core_area:
+            kept_core = trimmed
     body = (kept_core > 0) | (extra > 0)
     if category == "vehicle":
         body &= ~_occluders(work_plate, diff, thresh)
@@ -532,20 +540,20 @@ _ROOM_PAST_BOX = 1.25
 _ROOM_SLACK = 0.05
 
 
-def _others_masks(
-    shape: tuple[int, int],
+def _outside_others(
+    motion: np.ndarray,
     others: Sequence[tuple[float, float, float, float]],
     own: tuple[float, float, float, float],
-) -> tuple[np.ndarray, np.ndarray]:
-    """Where other objects are: ``(around, front)``.
+) -> np.ndarray:
+    """``motion`` without what lies in other objects' boxes, outside its own box.
 
-    ``around`` is every other object's box, outside this one's own box.
-    ``front`` is objects nearer the camera (their boxes reach lower in the
-    frame), which hide this one where the two overlap: the oval inside each
-    box, since a box's corners are often street, and a man's legs beside the
-    head of the woman in front of him are his.
+    Another tracked object next to this one is its own cutout. A man walking
+    behind a woman took her head, shoulders and bag along on some frames and
+    not on others, and his outline jumped by half his height. What is inside
+    his own box stays: the two play at their real offset (``crossings``) and
+    the one nearer the camera is drawn on top, so it lines up with her.
     """
-    height, width = shape[:2]
+    height, width = motion.shape[:2]
 
     def rect(box: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
         return (
@@ -555,47 +563,16 @@ def _others_masks(
             int(min(height, np.ceil(box[3]))),
         )
 
-    margin = 0.05 * max(1.0, own[3] - own[1])
-    behind = np.zeros((height, width), bool)
-    front = np.zeros((height, width), bool)
+    taken = np.zeros((height, width), bool)
     for box in others:
         x0, y0, x1, y1 = rect(box)
-        if x1 <= x0 or y1 <= y0:
-            continue
-        behind[y0:y1, x0:x1] = True
-        if box[3] > own[3] + margin:
-            oval = np.zeros((height, width), np.uint8)
-            cv2.ellipse(
-                oval,
-                (int(round((box[0] + box[2]) / 2)), int(round((box[1] + box[3]) / 2))),
-                (max(1, int(0.45 * (box[2] - box[0]))), max(1, int(0.45 * (box[3] - box[1])))),
-                0,
-                0,
-                360,
-                1,
-                -1,
-            )
-            front |= oval > 0
+        if x1 > x0 and y1 > y0:
+            taken[y0:y1, x0:x1] = True
     x0, y0, x1, y1 = rect(own)
     if x1 > x0 and y1 > y0:
-        behind[y0:y1, x0:x1] = False
-    return behind, front
-
-
-def _outside_others(
-    motion: np.ndarray,
-    others: Sequence[tuple[float, float, float, float]],
-    own: tuple[float, float, float, float],
-) -> np.ndarray:
-    """``motion`` without what lies in other objects' boxes (see ``_others_masks``).
-
-    Another tracked object next to this one is its own cutout. A man walking
-    behind a woman took her head, shoulders and bag along on some frames and
-    not on others, and his outline jumped by half his height.
-    """
-    behind, front = _others_masks(motion.shape, others, own)
+        taken[y0:y1, x0:x1] = False
     kept = motion.copy()
-    kept[behind | front] = 0
+    kept[taken] = 0
     return kept
 
 

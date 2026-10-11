@@ -1,7 +1,8 @@
 """Draw a recap frame and encode the synopsis with ffmpeg.
 
 Labels stay put for the whole appearance of an object. Only the thin
-leader and its dot follow the ghost. Vehicles are drawn under people.
+leader and its dot follow the ghost. Vehicles are drawn under people, and
+of two people the one nearer the camera is drawn on top.
 A label and its leader are drawn only when the cutout is actually on
 screen. The background can crossfade when the lighting period changes.
 """
@@ -507,9 +508,21 @@ def compose_frame(
     scale = max(0.45, height / 1080 * font_scale)
     line_w = max(1, int(round(height / 1080 * 1.5)))
     dot_r = max(3, int(round(height / 1080 * 4)))
+    def depth(index: int) -> float:
+        """How far down the frame the object reaches now: nearer is lower."""
+        local = frame_index - starts[index]
+        boxes = units[index].boxes
+        return float(boxes[local][3]) if 0 <= local < len(boxes) else 0.0
+
+    # Within a kind, the object nearer the camera is drawn over the one
+    # behind it: a woman walking in front of a man stays in front of him.
     order = sorted(
         range(len(units)),
-        key=lambda index: (DRAW_RANK.get(units[index].category, 3), starts[index]),
+        key=lambda index: (
+            DRAW_RANK.get(units[index].category, 3),
+            depth(index),
+            starts[index],
+        ),
     )
     active: list[int] = []
     fade: dict[int, float] = {}

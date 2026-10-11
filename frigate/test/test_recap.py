@@ -2343,6 +2343,68 @@ class TestLeaders(unittest.TestCase):
         self.assertEqual(smooth_points(points, 3), [(11, 10), None, (13, 10)])
 
 
+class TestDrawOrder(unittest.TestCase):
+    def test_the_person_nearer_the_camera_is_drawn_on_top(self):
+        # She walked in front of him: her box reaches lower in the frame. He
+        # started first, and drawn last he covered her.
+        plate = np.full((180, 320, 3), (80, 140, 70), np.uint8)
+        units, tubes = [], []
+        for name, box, color in (
+            ("woman", (110.0, 60.0, 170.0, 150.0), (200, 0, 0)),
+            ("man", (100.0, 30.0, 160.0, 90.0), (0, 0, 200)),
+        ):
+            units.append(
+                ScheduledUnit(
+                    event_id=name,
+                    clip_event_id=name,
+                    label="person",
+                    category="person",
+                    start_time=0.0,
+                    boxes=[box],
+                    text="5:50 PM",
+                )
+            )
+            tubes.append(
+                Tube(
+                    event_id=name,
+                    clip_event_id=name,
+                    label="person",
+                    category="person",
+                    start_time=0.0,
+                    frames=[
+                        GhostFrame(
+                            x=int(box[0]),
+                            y=int(box[1]),
+                            box=box,
+                            crop=np.full(
+                                (int(box[3] - box[1]), int(box[2] - box[0]), 3), color, np.uint8
+                            ),
+                            alpha=np.full(
+                                (int(box[3] - box[1]), int(box[2] - box[0])), 255, np.uint8
+                            ),
+                        )
+                    ],
+                )
+            )
+        frame = compose_frame(
+            plate,
+            units,
+            tubes,
+            [0, 0],
+            [(10, 10, 80, 36), (200, 10, 270, 36)],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1, 1],
+        )
+        # Where the two overlap, the pixel is hers.
+        self.assertGreater(int(frame[75, 140][0]), 150)
+        self.assertLess(int(frame[75, 140][2]), 60)
+
+
 class TestNightAndLabels(unittest.TestCase):
     def test_a_night_ghost_close_to_the_plate_keeps_its_label(self):
         # A dark car on a dark road used to lose its label and leader.
