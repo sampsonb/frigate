@@ -28,6 +28,7 @@ from frigate.recap.cutout import static_scenery
 from frigate.recap.layout import (
     MotionTrack,
     ScheduledUnit,
+    crossings,
     dedupe_tracks,
     follows,
     schedule_units,
@@ -286,6 +287,51 @@ class TestFollows(unittest.TestCase):
         trailer.together = (0, 6)
         starts, _length = schedule_units([pickup, trailer], WIDTH, HEIGHT, 200)
         self.assertEqual(starts[1] - starts[0], 6)
+
+    def test_people_who_crossed_paths_play_at_their_real_offset(self):
+        # A man walked to a truck behind a woman coming down the path. Played
+        # at another offset, his cutout showed her face beside her own.
+        woman = _track(
+            "woman", [100.0 + 0.1 * step for step in range(60)], [(100.0, 100.0, 140.0, 200.0)] * 60
+        )
+        man = _track(
+            "man", [102.0 + 0.1 * step for step in range(40)], [(120.0, 60.0, 150.0, 140.0)] * 40
+        )
+        result = crossings([woman, man])
+        self.assertEqual(result[0], [])
+        self.assertEqual([partner for partner, _share in result[1]], [0])
+        self.assertAlmostEqual(result[1][0][1], 20 / 60, places=2)
+
+    def test_people_who_stayed_apart_are_not_tied(self):
+        woman = _track(
+            "woman", [100.0 + 0.1 * step for step in range(60)], [(100.0, 100.0, 140.0, 200.0)] * 60
+        )
+        man = _track(
+            "man", [102.0 + 0.1 * step for step in range(40)], [(220.0, 60.0, 250.0, 140.0)] * 40
+        )
+        self.assertEqual(crossings([woman, man])[1], [])
+
+    def test_company_is_kept_when_it_honors_the_wait(self):
+        # Both waited for someone before them, and playing him at the real
+        # offset from her still starts him after that.
+        first = _unit("first", 12, (10.0, 10.0, 30.0, 50.0))
+        woman = _unit("woman", 24, (100.0, 100.0, 140.0, 170.0))
+        woman.after = [(0, 1.0)]
+        man = _unit("man", 24, (120.0, 60.0, 150.0, 140.0))
+        man.after = [(0, 1.0)]
+        man.together = (1, 5)
+        starts, _length = schedule_units([first, woman, man], WIDTH, HEIGHT, 200)
+        self.assertEqual(starts[2] - starts[1], 5)
+        self.assertGreaterEqual(starts[2], starts[0] + 12)
+
+    def test_order_wins_over_company(self):
+        first = _unit("first", 40, (10.0, 10.0, 30.0, 50.0))
+        woman = _unit("woman", 24, (100.0, 100.0, 140.0, 170.0))
+        man = _unit("man", 24, (120.0, 60.0, 150.0, 140.0))
+        man.after = [(0, 1.0)]
+        man.together = (1, 5)
+        starts, _length = schedule_units([first, woman, man], WIDTH, HEIGHT, 200)
+        self.assertGreaterEqual(starts[2], starts[0] + 40)
 
     def test_without_a_wait_far_apart_objects_share_the_screen(self):
         truck = _unit("truck", 24, (10.0, 60.0, 110.0, 120.0), "vehicle")

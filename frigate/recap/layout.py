@@ -150,6 +150,71 @@ def follows(
     return result
 
 
+# Frames two shown objects' boxes have to overlap, at the same moment, for
+# them to be played at their real offset (see ``crossings``), and how much
+# of the smaller box the overlap has to cover.
+CROSS_FRAMES = 5
+CROSS_SHARE = 0.1
+# Seconds apart two samples may be and still count as the same moment.
+CROSS_SLACK = 0.5
+
+
+def _overlap_share(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    """Overlap of two boxes over the smaller one's area."""
+    ix = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+    iy = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
+    smaller = min(
+        max(1.0, (left[2] - left[0]) * (left[3] - left[1])),
+        max(1.0, (right[2] - right[0]) * (right[3] - right[1])),
+    )
+    return ix * iy / smaller
+
+
+def crossings(shown: Sequence[MotionTrack]) -> list[list[tuple[int, float]]]:
+    """For each shown track, the earlier ones whose box it overlapped.
+
+    Two people who passed close to each other share pixels: each cutout
+    holds a piece of the other. Played at another offset than in the
+    recording, the man's cutout showed the woman's face beside her own.
+    Played at the real offset, the piece lines up with her. Each entry is
+    the earlier unit's index and the share of its clip played when this one
+    starts, as in ``follows``.
+    """
+    result: list[list[tuple[int, float]]] = [[] for _ in shown]
+    for later, track in enumerate(shown):
+        count_later = min(len(track.boxes), len(track.times))
+        if not count_later:
+            continue
+        begin = track.times[0]
+        for earlier in range(later):
+            other = shown[earlier]
+            count = min(len(other.boxes), len(other.times))
+            if count < 2 or not other.times[0] <= begin <= other.times[count - 1]:
+                continue
+            touching = 0
+            for box, moment in zip(
+                track.boxes[:count_later], track.times[:count_later], strict=True
+            ):
+                if moment > other.times[count - 1] + CROSS_SLACK:
+                    break
+                index = min(count - 1, bisect.bisect_left(other.times, moment, 0, count))
+                if index > 0 and abs(other.times[index - 1] - moment) < abs(
+                    other.times[index] - moment
+                ):
+                    index -= 1
+                if abs(other.times[index] - moment) > CROSS_SLACK:
+                    continue
+                if _overlap_share(box, other.boxes[index]) >= CROSS_SHARE:
+                    touching += 1
+            if touching >= CROSS_FRAMES:
+                played = bisect.bisect_left(other.times, begin, 0, count)
+                result[later].append((earlier, played / count))
+    return result
+
+
 def format_clock(timestamp: float, zone: tzinfo, *, seconds: bool) -> str:
     """Local clock time. Seconds are included only when requested.
 
@@ -605,6 +670,16 @@ def schedule_units(
             length = len(occupied)
             partner = link[index]
             together = units[index].together
+            if together is not None and together[0] < len(starts):
+                start = starts[together[0]] + together[1]
+                # Order wins over company: it must not start before what it
+                # waits for. Most often the partner waited for the same thing.
+                if any(
+                    0 <= prior < len(starts)
+                    and start < starts[prior] + int(math.ceil(share * len(cells[prior])))
+                    for prior, share in units[index].after
+                ):
+                    together = None
             if together is not None and together[0] < len(starts):
                 start = starts[together[0]] + together[1]
                 if start + length >= horizon:

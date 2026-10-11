@@ -449,6 +449,22 @@ class TestPeople(unittest.TestCase):
         self.assertEqual(int(kept[20, 15]), 1)
         self.assertEqual(int(kept[20, 35]), 1)
 
+    def test_someone_in_front_keeps_where_the_two_overlap(self):
+        # Her box reaches lower in the frame: she is nearer the camera, and
+        # where the boxes overlap the pixels are hers, not the man's behind.
+        motion = np.ones((60, 40), np.uint8)
+        man = (10.0, 0.0, 30.0, 40.0)
+        woman = (12.0, 30.0, 34.0, 60.0)
+        kept = _outside_others(motion, [woman], man)
+        self.assertEqual(int(kept[40, 23]), 0)
+        self.assertEqual(int(kept[10, 20]), 1)
+        # A corner of her box is not her: his legs there stay his.
+        self.assertEqual(int(kept[31, 13]), 1)
+        # From her side the man is behind: only what is outside her box goes.
+        kept = _outside_others(motion, [man], woman)
+        self.assertEqual(int(kept[35, 20]), 1)
+        self.assertEqual(int(kept[10, 20]), 0)
+
     def test_a_person_keeps_the_dog_they_walk(self):
         self.assertFalse(_avoids("person", "animal"))
         self.assertTrue(_avoids("person", "person"))

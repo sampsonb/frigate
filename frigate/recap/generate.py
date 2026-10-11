@@ -39,6 +39,7 @@ from frigate.recap.layout import (
     MotionTrack,
     ScheduledUnit,
     assign_label_texts,
+    crossings,
     dedupe_tracks,
     follows,
     is_stationary,
@@ -1421,13 +1422,15 @@ def generate_recap(
         width,
         height,
     )
-    for unit, earlier in zip(units, waits, strict=True):
+    crossed = crossings([track_of[unit.event_id] for unit in units])
+    for unit, earlier, crossing in zip(units, waits, crossed, strict=True):
         unit.after = [item for item in earlier if item[1] >= 1.0]
-        alongside = [item for item in earlier if item[1] < 1.0]
+        alongside = [item for item in earlier if item[1] < 1.0] + crossing
         if alongside:
-            # It came into view next to an object still on screen: a pickup
-            # and the trailer Frigate tracked apart, or someone stepping out.
-            # They were there together, so they play together.
+            # It came into view next to an object still on screen (a pickup
+            # and the trailer Frigate tracked apart, or someone stepping out),
+            # or it crossed paths with one. They were there together, so
+            # they play together.
             partner, share = max(alongside)
             unit.together = (
                 partner,
@@ -1438,10 +1441,6 @@ def generate_recap(
         if stay.arrival is not None and stay.departure is not None:
             # It drives off after it has pulled in, however long it sat.
             units[stay.departure].after.append((stay.arrival, 1.0))
-    for unit in units:
-        if unit.together is not None and unit.after:
-            # Order wins over company: it must not start before what it waits for.
-            unit.together = None
 
     person_unit = {unit.event_id: index for index, unit in enumerate(units)}
     for link in links:
