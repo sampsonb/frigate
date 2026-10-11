@@ -1904,21 +1904,58 @@ class TestLightingPlates(unittest.TestCase):
 
     def test_plate_follows_the_lighting_period_then_the_nearest_time(self):
         samples = []
-        for moment in (0, 600, 1200, 1800, 2400):
+        for moment in (0, 600, 1200, 1800, 2400, 3000):
             samples.append((float(moment), _color_frame(20, 30, (40, 150, 40))))
-        for moment in (3000, 3600, 4200):
+        for moment in (3600, 4200, 4800):
             samples.append((float(moment), _ir_frame(20, 30, 30)))
         plates = build_timed_plates(samples)
         self.assertGreaterEqual(len(plates), 3)
         self.assertFalse(plates[plate_index_at(plates, 1000)].is_ir)
         self.assertFalse(plates[plate_index_at(plates, 2000)].is_ir)
-        # Halfway between the last day sample (2400) and the first night (3000).
-        self.assertFalse(plates[plate_index_at(plates, 2600)].is_ir)
-        self.assertTrue(plates[plate_index_at(plates, 2800)].is_ir)
-        self.assertTrue(plates[plate_index_at(plates, 4000)].is_ir)
+        # Halfway between the last day sample (3000) and the first night (3600).
+        self.assertFalse(plates[plate_index_at(plates, 3200)].is_ir)
+        self.assertTrue(plates[plate_index_at(plates, 3400)].is_ir)
+        self.assertTrue(plates[plate_index_at(plates, 4600)].is_ir)
         early = plate_index_at(plates, 200)
-        later = plate_index_at(plates, 2200)
+        later = plate_index_at(plates, 2800)
         self.assertLess(plates[early].time, plates[later].time)
+
+    def test_a_car_in_a_thin_half_hour_is_not_half_there(self):
+        # Recording holes left a half hour two samples, one with an SUV
+        # braking at the stop sign. Their mean was a see-through SUV, drawn
+        # for as long as that plate was.
+        road = _color_frame(20, 30, (40, 150, 40))
+        car = road.copy()
+        car[12:18, 10:20] = (0, 0, 220)
+        samples = [(0.0, road), (600.0, car)] + [
+            (float(moment), road) for moment in (1800, 2400, 3000)
+        ]
+        plates = build_timed_plates(samples)
+        self.assertEqual(len(plates), 1)
+        np.testing.assert_array_equal(plates[0].image[15, 15], road[15, 15])
+
+    def test_two_samples_are_never_blended(self):
+        road = _color_frame(20, 30, (40, 150, 40))
+        car = road.copy()
+        car[12:18, 10:20] = (0, 0, 220)
+        for first, second in ((road, car), (car, road)):
+            plates = build_timed_plates([(0.0, first), (600.0, second)])
+            np.testing.assert_array_equal(plates[0].image, first)
+
+    def test_an_even_count_leaves_the_odd_one_out(self):
+        road = _color_frame(20, 30, (40, 150, 40))
+        car = road.copy()
+        car[12:18, 10:20] = (0, 0, 220)
+        wet = road.copy()
+        wet[10:] = (30, 110, 30)
+        samples = [(0.0, road), (500.0, car), (1000.0, road), (1500.0, wet)]
+        plates = build_timed_plates(samples)
+        self.assertEqual(len(plates), 1)
+        pixel = plates[0].image[15, 15]
+        self.assertTrue(
+            any(np.array_equal(pixel, frame[15, 15]) for frame in (road, car, wet)),
+            pixel,
+        )
 
     def test_lighting_gap_asks_for_the_midpoint(self):
         samples = [

@@ -804,12 +804,25 @@ class RecapJob(threading.Thread):
         moment: float,
         width: int,
         height: int,
-    ):
-        segment = _segment_at(rows, moment)
-        if segment is None:
+        taken: list[float],
+    ) -> tuple[float, Any] | None:
+        """One plate sample and the moment it shows, or None.
+
+        A stand-in from the nearest recording is skipped when it lands on
+        a moment already sampled: the same frame twice is a majority.
+        """
+        found = _plate_segment(rows, moment)
+        if found is None:
             return None
-        path, offset = segment
-        return grab_frame(ffmpeg, path, offset, width, height)
+        path, offset, shown = found
+        if shown != moment and any(
+            abs(shown - other) < PLATE_APART for other in taken
+        ):
+            return None
+        frame = grab_frame(ffmpeg, path, offset, width, height)
+        if frame is None:
+            return None
+        return shown, frame
 
     def _plate(
         self,
@@ -827,9 +840,11 @@ class RecapJob(threading.Thread):
         for moment in plate_sample_times(self.after, self.before):
             if self._cancel.is_set():
                 raise RecapCancelled()
-            frame = self._grab_plate(ffmpeg, rows, moment, width, height)
-            if frame is not None:
-                samples.append((moment, frame))
+            sample = self._grab_plate(
+                ffmpeg, rows, moment, width, height, [item[0] for item in samples]
+            )
+            if sample is not None:
+                samples.append(sample)
         # A 10 minute step can jump over the infrared switch. Bisect the
         # gaps whose neighbors disagree, a few times, so the plate changes
         # near the real switch instead of half an hour later.
@@ -841,10 +856,12 @@ class RecapJob(threading.Thread):
             for moment in extras:
                 if self._cancel.is_set():
                     raise RecapCancelled()
-                frame = self._grab_plate(ffmpeg, rows, moment, width, height)
-                if frame is None:
+                sample = self._grab_plate(
+                    ffmpeg, rows, moment, width, height, [item[0] for item in samples]
+                )
+                if sample is None:
                     continue
-                samples.append((moment, frame))
+                samples.append(sample)
                 added = True
             if not added:
                 break
@@ -1119,3 +1136,36 @@ def _segment_at(rows: list[dict[str, Any]], moment: float) -> tuple[str, float] 
         if row["start"] <= moment < row["end"]:
             return row["path"], max(0.0, moment - row["start"])
     return None
+
+
+# How far from its planned time a plate sample may come from, and how close
+# a stand-in may land to another sample before it is skipped.
+PLATE_REACH = 300.0
+PLATE_APART = 60.0
+
+
+def _plate_segment(
+    rows: list[dict[str, Any]], moment: float, reach: float = PLATE_REACH
+) -> tuple[str, float, float] | None:
+    """Where to grab a plate sample: path, offset, and the moment it shows.
+
+    Motion-only retention drops the quiet segments, and a 10 minute grid
+    lands in those holes: two of four samples in one half hour were lost,
+    and the plate was made of the two left. The nearest recording within
+    ``reach`` seconds stands in.
+    """
+    found = _segment_at(rows, moment)
+    if found is not None:
+        return found[0], found[1], float(moment)
+    best: tuple[float, str, float, float] | None = None
+    for row in rows:
+        start, end = float(row["start"]), float(row["end"])
+        if end - start < 1.0:
+            continue
+        nearest = min(max(float(moment), start + 0.5), end - 0.5)
+        distance = abs(nearest - moment)
+        if distance <= reach and (best is None or distance < best[0]):
+            best = (distance, row["path"], nearest - start, nearest)
+    if best is None:
+        return None
+    return best[1], best[2], best[3]

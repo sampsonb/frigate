@@ -581,6 +581,38 @@ class TestRollingFailureKeepsLive(unittest.TestCase):
                 self.assertEqual(manager.rolling_state["front"]["last"], "failed")
 
 
+class TestPlateSamples(unittest.TestCase):
+    """Motion-only retention leaves holes where a plate sample was planned."""
+
+    ROWS = [
+        {"path": "a.mp4", "start": 0.0, "end": 60.0},
+        {"path": "b.mp4", "start": 900.0, "end": 960.0},
+        {"path": "c.mp4", "start": 1790.0, "end": 1800.0},
+    ]
+
+    def test_a_hole_takes_the_nearest_recording(self):
+        from frigate.recap.manager import _plate_segment
+
+        self.assertEqual(_plate_segment(self.ROWS, 30.0), ("a.mp4", 30.0, 30.0))
+        self.assertEqual(_plate_segment(self.ROWS, 1200.0), ("b.mp4", 59.5, 959.5))
+        # Nothing recorded within five minutes.
+        self.assertIsNone(_plate_segment(self.ROWS, 600.0))
+
+    def test_a_stand_in_is_not_sampled_twice(self):
+        from frigate.recap import manager as manager_module
+
+        job = manager_module.RecapJob(
+            None, "id", "front", 0.0, 1800.0, RecapConfig(enabled=True), Path(".")
+        )
+        frame = np.zeros((4, 4, 3), np.uint8)
+        with patch.object(manager_module, "grab_frame", return_value=frame):
+            samples = job._plate("ffmpeg", self.ROWS, 4, 4)
+            # The same frame twice would outvote a third sample.
+            again = job._grab_plate("ffmpeg", self.ROWS, 1000.0, 4, 4, [959.5])
+        self.assertEqual([moment for moment, _frame in samples], [0.0, 959.5, 1799.5])
+        self.assertIsNone(again)
+
+
 class TestNothingRecorded(unittest.TestCase):
     def _run(self, reason: str):
         from frigate.recap import manager as manager_module

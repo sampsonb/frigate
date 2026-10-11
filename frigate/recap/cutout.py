@@ -346,11 +346,40 @@ def _attach(
     pieces are never taken from inside ``avoid``, the boxes of the other
     objects in the frame. ``settled`` means the box hardly moves between
     samples (see ``_motion_pieces``). Also returns how far the box was moved
-    onto the object, in frame pixels, ``(0, 0)`` when it was not.
+    onto the object, in frame pixels, ``(0, 0)`` when it was not. A vehicle
+    longer than its box is looked for again in a window that holds a whole
+    vehicle (see ``_vehicle_room``).
     """
     height, width = frame.shape[:2]
+    window = search_window(box, category, width, height, span, travel)
+    found = _attach_in(
+        frame, background, box, category, fg_thresh, avoid, settled, window
+    )
+    if category == "vehicle":
+        x0, y0, mask, _moved = found
+        wider = _vehicle_room(
+            mask, (x0, y0, x0 + mask.shape[1], y0 + mask.shape[0]), width, box
+        )
+        if wider is not None:
+            found = _attach_in(
+                frame, background, box, category, fg_thresh, avoid, settled, wider
+            )
+    return found
+
+
+def _attach_in(
+    frame: np.ndarray,
+    background: np.ndarray,
+    box: tuple[float, float, float, float],
+    category: str,
+    fg_thresh: int,
+    avoid: Sequence[tuple[float, float, float, float]],
+    settled: bool,
+    window: tuple[int, int, int, int],
+) -> tuple[int, int, np.ndarray, tuple[float, float]]:
+    """``_attach`` inside one search window."""
     box_h = max(1.0, box[3] - box[1])
-    x0, y0, x1, y1 = search_window(box, category, width, height, span, travel)
+    x0, y0, x1, y1 = window
     if x1 - x0 < 4 or y1 - y0 < 4:
         return (
             x0,
@@ -433,8 +462,11 @@ def _attach(
         )
         # The far side of an occluder is often black paint over dark road,
         # well under a threshold set by the bright side. It is looked for
-        # again at half the threshold, held to the same height and length.
+        # again at half the threshold, held to the same height and length,
+        # but not in warm light: at half the threshold, tail light glowing in
+        # the mist behind a truck came and went with the frames.
         weak = _vehicle_motion(diff, max(6, thresh // 2), work_box)
+        weak[_warm_light(work_crop, work_plate)] = 0
         weak[(core | extra) > 0] = 0
         weak_count, weak_labels, weak_stats, _weak_centroids = (
             cv2.connectedComponentsWithStats(weak, connectivity=8)
@@ -478,6 +510,49 @@ def _attach(
     return x0, y0, mask, moved
 
 
+# A vehicle found this many times as long as its box is only partly boxed,
+# and the window may be widened by up to a share of its longest length
+# before that is worth a second look (see ``_vehicle_room``).
+_ROOM_PAST_BOX = 1.25
+_ROOM_SLACK = 0.05
+
+
+def _vehicle_room(
+    body: np.ndarray,
+    window: tuple[int, int, int, int],
+    frame_width: int,
+    box: tuple[float, float, float, float],
+) -> tuple[int, int, int, int] | None:
+    """The window widened to hold the whole vehicle, or None when it does.
+
+    ``body`` is the vehicle found in ``window``, at any scale. A detector
+    box lagging a pickup that pulled in covered only its back, and the
+    window around it ended at the planter: the front, plainly visible past
+    it, was left off and popped in once the box caught up. The body gives
+    the vehicle's real height, the box's is often short, and a vehicle can
+    be ``VEHICLE_MAX_ASPECT`` heights long from either of its ends. A box
+    that already holds the vehicle needs no second look.
+    """
+    rows = np.flatnonzero(body.any(axis=1))
+    if len(rows) == 0:
+        return None
+    columns = np.flatnonzero(body.any(axis=0))
+    x0, y0, x1, y1 = window
+    scale_x = (x1 - x0) / max(1, body.shape[1])
+    scale_y = (y1 - y0) / max(1, body.shape[0])
+    left = x0 + float(columns[0]) * scale_x
+    right = x0 + float(columns[-1] + 1) * scale_x
+    if right - left < _ROOM_PAST_BOX * max(1.0, box[2] - box[0]):
+        return None
+    longest = VEHICLE_MAX_ASPECT * float(rows[-1] - rows[0] + 1) * scale_y
+    wide_x0 = max(0, min(x0, int(np.floor(right - longest))))
+    wide_x1 = min(frame_width, max(x1, int(np.ceil(left + longest))))
+    slack = _ROOM_SLACK * longest
+    if wide_x0 >= x0 - slack and wide_x1 <= x1 + slack:
+        return None
+    return wide_x0, y0, wide_x1, y1
+
+
 # Local contrast of the plate (standard deviation over a few pixels) above
 # which it is busy scenery: leaves, a planter, a post, a fence.
 _SCENERY_TEXTURE = 14.0
@@ -497,6 +572,17 @@ def _occluders(plate: np.ndarray, diff: np.ndarray, thresh: int) -> np.ndarray:
     mean = cv2.blur(gray, (7, 7))
     spread = np.sqrt(np.maximum(cv2.blur(gray * gray, (7, 7)) - mean * mean, 0.0))
     return (spread > _SCENERY_TEXTURE) & (diff < max(6, thresh // 2))
+
+
+def _warm_light(crop: np.ndarray, plate: np.ndarray) -> np.ndarray:
+    """Pixels lit up warm: brighter in every channel, red at least as much as blue.
+
+    Tail and brake light in the mist and on a wet road behind a truck. A
+    glossy black body passing for gray reflects the sky instead, and the
+    sky brightens blue more than red.
+    """
+    change = crop.astype(np.int16) - plate.astype(np.int16)
+    return (change.min(axis=2) > 0) & (change[:, :, 2] >= change[:, :, 0])
 
 
 def _vehicle_motion(

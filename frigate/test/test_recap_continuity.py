@@ -349,7 +349,7 @@ class TestCleanPlates(unittest.TestCase):
         ]
         plates = build_timed_plates(samples)
         self.assertEqual(len(plates), 1)
-        # Half the samples have the car, so the plain median is half car.
+        # Half the samples have the car, so the plate does too.
         self.assertGreater(int(plates[0].image[112, 190, 2]), 120)
         cleaned = clean_plates(plates, samples, [self.SPAN], WIDTH, HEIGHT)
         np.testing.assert_allclose(cleaned[0].image[112, 190], ROAD, atol=2)

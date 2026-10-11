@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 # as separate clips, still snapshots only when the path does not line up,
 # and a vehicle's first and last frames kept to draw it parked.
 # 5: real-speed sampling, no sliding reused masks, scenery kept in front
-# of vehicles, and vehicle clips cut to where they move.
+# of vehicles, vehicle clips cut to where they move, a whole-vehicle
+# window when the box is short, and warm light left out.
 CACHE_VERSION = 5
 # Longest window a cached cutout is useful for (72 hours) plus slack.
 MAX_AGE_HOURS = 74.0

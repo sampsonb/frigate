@@ -13,6 +13,8 @@ from frigate.recap.align import estimate_shift
 from frigate.recap.clips import download_name
 from frigate.recap.cutout import (
     _occluders,
+    _warm_light,
+    attach_motion,
     build_cutouts,
     needs_window,
     rounded_alpha,
@@ -364,6 +366,49 @@ class TestDaylightCutouts(unittest.TestCase):
         # Paint over the same busy patch differs a lot: that is the car.
         diff[:] = 80
         self.assertFalse(_occluders(plate, diff, 22)[90, 130])
+
+    @staticmethod
+    def _covers(found, px: int, py: int) -> bool:
+        x, y, mask = found
+        return (
+            0 <= py - y < mask.shape[0]
+            and 0 <= px - x < mask.shape[1]
+            and bool(mask[py - y, px - x])
+        )
+
+    def test_a_vehicle_longer_than_its_box_keeps_its_front_past_the_post(self):
+        # Frigate's box lagged a pickup pulling in and covered only its back.
+        # The front, plainly visible past the post, was left off.
+        background = np.full((HEIGHT, WIDTH, 3), DAYLIGHT, np.uint8)
+        background[70:115, 90:96] = (150, 150, 150)
+        frame = background.copy()
+        frame[80:110, 40:130] = (30, 30, 30)
+        frame[70:115, 90:96] = (150, 150, 150)
+        found = attach_motion(frame, background, (40.0, 80.0, 72.0, 110.0), "vehicle")
+        self.assertTrue(self._covers(found, 125, 95))
+        self.assertTrue(self._covers(found, 60, 95))
+
+    def test_warm_light_behind_a_vehicle_is_not_part_of_it(self):
+        # Tail light in the mist behind a dark truck: a little brighter and
+        # warm, under the full threshold but over half of it.
+        background = np.full((HEIGHT, WIDTH, 3), DAYLIGHT, np.uint8)
+        frame = background.copy()
+        frame[80:110, 50:110] = (30, 30, 30)
+        frame[80:110, 25:50] = np.clip(
+            frame[80:110, 25:50].astype(np.int16) + (12, 12, 16), 0, 255
+        ).astype(np.uint8)
+        found = attach_motion(frame, background, (50.0, 80.0, 110.0, 110.0), "vehicle")
+        self.assertFalse(self._covers(found, 35, 95))
+        self.assertTrue(self._covers(found, 80, 95))
+
+    def test_warm_light_is_told_from_sky_on_glossy_paint(self):
+        plate = np.full((4, 4, 3), 90, np.uint8)
+        lit = np.clip(plate.astype(np.int16) + (10, 10, 14), 0, 255).astype(np.uint8)
+        sky = np.clip(plate.astype(np.int16) + (31, 22, 14), 0, 255).astype(np.uint8)
+        paint = np.clip(plate.astype(np.int16) - 20, 0, 255).astype(np.uint8)
+        self.assertTrue(_warm_light(lit, plate).all())
+        self.assertFalse(_warm_light(sky, plate).any())
+        self.assertFalse(_warm_light(paint, plate).any())
 
 
 class TestSnapshots(unittest.TestCase):

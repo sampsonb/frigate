@@ -25,6 +25,11 @@ DARK_LUMA = 60.0
 PLATE_INTERVAL = 1800.0
 # How often recordings are sampled while looking for the day/night switch.
 CLASSIFY_STEP = 600.0
+# Most plate samples for one recap: a whole day at ``CLASSIFY_STEP``. Fewer
+# left a 12 hour recap two samples per plate.
+PLATE_MAX_SAMPLES = 145
+# Fewest samples a plate is a median of. One or two keep whatever drove by.
+PLATE_MIN_SAMPLES = 3
 # Crossfade when the recap moves to another plate.
 PLATE_FADE_SECONDS = 0.5
 # How much saturation and brightness to take off the plate so cutouts pop.
@@ -187,14 +192,14 @@ def label_should_draw(alpha: np.ndarray) -> bool:
 def plate_sample_times(
     after: float, before: float, step: float = CLASSIFY_STEP
 ) -> list[float]:
-    """Timestamps for plate grabs, about every 10 minutes, capped at 48."""
+    """Timestamps for plate grabs, about every 10 minutes for up to a day."""
     if before <= after:
         return [float(after)]
     span = float(before) - float(after)
     if span <= step:
         return [float(after) + span / 2]
     count = int(round(span / step)) + 1
-    count = max(2, min(count, 48))
+    count = max(2, min(count, PLATE_MAX_SAMPLES))
     return [float(item) for item in np.linspace(after, before, count)]
 
 
@@ -218,6 +223,13 @@ def gap_sample_times(
 
 
 def _median_image(frames: Sequence[np.ndarray]) -> np.ndarray:
+    """Per-pixel median of an odd number of the frames.
+
+    The median of an even count is the mean of the middle two. A car in
+    half the samples came out half there: a see-through car parked in the
+    plate for as long as it was drawn. The frame least like the others is
+    left out instead, and of two frames the first is used whole.
+    """
     first = frames[0]
     height, width = first.shape[:2]
     same = []
@@ -225,8 +237,15 @@ def _median_image(frames: Sequence[np.ndarray]) -> np.ndarray:
         if frame.shape[:2] != (height, width):
             frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
         same.append(frame)
-    if len(same) == 1:
+    if len(same) <= 2:
         return same[0]
+    if len(same) % 2 == 0:
+        middle = np.median(np.stack(same), axis=0)
+        unlike = [
+            float(np.abs(frame.astype(np.float32) - middle).mean()) for frame in same
+        ]
+        drop = int(np.argmax(unlike))
+        same = [frame for index, frame in enumerate(same) if index != drop]
     return np.median(np.stack(same), axis=0).astype(np.uint8)
 
 
@@ -272,15 +291,29 @@ def build_timed_plates(
         )
 
     for run in runs:
-        bucket: list[tuple[float, np.ndarray, bool]] = []
+        buckets: list[list[tuple[float, np.ndarray, bool]]] = [[]]
         bucket_start = run[0][0]
         for item in run:
-            if bucket and item[0] - bucket_start >= interval:
-                flush(bucket)
-                bucket = []
+            if buckets[-1] and item[0] - bucket_start >= interval:
+                buckets.append([])
                 bucket_start = item[0]
-            bucket.append(item)
-        if bucket:
+            buckets[-1].append(item)
+        # A plate of one or two samples keeps whatever passed by in them.
+        # It joins its neighbor in the run when that is close enough in time.
+        joined: list[list[tuple[float, np.ndarray, bool]]] = []
+        for bucket in buckets:
+            if (
+                joined
+                and (
+                    len(bucket) < PLATE_MIN_SAMPLES
+                    or len(joined[-1]) < PLATE_MIN_SAMPLES
+                )
+                and bucket[0][0] - joined[-1][-1][0] <= interval
+            ):
+                joined[-1].extend(bucket)
+            else:
+                joined.append(bucket)
+        for bucket in joined:
             flush(bucket)
     return plates
 
