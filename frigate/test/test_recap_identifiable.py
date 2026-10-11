@@ -12,7 +12,10 @@ from frigate.recap import cutcache
 from frigate.recap.align import estimate_shift
 from frigate.recap.clips import download_name
 from frigate.recap.cutout import (
+    _attach,
     _occluders,
+    _outside_others,
+    _steady_outlines,
     _warm_light,
     attach_motion,
     build_cutouts,
@@ -23,7 +26,9 @@ from frigate.recap.cutout import (
 )
 from frigate.recap.frames import concat_sample
 from frigate.recap.generate import (
+    _avoids,
     _cutouts_for,
+    _too_many_held,
     _merge_dog_walkers,
     boxes_at,
     clip_window,
@@ -409,6 +414,143 @@ class TestDaylightCutouts(unittest.TestCase):
         self.assertTrue(_warm_light(lit, plate).all())
         self.assertFalse(_warm_light(sky, plate).any())
         self.assertFalse(_warm_light(paint, plate).any())
+
+
+DARK = (40, 40, 40)
+SHIRT = (200, 200, 210)
+
+
+class TestPeople(unittest.TestCase):
+    """People stay whole and on screen, and do not take each other along."""
+
+    def _road(self) -> np.ndarray:
+        return np.full((HEIGHT, WIDTH, 3), DAYLIGHT, np.uint8)
+
+    def test_a_person_keeps_out_of_someone_walking_in_front(self):
+        # A man walking behind a woman took her head, shoulders and bag along
+        # on some frames and not others.
+        background = self._road()
+        frame = background.copy()
+        frame[40:100, 100:120] = DARK
+        frame[90:165, 104:130] = SHIRT
+        man = (100.0, 40.0, 120.0, 100.0)
+        woman = (104.0, 90.0, 130.0, 165.0)
+        x, y, mask = attach_motion(frame, background, man, "person", avoid=[woman])
+        rows = np.flatnonzero(mask.any(axis=1)) + y
+        self.assertLess(int(rows.max()), 115)
+        self.assertEqual(int(mask[70 - y, 110 - x]), 1)
+        alone_x, alone_y, alone = attach_motion(frame, background, man, "person")
+        self.assertGreater(int((np.flatnonzero(alone.any(axis=1)) + alone_y).max()), 140)
+
+    def test_only_what_is_in_its_own_box_is_kept_from_anothers(self):
+        motion = np.ones((40, 40), np.uint8)
+        kept = _outside_others(motion, [(0.0, 0.0, 20.0, 40.0)], (10.0, 0.0, 30.0, 40.0))
+        self.assertEqual(int(kept[20, 5]), 0)
+        self.assertEqual(int(kept[20, 15]), 1)
+        self.assertEqual(int(kept[20, 35]), 1)
+
+    def test_a_person_keeps_the_dog_they_walk(self):
+        self.assertFalse(_avoids("person", "animal"))
+        self.assertTrue(_avoids("person", "person"))
+        self.assertTrue(_avoids("person", "vehicle"))
+        self.assertTrue(_avoids("animal", "person"))
+        self.assertTrue(_avoids("vehicle", "animal"))
+
+    def test_a_person_who_stops_is_held_standing_not_dropped(self):
+        # She got out of the truck and stood by it. Standing still she is part
+        # of the clip's own plate, and the mask finds nothing there.
+        frames, boxes = [], []
+        for index in range(30):
+            left = 80 + 5 * min(index, 4)
+            frame = self._road()
+            frame[60:130, left : left + 22] = DARK
+            frames.append(frame)
+            # Frigate's box drifts around someone standing still.
+            drift = 0.3 * max(0, index - 4)
+            boxes.append((left - drift, 60.0, left + 22 - drift, 130.0))
+        ghosts = build_cutouts(frames, boxes, "person")
+        assert ghosts is not None
+        for index, ghost in enumerate(ghosts):
+            self.assertGreater(int((np.asarray(ghost["alpha"]) > 128).sum()), 300, index)
+        standing = [ghost for ghost in ghosts if ghost.get("standing")]
+        self.assertTrue(standing)
+        # Held where she stands, not sliding with the box.
+        self.assertLessEqual(len({int(ghost["x"]) for ghost in standing}), 2)
+        self.assertFalse(_too_many_held(ghosts))
+
+    def test_a_person_who_left_is_still_left_out(self):
+        frames, boxes = [], []
+        for index in range(24):
+            left = 60 + 6 * index
+            frame = self._road()
+            if index < 8:
+                frame[60:130, left : left + 22] = DARK
+            frames.append(frame)
+            boxes.append((float(left), 60.0, float(left + 22), 130.0))
+        ghosts = build_cutouts(frames, boxes, "person")
+        assert ghosts is not None
+        self.assertTrue(
+            all(int(np.asarray(g["alpha"]).max()) < 8 for g in ghosts[16:])
+        )
+        self.assertFalse(any(g.get("standing") for g in ghosts))
+
+    def test_a_persons_box_is_not_moved_onto_motion_beside_it(self):
+        # Standing still, she barely differed from the clip's plate, and her
+        # box was moved onto the motion below her, off the frame.
+        background = self._road()
+        frame = background.copy()
+        frame[120:178, 150:172] = DARK
+        box = (150.0, 40.0, 172.0, 100.0)
+        _x, _y, _mask, moved = _attach(frame, background, box, "person")
+        self.assertEqual(moved, (0.0, 0.0))
+
+    def test_someone_standing_the_whole_clip_is_cut_against_the_recap_plate(self):
+        # Standing still for the whole clip she is the clip's own plate, and
+        # without the recap's plate she was a frozen snapshot.
+        road = self._road()
+        frames, boxes = [], []
+        for index in range(24):
+            frame = road.copy()
+            # A little sway, as people do.
+            left = 120 + (index % 2)
+            frame[60:130, left : left + 22] = DARK
+            frames.append(frame)
+            boxes.append((120.0, 60.0, 143.0, 130.0))
+        alone = build_cutouts(frames, boxes, "person")
+        assert alone is not None
+        self.assertTrue(all(g.get("window") for g in alone))
+        ghosts = build_cutouts(frames, boxes, "person", plate=road)
+        assert ghosts is not None
+        self.assertFalse(any(g.get("window") for g in ghosts))
+        self.assertTrue(
+            all(int((np.asarray(g["alpha"]) > 128).sum()) > 600 for g in ghosts)
+        )
+
+    def test_a_post_frigate_took_for_a_person_is_left_out(self):
+        # Nothing differs from either plate: there is no one to show.
+        road = self._road()
+        road[60:130, 120:126] = (70, 70, 70)
+        frames = [road.copy() for _ in range(12)]
+        boxes = [(116.0, 60.0, 130.0, 130.0)] * 12
+        self.assertEqual(build_cutouts(frames, boxes, "person", plate=road), [])
+
+    def test_a_part_seen_on_one_frame_only_is_taken_out(self):
+        ghosts = []
+        for index in range(3):
+            alpha = np.zeros((80, 30), np.uint8)
+            alpha[0:60, 5:25] = 255
+            if index == 1:
+                # A splash under the feet on one frame.
+                alpha[60:80, 0:30] = 255
+            ghosts.append({"x": 100 + 4 * index, "y": 50, "alpha": alpha, "crop": np.zeros((80, 30, 3), np.uint8)})
+        centers = np.array([[115.0 + 4 * index, 80.0] for index in range(3)])
+        steady = _steady_outlines(ghosts, centers)
+        middle = np.asarray(steady[1]["alpha"])
+        self.assertEqual(int(middle[75, 15]), 0)
+        self.assertEqual(int(middle[30, 15]), 255)
+        # The other frames are untouched, and nothing is added anywhere.
+        self.assertIs(steady[0], ghosts[0])
+        self.assertLessEqual(int((middle > 0).sum()), int((ghosts[1]["alpha"] > 0).sum()))
 
 
 class TestSnapshots(unittest.TestCase):

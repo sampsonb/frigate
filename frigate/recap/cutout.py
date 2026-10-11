@@ -400,11 +400,21 @@ def _attach_in(
         motion = _vehicle_motion(diff, thresh, work_box)
     else:
         motion = _motion(work_crop, work_plate, fg_thresh)
+    work_avoid = _scaled_boxes(avoid, x0, y0, crop.shape[:2], work_crop.shape[:2])
+    if category != "vehicle" and work_avoid:
+        motion = _outside_others(motion, work_avoid, work_box)
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
         (motion > 0).astype(np.uint8), connectivity=8
     )
-    work_avoid = _scaled_boxes(avoid, x0, y0, crop.shape[:2], work_crop.shape[:2])
-    snapped = _snap_to_motion(labels, stats, count, core, work_box, motion, work_avoid)
+    # Only a vehicle's box is moved onto the motion beside it: a car outruns
+    # Frigate's sparse path. A person standing still barely differs from the
+    # clip's own plate, and her box was moved onto the motion below her, off
+    # the frame, and every frame after that was left out.
+    snapped = (
+        _snap_to_motion(labels, stats, count, core, work_box, motion, work_avoid)
+        if category == "vehicle"
+        else None
+    )
     moved = (0.0, 0.0)
     if snapped is not None:
         moved = (
@@ -515,6 +525,40 @@ def _attach_in(
 # before that is worth a second look (see ``_vehicle_room``).
 _ROOM_PAST_BOX = 1.25
 _ROOM_SLACK = 0.05
+
+
+def _outside_others(
+    motion: np.ndarray,
+    others: Sequence[tuple[float, float, float, float]],
+    own: tuple[float, float, float, float],
+) -> np.ndarray:
+    """``motion`` without what lies in other objects' boxes, outside its own box.
+
+    Another tracked object next to this one is its own cutout. A man walking
+    behind a woman took her head, shoulders and bag along on some frames and
+    not on others, and his outline jumped by half his height.
+    """
+    height, width = motion.shape[:2]
+
+    def rect(box: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+        return (
+            int(max(0, np.floor(box[0]))),
+            int(max(0, np.floor(box[1]))),
+            int(min(width, np.ceil(box[2]))),
+            int(min(height, np.ceil(box[3]))),
+        )
+
+    taken = np.zeros((height, width), bool)
+    for box in others:
+        x0, y0, x1, y1 = rect(box)
+        if x1 > x0 and y1 > y0:
+            taken[y0:y1, x0:x1] = True
+    x0, y0, x1, y1 = rect(own)
+    if x1 > x0 and y1 > y0:
+        taken[y0:y1, x0:x1] = False
+    kept = motion.copy()
+    kept[taken] = 0
+    return kept
 
 
 def _vehicle_room(
@@ -699,6 +743,35 @@ def _snap_to_motion(
         return None
     _distance, dx, dy = best
     return (box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy)
+
+
+def _support(
+    frame: np.ndarray,
+    background: np.ndarray,
+    box: tuple[float, float, float, float],
+    category: str,
+    fg_thresh: int,
+) -> float:
+    """Share of the box's seed that differs from the plate, as ``_attach`` sees it."""
+    height, width = frame.shape[:2]
+    x0 = int(max(0, np.floor(box[0])))
+    y0 = int(max(0, np.floor(box[1])))
+    x1 = int(min(width, np.ceil(box[2])))
+    y1 = int(min(height, np.ceil(box[3])))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return 0.0
+    crop = frame[y0:y1, x0:x1]
+    plate = background[y0:y1, x0:x1]
+    core = _seed(crop.shape[:2], (box[0] - x0, box[1] - y0, box[2] - x0, box[3] - y0), category)
+    inside = core > 0
+    if not inside.any():
+        return 0.0
+    if category == "vehicle":
+        diff = cv2.absdiff(crop, plate).max(axis=2)
+        moving = diff > _object_threshold(diff, core, category, fg_thresh)
+    else:
+        moving = _motion(crop, plate, fg_thresh) > 0
+    return float(moving[inside].mean())
 
 
 def _scaled_boxes(
@@ -1368,6 +1441,47 @@ def _reuse_ghost(
     return _clip_ghost(moved, width, height)
 
 
+def _looks_like(
+    frame: np.ndarray, ghost: dict[str, object], share: float, reach: int = 4
+) -> tuple[int, int] | None:
+    """Where ``frame`` still shows the ghost, within ``reach`` pixels, or None.
+
+    The ghost matches where at most ``share`` of its opaque pixels differ.
+    Filled-in frames drift a few pixels from the object, so small shifts are
+    tried and the best one is returned.
+    """
+    crop = ghost["crop"]
+    alpha = ghost["alpha"]
+    assert isinstance(crop, np.ndarray)
+    assert isinstance(alpha, np.ndarray)
+    if alpha.size <= 1:
+        return None
+    ys, xs = np.nonzero(alpha > 128)
+    if len(xs) < 8:
+        return None
+    if len(xs) > 4000:
+        pick = np.linspace(0, len(xs) - 1, 4000).astype(int)
+        ys, xs = ys[pick], xs[pick]
+    then = crop[ys, xs].astype(np.int16)
+    x = int(ghost["x"])  # type: ignore[arg-type]
+    y = int(ghost["y"])  # type: ignore[arg-type]
+    best: tuple[float, tuple[int, int]] | None = None
+    for dy in range(-reach, reach + 1, 2):
+        for dx in range(-reach, reach + 1, 2):
+            fy = ys + y + dy
+            fx = xs + x + dx
+            inside = (fy >= 0) & (fx >= 0) & (fy < frame.shape[0]) & (fx < frame.shape[1])
+            if int(inside.sum()) < 0.5 * len(xs):
+                continue
+            now = frame[fy[inside], fx[inside]].astype(np.int16)
+            changed = float((np.abs(now - then[inside]).max(axis=1) > 30).mean())
+            if best is None or changed < best[0]:
+                best = (changed, (dx, dy))
+    if best is None or best[0] >= share:
+        return None
+    return best[1]
+
+
 def _slow(boxes: Sequence[tuple[float, float, float, float]], index: int) -> bool:
     """True when the box moves less than a tenth of its size to a neighbor."""
     box = boxes[index]
@@ -1386,8 +1500,12 @@ def _still_there(
     frame: np.ndarray,
     source: np.ndarray,
     piece: tuple[int, int, np.ndarray],
+    share: float = 0.1,
 ) -> bool:
-    """True when the pixels under a mask still look as they did."""
+    """True when the pixels under a mask still look as they did.
+
+    At most ``share`` of them may have changed.
+    """
     x, y, mask = piece
     ys, xs = np.nonzero(mask)
     if len(xs) < 8:
@@ -1400,7 +1518,7 @@ def _still_there(
     ys, xs = ys[inside], xs[inside]
     diff = np.abs(frame[ys, xs].astype(np.int16) - source[ys, xs].astype(np.int16))
     # A tenth of the mask changing is a car that moved a few pixels.
-    return float((diff.max(axis=1) > 30).mean()) < 0.1
+    return float((diff.max(axis=1) > 30).mean()) < share
 
 
 def _motion_pieces(
@@ -1428,6 +1546,12 @@ def _motion_pieces(
     source_frame: np.ndarray | None = None
     offset_x = offset_y = 0.0
     for index, (frame, box) in enumerate(zip(frames, boxes, strict=True)):
+        if (offset_x or offset_y) and _support(
+            frame, background, box, category, fg_thresh
+        ) >= _SNAP_SUPPORT:
+            # The path caught up with the object. Carried on, the correction
+            # pushed a box that was right off the object again.
+            offset_x = offset_y = 0.0
         guess = (
             box[0] + offset_x,
             box[1] + offset_y,
@@ -1474,10 +1598,15 @@ def build_cutouts(
     category: str,
     fg_thresh: int = 22,
     avoid: Sequence[Sequence[tuple[float, float, float, float]]] | None = None,
+    plate: np.ndarray | None = None,
 ) -> list[dict[str, object]] | None:
     """Feathered ghosts for one track, one entry per input frame.
 
     ``avoid`` holds, per frame, the boxes of the other objects in it.
+    ``plate`` is the recap's background for this time. Someone who stands
+    still for most of the clip is part of the clip's own background, and
+    for them it is used instead (see ``_matched_plate``). Something found
+    against neither is not there to show, and the list is empty.
 
     A bad mask is repaired from a neighbor a few frames away. The crop
     comes from that neighbor, shifted with the box, so a short detection
@@ -1497,16 +1626,48 @@ def build_cutouts(
     scenery = (
         static_scenery(frames, background, boxes) if category == "vehicle" else None
     )
-    pieces, boxes = _motion_pieces(
-        frames, boxes, background, category, fg_thresh, span, travel, avoid
-    )
+    path_boxes = boxes
+
+    def measure(
+        plate_now: np.ndarray,
+    ) -> tuple[
+        list[tuple[int, int, np.ndarray]],
+        list[tuple[float, float, float, float]],
+        list[bool],
+    ]:
+        found, cut_at = _motion_pieces(
+            frames, path_boxes, plate_now, category, fg_thresh, span, travel, avoid
+        )
+        missed = [
+            int(piece[2].sum()) < 8 or not _object_is_visible(frame, plate_now, piece)
+            for frame, piece in zip(frames, found, strict=True)
+        ]
+        return found, cut_at, missed
+
+    pieces, boxes, bad = measure(background)
+    if (
+        category != "vehicle"
+        and plate is not None
+        and sum(bad) * 2 > len(bad)
+        and frame_is_ir(plate) == frame_is_ir(background)
+    ):
+        # Standing still she was part of the clip's own plate, and her mask
+        # was empty in most frames: a frozen snapshot, or gone. The recap's
+        # plate was made from frames minutes apart, without her.
+        other = _matched_plate(plate, background, path_boxes, span, category)
+        other_pieces, other_boxes, other_bad = measure(other)
+        if all(bad) and all(other_bad):
+            # Nothing there against either plate: Frigate took a post for a
+            # person, or someone stood there so long the recap's plate shows
+            # them anyway. A snapshot of it would be a sticker of the street.
+            return []
+        if sum(other_bad) < sum(bad) and masks_plausible(
+            other_pieces, other_boxes, category
+        ):
+            background, pieces, boxes, bad = other, other_pieces, other_boxes, other_bad
     if not masks_plausible(pieces, boxes, category):
         return window_ghosts(frames, boxes, category)
     areas = np.array([int(piece[2].sum()) for piece in pieces], np.float32)
-    bad = [
-        bool(area < 8) or not _object_is_visible(frame, background, piece)
-        for area, frame, piece in zip(areas, frames, pieces, strict=True)
-    ]
     low_ratio = 0.35 if category == "vehicle" else 0.45
     for index, area in enumerate(areas):
         if bad[index]:
@@ -1641,18 +1802,125 @@ def build_cutouts(
         if not drawn:
             return window_ghosts(frames, boxes, category)
         for index in missing:
+            donor = min(drawn, key=lambda item: abs(item - index))
             if index < drawn[0] or index > drawn[-1]:
                 # Before it is found or after it is gone: leave the frame out
-                # instead of freezing the object there.
+                # instead of freezing the object there. A person who got out
+                # of a truck and stood by it is part of the clip's own plate,
+                # though, and the mask finds nothing. Where the frame still
+                # shows them under their last cutout, they are standing there,
+                # and are held in place: Frigate's box drifts around them.
+                if category != "vehicle":
+                    found = _looks_like(frames[index], ghosts[donor], 0.25)
+                    if found is not None:
+                        ghosts[index] = dict(
+                            ghosts[donor],
+                            x=int(ghosts[donor]["x"]) + found[0],  # type: ignore[arg-type]
+                            y=int(ghosts[donor]["y"]) + found[1],  # type: ignore[arg-type]
+                            standing=True,
+                        )
                 continue
-            donor = min(drawn, key=lambda item: abs(item - index))
             held = _reuse_ghost(
                 ghosts[donor], boxes[donor], boxes[index], width, height
             )
             if held is not None:
                 held["held"] = True
                 ghosts[index] = held
-    return ghosts
+    return _steady_outlines(ghosts, centers)
+
+
+def _matched_plate(
+    plate: np.ndarray,
+    background: np.ndarray,
+    boxes: Sequence[tuple[float, float, float, float]],
+    span: tuple[float, float, float, float],
+    category: str,
+) -> np.ndarray:
+    """The recap's plate, brightened or darkened to the clip's own background.
+
+    The gain per channel is measured away from the object, where the two
+    show the same street a few minutes apart.
+    """
+    height, width = background.shape[:2]
+    if plate.shape[:2] != (height, width):
+        plate = cv2.resize(plate, (width, height), interpolation=cv2.INTER_AREA)
+    away = np.ones((height, width), bool)
+    for box in boxes:
+        x0, y0, x1, y1 = search_window(box, category, width, height, span)
+        away[y0:y1, x0:x1] = False
+    if int(away.sum()) < 0.1 * height * width:
+        return plate
+    clip = background[away].astype(np.float32) + 1.0
+    still = plate[away].astype(np.float32) + 1.0
+    gain = np.clip(np.median(clip / still, axis=0), 0.7, 1.4)
+    return np.clip(plate.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+
+
+# How far, as a share of the object's height, a pixel may be from the
+# outline in both neighboring frames before it is a one-frame flicker.
+_STEADY_REACH = 0.04
+
+
+def _steady_outlines(
+    ghosts: list[dict[str, object]], centers: np.ndarray
+) -> list[dict[str, object]]:
+    """Ghosts without the parts that flash up for a single frame.
+
+    A splash or a reflection under someone's feet joined their outline on
+    one frame and not the next, and the outline jumped by half their height.
+    A pixel farther than ``_STEADY_REACH`` of the object's height from the
+    outline in both neighboring frames (moved along the smoothed box path,
+    ``centers``) is taken out. Nothing is added, so no road comes along, and
+    a limb that moved a little between frames stays.
+    """
+    masks: list[tuple[int, int, np.ndarray] | None] = []
+    for ghost in ghosts:
+        alpha = ghost["alpha"]
+        if (
+            not isinstance(alpha, np.ndarray)
+            or alpha.size <= 1
+            or ghost.get("window")
+            or ghost.get("held")
+            or ghost.get("standing")
+        ):
+            masks.append(None)
+            continue
+        own = alpha > 128
+        masks.append(
+            (int(ghost["x"]), int(ghost["y"]), own) if int(own.sum()) >= 8 else None  # type: ignore[arg-type]
+        )
+    steady = list(ghosts)
+    for index, item in enumerate(masks):
+        if item is None:
+            continue
+        x, y, own = item
+        rows = np.flatnonzero(own.any(axis=1))
+        reach = max(2, int(round(_STEADY_REACH * (rows[-1] - rows[0] + 1))))
+        kernel = np.ones((2 * reach + 1, 2 * reach + 1), np.uint8)
+        near = np.zeros(own.shape, bool)
+        seen = False
+        for other in (index - 1, index + 1):
+            if not 0 <= other < len(masks) or masks[other] is None:
+                continue
+            ox, oy, theirs = masks[other]  # type: ignore[misc]
+            # Their mask, moved with the object onto this frame's crop.
+            dx = int(round(float(centers[index][0] - centers[other][0]))) + ox - x
+            dy = int(round(float(centers[index][1] - centers[other][1]))) + oy - y
+            placed = np.zeros(own.shape, np.uint8)
+            _paste(placed, 0, 0, theirs.astype(np.uint8), dx, dy)
+            near |= cv2.dilate(placed, kernel) > 0
+            seen = True
+        if not seen:
+            continue
+        flicker = own & ~near
+        if int(flicker.sum()) < 0.02 * int(own.sum()):
+            continue
+        alpha = np.asarray(ghosts[index]["alpha"]).copy()
+        alpha[flicker] = 0
+        trimmed = dict(ghosts[index])
+        trimmed["alpha"] = solid_feather((alpha > 128).astype(np.uint8) * 255)
+        steady[index] = trimmed
+    return steady
 
 
 def _paste(

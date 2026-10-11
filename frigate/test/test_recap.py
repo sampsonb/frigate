@@ -76,6 +76,7 @@ from frigate.recap.render import (
     compose_frame,
     draw_label,
     leader_without_ghost,
+    smooth_points,
 )
 from frigate.recap.storage import list_visible_recaps, recap_kind, remove_superseded
 
@@ -2323,6 +2324,23 @@ def _checker(height: int, width: int, dark: int, light: int) -> np.ndarray:
     image = np.full((height, width, 3), dark, np.uint8)
     image[::2, ::2] = light
     return image
+
+
+class TestLeaders(unittest.TestCase):
+    def test_a_jittering_end_point_glides(self):
+        jitter = [(100 + 4 * index, 50 + (12 if index % 2 else -12)) for index in range(15)]
+        smooth = smooth_points(jitter, 3)
+        steps = [abs(b[1] - a[1]) for a, b in zip(smooth[3:-3], smooth[4:-3])]
+        self.assertLessEqual(max(steps), 4)
+
+    def test_a_steady_walk_is_not_moved(self):
+        walk = [(100 + 4 * index, 50 + 2 * index) for index in range(15)]
+        self.assertEqual(smooth_points(walk, 3)[3:-3], walk[3:-3])
+
+    def test_frames_without_a_mask_stay_empty(self):
+        points = [(10, 10), None, (14, 10)]
+        # Nearer points weigh more.
+        self.assertEqual(smooth_points(points, 3), [(11, 10), None, (13, 10)])
 
 
 class TestNightAndLabels(unittest.TestCase):

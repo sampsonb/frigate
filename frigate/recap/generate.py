@@ -1238,16 +1238,16 @@ def generate_recap(
             stats=stats,
             time_shift=time_shift,
             load_snapshot=load_snapshot,
-            others=(
-                [
-                    other
-                    for other, _other_category, _other_track in active
-                    if str(other.get("source_id") or other["id"])
-                    != str(event.get("source_id") or event["id"])
-                ]
-                if category == "vehicle"
-                else ()
-            ),
+            others=[
+                other
+                for other, other_category, _other_track in active
+                if str(other.get("source_id") or other["id"])
+                != str(event.get("source_id") or event["id"])
+                and _avoids(category, other_category)
+            ],
+            plate_at=lambda moment: timed_plates[
+                plate_index_at(timed_plates, moment)
+            ].image,
         )
         if cut.status == "no_frames":
             excluded.append(
@@ -1861,6 +1861,15 @@ def _still_ends(
     return start, end
 
 
+def _avoids(category: str, other: str) -> bool:
+    """Whether a cutout of ``category`` stays out of an ``other`` object's box.
+
+    A person keeps the dog they walk: the two are joined after the cutouts
+    (``_merge_dog_walkers``), and the person's cutout is the one drawn.
+    """
+    return category == "vehicle" or category == "animal" or other != "animal"
+
+
 def _others_in(
     others: Sequence[dict[str, Any]],
     times: Sequence[float],
@@ -1906,11 +1915,12 @@ def _cutouts_for(
     time_shift: float = 0.0,
     load_snapshot: LoadSnapshot | None = None,
     others: Sequence[dict[str, Any]] = (),
+    plate_at: Callable[[float], np.ndarray | None] | None = None,
 ) -> _Cut:
     """Ghost frames for one event, from the cache when possible.
 
-    ``others`` are the other events in the recap. A vehicle's cutout never
-    takes a piece from inside one of their boxes.
+    ``others`` are the other events in the recap. A cutout never takes a
+    piece from inside one of their boxes (``_avoids`` says whose).
 
     A moving cutout is used when the clip is well lit and the path lines
     up with the recording. Otherwise, and whenever the clip is infrared
@@ -2050,12 +2060,13 @@ def _cutouts_for(
         # the clip's own plate, and the parked car stops showing as itself.
         start, end = _still_ends(frames, times, boxes)
         frames, times, boxes = frames[start:end], times[start:end], boxes[start:end]
-    avoid = (
-        _others_in(others, times, width, height, shift)
-        if category == "vehicle" and others
+    avoid = _others_in(others, times, width, height, shift) if others else None
+    plate = (
+        plate_at((float(times[0]) + float(times[-1])) / 2 + shift)
+        if plate_at is not None and times
         else None
     )
-    ghosts = build_cutouts(frames, boxes, category, avoid=avoid)
+    ghosts = build_cutouts(frames, boxes, category, avoid=avoid, plate=plate)
     if ghosts and _mostly_windows(ghosts):
         held = still("mask did not hold")
         if held is not None and held.status == "ok":

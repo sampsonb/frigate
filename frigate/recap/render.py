@@ -37,6 +37,8 @@ from frigate.recap.plates import (
 logger = logging.getLogger(__name__)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+# Frames on each side averaged into a leader's end point (see Tube.leaders).
+LEADER_SMOOTH = 3
 DRAW_RANK = {"vehicle": 0, "parked": 1, "delivery": 2, "animal": 3, "person": 4}
 
 
@@ -108,6 +110,27 @@ class Tube:
     context_last: bytes | None = None
     # Frigate's snapshot held in place rather than a clip.
     still: bool = False
+    _leaders: list[tuple[int, int] | None] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def leaders(self) -> list[tuple[int, int] | None]:
+        """Where each frame's leader ends: the mask centroid, averaged with its neighbors.
+
+        Measured on one frame, the centroid jumps with the mask (a shadow, a
+        swinging bag), and the dot and its line jumped with it. Averaged over
+        ``LEADER_SMOOTH`` frames each side it glides. A steady walk is not
+        moved by a centered average, only the jitter is.
+        """
+        if self._leaders is None:
+            raw: list[tuple[int, int] | None] = []
+            for ghost in self.frames:
+                pixels = ghost.pixels()
+                raw.append(
+                    None if pixels is None else mask_centroid(pixels[1], ghost.x, ghost.y)
+                )
+            self._leaders = smooth_points(raw, LEADER_SMOOTH)
+        return self._leaders
 
     def context_image(self, which: str) -> np.ndarray | None:
         raw = self.context_last if which == "last" else self.context_first
@@ -540,7 +563,9 @@ def compose_frame(
         )
         if drawn and tip is not None:
             shown.add(index)
-            tips[index] = tip
+            points = tube.leaders()
+            steady = points[source_index] if source_index < len(points) else None
+            tips[index] = steady if steady is not None else tip
 
     for index in active:
         if index not in shown:
@@ -648,6 +673,28 @@ def compose_frame(
         cv2.LINE_AA,
     )
     return canvas
+
+
+def smooth_points(
+    points: Sequence[tuple[int, int] | None], radius: int
+) -> list[tuple[int, int] | None]:
+    """Each point averaged with its neighbors within ``radius``, nearer ones weighing more."""
+    smoothed: list[tuple[int, int] | None] = []
+    for index, point in enumerate(points):
+        if point is None:
+            smoothed.append(None)
+            continue
+        total = sum_x = sum_y = 0.0
+        for other in range(max(0, index - radius), min(len(points), index + radius + 1)):
+            near = points[other]
+            if near is None:
+                continue
+            weight = float(radius + 1 - abs(other - index))
+            total += weight
+            sum_x += weight * near[0]
+            sum_y += weight * near[1]
+        smoothed.append((int(round(sum_x / total)), int(round(sum_y / total))))
+    return smoothed
 
 
 def _iou(
