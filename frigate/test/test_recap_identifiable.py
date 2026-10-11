@@ -246,7 +246,7 @@ class TestWindows(unittest.TestCase):
             np.array_equal(crop[alpha.shape[0] // 2, alpha.shape[1] // 2], RED)
         )
 
-    def test_infrared_frames_become_windows_not_motion_masks(self):
+    def test_infrared_frames_are_cut_out_like_daylight(self):
         frames = [_scene(moment, (70, 70, 70)) for moment in (0.5, 0.75, 1.0, 1.25)]
         boxes = [
             (_car_left(moment), CAR_TOP, _car_left(moment) + CAR_W, CAR_TOP + CAR_H)
@@ -255,7 +255,10 @@ class TestWindows(unittest.TestCase):
         ghosts = build_cutouts(frames, boxes, "vehicle")
         self.assertIsNotNone(ghosts)
         assert ghosts is not None
-        self.assertTrue(all(ghost.get("window") for ghost in ghosts))
+        self.assertFalse(any(ghost.get("window") for ghost in ghosts))
+        self.assertTrue(
+            all(int((np.asarray(g["alpha"]) > 128).sum()) > 300 for g in ghosts)
+        )
 
     def test_rounded_alpha_is_opaque_inside(self):
         alpha = rounded_alpha(40, 60)
@@ -456,9 +459,9 @@ class TestPeople(unittest.TestCase):
         self.assertTrue(_avoids("animal", "person"))
         self.assertTrue(_avoids("vehicle", "animal"))
 
-    def test_a_person_who_stops_is_held_standing_not_dropped(self):
+    def test_a_person_who_stops_stays_on_screen(self):
         # She got out of the truck and stood by it. Standing still she is part
-        # of the clip's own plate, and the mask finds nothing there.
+        # of the clip's own plate, and her frames were left out.
         frames, boxes = [], []
         for index in range(30):
             left = 80 + 5 * min(index, 4)
@@ -468,15 +471,33 @@ class TestPeople(unittest.TestCase):
             # Frigate's box drifts around someone standing still.
             drift = 0.3 * max(0, index - 4)
             boxes.append((left - drift, 60.0, left + 22 - drift, 130.0))
-        ghosts = build_cutouts(frames, boxes, "person")
+        ghosts = build_cutouts(frames, boxes, "person", plate=self._road())
         assert ghosts is not None
         for index, ghost in enumerate(ghosts):
-            self.assertGreater(int((np.asarray(ghost["alpha"]) > 128).sum()), 300, index)
-        standing = [ghost for ghost in ghosts if ghost.get("standing")]
-        self.assertTrue(standing)
-        # Held where she stands, not sliding with the box.
-        self.assertLessEqual(len({int(ghost["x"]) for ghost in standing}), 2)
+            alpha = np.asarray(ghost["alpha"])
+            self.assertGreater(int((alpha > 128).sum()), 300, index)
+        # Where she stands, not sliding with the box.
+        last = ghosts[-1]
+        ys, xs = np.nonzero(np.asarray(last["alpha"]) > 128)
+        self.assertAlmostEqual(float(xs.mean()) + int(last["x"]), 111.0, delta=3.0)
         self.assertFalse(_too_many_held(ghosts))
+
+    def test_a_runner_who_outran_his_box_is_not_held(self):
+        # Frigate's box stopped while the jogger ran on. His last cutout was
+        # pavement, held for seconds under his label.
+        frames, boxes = [], []
+        for index in range(24):
+            frame = self._road()
+            left = 40 + 12 * index
+            if left < WIDTH - 22:
+                frame[60:130, left : left + 22] = DARK
+            frames.append(frame)
+            box_left = 40 + 12 * min(index, 9)
+            boxes.append((float(box_left), 60.0, float(box_left + 22), 130.0))
+        ghosts = build_cutouts(frames, boxes, "person", plate=self._road())
+        assert ghosts is not None
+        self.assertFalse(any(g.get("standing") for g in ghosts))
+        self.assertTrue(all(int(np.asarray(g["alpha"]).max()) < 8 for g in ghosts[16:]))
 
     def test_a_person_who_left_is_still_left_out(self):
         frames, boxes = [], []
@@ -487,7 +508,7 @@ class TestPeople(unittest.TestCase):
                 frame[60:130, left : left + 22] = DARK
             frames.append(frame)
             boxes.append((float(left), 60.0, float(left + 22), 130.0))
-        ghosts = build_cutouts(frames, boxes, "person")
+        ghosts = build_cutouts(frames, boxes, "person", plate=self._road())
         assert ghosts is not None
         self.assertTrue(
             all(int(np.asarray(g["alpha"]).max()) < 8 for g in ghosts[16:])
@@ -593,11 +614,14 @@ class TestSnapshots(unittest.TestCase):
             )
         return cut, calls
 
-    def test_night_object_is_its_snapshot_and_no_clip_is_decoded(self):
+    def test_night_object_moves_instead_of_a_held_snapshot(self):
+        # Held snapshots at night left the first twenty seconds of a recap
+        # with nothing moving.
         cut, calls = self._cut(_event(), (70, 70, 70), (70, 70, 70))
         self.assertEqual(cut.status, "ok")
-        self.assertTrue(cut.still)
-        self.assertEqual(calls, [])
+        self.assertFalse(cut.still)
+        self.assertEqual(len(calls), 1)
+        self.assertGreater(len(cut.frames), 8)
 
     def test_lined_up_daylight_object_moves(self):
         cut, calls = self._cut(_event(), DAYLIGHT)

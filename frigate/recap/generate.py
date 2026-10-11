@@ -31,7 +31,6 @@ from frigate.recap.categories import (
 )
 from frigate.recap.cutout import (
     build_cutouts,
-    needs_window,
     parked_car_ghost,
     window_ghost,
 )
@@ -2000,11 +1999,8 @@ def _cutouts_for(
         )
         return remember(_keep_visible(cut, width, height))
 
-    # Infrared or dusk: a clip is grain, glare, and motion blur.
-    if image is not None and needs_window(image):
-        held = still("infrared or dusk")
-        if held is not None and held.status == "ok":
-            return held
+    # Infrared or dusk clips are cut out too. Held snapshots at night left
+    # the first twenty seconds of a recap with nothing moving.
 
     # The stretch around the best view, in detector time, plus enough
     # recording on each side for any shift the search may pick.
@@ -2066,11 +2062,9 @@ def _cutouts_for(
         else None
     )
     ghosts = build_cutouts(frames, boxes, category, avoid=avoid, plate=plate)
-    if ghosts and _mostly_windows(ghosts):
-        held = still("mask did not hold")
-        if held is not None and held.status == "ok":
-            return held
-    if ghosts and _too_many_held(ghosts):
+    # Where the mask did not hold, the object moves as a window: its padded
+    # box as recorded. Seeing it move beats a snapshot frozen in place.
+    if ghosts and not _mostly_windows(ghosts) and _too_many_held(ghosts):
         held = still("object missing from much of the clip")
         if held is not None and held.status == "ok":
             return held

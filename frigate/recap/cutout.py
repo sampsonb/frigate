@@ -510,16 +510,15 @@ def _attach_in(
     elif int(core.sum()):
         # The same for people: the oval inside a far person's box is most of
         # the box, and it brought a pale patch of the clip's own pavement
-        # along. Someone who barely differs (standing in their own clip's
-        # plate) keeps the oval.
+        # along. A jogger who had run ahead of his box left only pavement in
+        # it, held for seconds under his label. Someone standing in their own
+        # clip's plate is found against the recap's plate instead.
         person_diff = cv2.absdiff(work_crop, work_plate).max(axis=2)
         differs = cv2.dilate(
             (person_diff >= max(8, fg_thresh // 2)).astype(np.uint8),
             np.ones((5, 5), np.uint8),
         )
-        trimmed = core & differs
-        if int(trimmed.sum()) >= 0.25 * core_area:
-            kept_core = trimmed
+        kept_core = core & differs
     body = (kept_core > 0) | (extra > 0)
     if category == "vehicle":
         body &= ~_occluders(work_plate, diff, thresh)
@@ -1456,45 +1455,54 @@ def _reuse_ghost(
     return _clip_ghost(moved, width, height)
 
 
-def _looks_like(
-    frame: np.ndarray, ghost: dict[str, object], share: float, reach: int = 4
-) -> tuple[int, int] | None:
-    """Where ``frame`` still shows the ghost, within ``reach`` pixels, or None.
+# Share of a mask that must differ strongly from the recap's plate for a
+# frame to count against it (see ``_strong_share``).
+_SOMEONE_SHARE = 0.3
+# Share of a person's frames the clip's own plate has to miss before the
+# recap's plate is tried for them (see ``build_cutouts``).
+_PLATE_RETRY = 0.25
+# Most a mask's colors may differ from the object's, as a Bhattacharyya
+# distance between hue and saturation histograms, to be the same object.
+_SAME_COLORS = 0.55
 
-    The ghost matches where at most ``share`` of its opaque pixels differ.
-    Filled-in frames drift a few pixels from the object, so small shifts are
-    tried and the best one is returned.
-    """
-    crop = ghost["crop"]
-    alpha = ghost["alpha"]
-    assert isinstance(crop, np.ndarray)
-    assert isinstance(alpha, np.ndarray)
-    if alpha.size <= 1:
+
+def _colors(
+    frames: Sequence[np.ndarray], pieces: Sequence[tuple[int, int, np.ndarray]]
+) -> np.ndarray | None:
+    """Hue and saturation histogram of the pixels under some masks, or None."""
+    samples: list[np.ndarray] = []
+    step = max(1, len(frames) // 8)
+    for frame, (x, y, mask) in list(zip(frames, pieces, strict=True))[::step]:
+        ys, xs = np.nonzero(mask)
+        fy, fx = ys + y, xs + x
+        inside = (fy >= 0) & (fx >= 0) & (fy < frame.shape[0]) & (fx < frame.shape[1])
+        if int(inside.sum()) < 8:
+            continue
+        samples.append(frame[fy[inside], fx[inside]])
+    if not samples:
         return None
-    ys, xs = np.nonzero(alpha > 128)
-    if len(xs) < 8:
-        return None
-    if len(xs) > 4000:
-        pick = np.linspace(0, len(xs) - 1, 4000).astype(int)
-        ys, xs = ys[pick], xs[pick]
-    then = crop[ys, xs].astype(np.int16)
-    x = int(ghost["x"])  # type: ignore[arg-type]
-    y = int(ghost["y"])  # type: ignore[arg-type]
-    best: tuple[float, tuple[int, int]] | None = None
-    for dy in range(-reach, reach + 1, 2):
-        for dx in range(-reach, reach + 1, 2):
-            fy = ys + y + dy
-            fx = xs + x + dx
-            inside = (fy >= 0) & (fx >= 0) & (fy < frame.shape[0]) & (fx < frame.shape[1])
-            if int(inside.sum()) < 0.5 * len(xs):
-                continue
-            now = frame[fy[inside], fx[inside]].astype(np.int16)
-            changed = float((np.abs(now - then[inside]).max(axis=1) > 30).mean())
-            if best is None or changed < best[0]:
-                best = (changed, (dx, dy))
-    if best is None or best[0] >= share:
-        return None
-    return best[1]
+    pixels = np.concatenate(samples).reshape(-1, 1, 3)
+    hsv = cv2.cvtColor(pixels, cv2.COLOR_BGR2HSV)
+    histogram = cv2.calcHist([hsv], [0, 1], None, [18, 8], [0, 180, 0, 256])
+    cv2.normalize(histogram, histogram, 1.0, 0.0, cv2.NORM_L1)
+    return histogram
+
+
+def _strong_share(
+    frame: np.ndarray, plate: np.ndarray, piece: tuple[int, int, np.ndarray]
+) -> float:
+    """Share of a mask whose pixels differ from ``plate`` by more than 40."""
+    origin_x, origin_y, mask = piece
+    ys, xs = np.nonzero(mask)
+    fy, fx = ys + origin_y, xs + origin_x
+    inside = (fy >= 0) & (fx >= 0) & (fy < frame.shape[0]) & (fx < frame.shape[1])
+    if int(inside.sum()) < 8:
+        return 0.0
+    diff = np.abs(
+        frame[fy[inside], fx[inside]].astype(np.int16)
+        - plate[fy[inside], fx[inside]].astype(np.int16)
+    ).max(axis=1)
+    return float((diff > 40).mean())
 
 
 def _slow(boxes: Sequence[tuple[float, float, float, float]], index: int) -> bool:
@@ -1636,15 +1644,13 @@ def build_cutouts(
     travel = _horizontal_travel(boxes)
     background = clean_background(frames, boxes, category, span, travel)
     height, width = background.shape[:2]
-    if needs_window(background):
-        return window_ghosts(frames, boxes, category)
     scenery = (
         static_scenery(frames, background, boxes) if category == "vehicle" else None
     )
     path_boxes = boxes
 
     def measure(
-        plate_now: np.ndarray,
+        plate_now: np.ndarray, strict: bool = False
     ) -> tuple[
         list[tuple[int, int, np.ndarray]],
         list[tuple[float, float, float, float]],
@@ -1654,7 +1660,9 @@ def build_cutouts(
             frames, path_boxes, plate_now, category, fg_thresh, span, travel, avoid
         )
         missed = [
-            int(piece[2].sum()) < 8 or not _object_is_visible(frame, plate_now, piece)
+            int(piece[2].sum()) < 8
+            or not _object_is_visible(frame, plate_now, piece)
+            or (strict and _strong_share(frame, plate_now, piece) < _SOMEONE_SHARE)
             for frame, piece in zip(frames, found, strict=True)
         ]
         return found, cut_at, missed
@@ -1663,23 +1671,42 @@ def build_cutouts(
     if (
         category != "vehicle"
         and plate is not None
-        and sum(bad) * 2 > len(bad)
+        and sum(bad) >= _PLATE_RETRY * len(bad)
         and frame_is_ir(plate) == frame_is_ir(background)
     ):
         # Standing still she was part of the clip's own plate, and her mask
-        # was empty in most frames: a frozen snapshot, or gone. The recap's
-        # plate was made from frames minutes apart, without her.
+        # was empty: a frozen snapshot, or gone. The recap's plate was made
+        # from frames minutes apart, without her. It is used frame by frame
+        # where the clip's own plate finds nothing, and only where it differs
+        # strongly, as a person does: wet pavement minutes apart differs too.
         other = _matched_plate(plate, background, path_boxes, span, category)
-        other_pieces, other_boxes, other_bad = measure(other)
+        other_pieces, other_boxes, other_bad = measure(other, strict=True)
         if all(bad) and all(other_bad):
             # Nothing there against either plate: Frigate took a post for a
             # person, or someone stood there so long the recap's plate shows
             # them anyway. A snapshot of it would be a sticker of the street.
             return []
-        if sum(other_bad) < sum(bad) and masks_plausible(
-            other_pieces, other_boxes, category
-        ):
-            background, pieces, boxes, bad = other, other_pieces, other_boxes, other_bad
+        pieces, boxes, bad = list(pieces), list(boxes), list(bad)
+        # What it looked like where the clip's own plate found it. A coasting
+        # box on the planter differed from the recap's plate too, by its
+        # swaying red flowers, and the dog walker who had left became a
+        # frozen snapshot.
+        seen = _colors(
+            [frames[index] for index, missed in enumerate(bad) if not missed],
+            [pieces[index] for index, missed in enumerate(bad) if not missed],
+        )
+        for index, missed in enumerate(bad):
+            if not missed or other_bad[index]:
+                continue
+            if seen is not None:
+                found = _colors([frames[index]], [other_pieces[index]])
+                if found is None or cv2.compareHist(
+                    seen, found, cv2.HISTCMP_BHATTACHARYYA
+                ) > _SAME_COLORS:
+                    continue
+            pieces[index] = other_pieces[index]
+            boxes[index] = other_boxes[index]
+            bad[index] = False
     if not masks_plausible(pieces, boxes, category):
         return window_ghosts(frames, boxes, category)
     areas = np.array([int(piece[2].sum()) for piece in pieces], np.float32)
@@ -1801,9 +1828,17 @@ def build_cutouts(
             cached = None
             cached_box = None
             continue
-        cached = ghost
-        cached_box = box
-        cached_frame = frame
+        if ghost.get("repaired"):
+            # Taken from a neighbor: this frame never showed it here, and a
+            # runner who outran his box was reused, frozen, where the frames
+            # matched only because both were empty pavement.
+            cached = None
+            cached_box = None
+            cached_frame = None
+        else:
+            cached = ghost
+            cached_box = box
+            cached_frame = frame
         ghosts.append(ghost)
     if missing:
         skipped = set(missing)
@@ -1817,24 +1852,12 @@ def build_cutouts(
         if not drawn:
             return window_ghosts(frames, boxes, category)
         for index in missing:
-            donor = min(drawn, key=lambda item: abs(item - index))
             if index < drawn[0] or index > drawn[-1]:
                 # Before it is found or after it is gone: leave the frame out
-                # instead of freezing the object there. A person who got out
-                # of a truck and stood by it is part of the clip's own plate,
-                # though, and the mask finds nothing. Where the frame still
-                # shows them under their last cutout, they are standing there,
-                # and are held in place: Frigate's box drifts around them.
-                if category != "vehicle":
-                    found = _looks_like(frames[index], ghosts[donor], 0.25)
-                    if found is not None:
-                        ghosts[index] = dict(
-                            ghosts[donor],
-                            x=int(ghosts[donor]["x"]) + found[0],  # type: ignore[arg-type]
-                            y=int(ghosts[donor]["y"]) + found[1],  # type: ignore[arg-type]
-                            standing=True,
-                        )
+                # instead of freezing the object there. Someone standing still
+                # is found against the recap's plate instead (see above).
                 continue
+            donor = min(drawn, key=lambda item: abs(item - index))
             held = _reuse_ghost(
                 ghosts[donor], boxes[donor], boxes[index], width, height
             )
@@ -1896,7 +1919,6 @@ def _steady_outlines(
             or alpha.size <= 1
             or ghost.get("window")
             or ghost.get("held")
-            or ghost.get("standing")
         ):
             masks.append(None)
             continue
