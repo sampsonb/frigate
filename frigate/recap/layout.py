@@ -417,12 +417,56 @@ def _area(box: tuple[float, float, float, float]) -> float:
     return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
 
 
+# Seconds between one track's last sighting and the next one's first under
+# which, at the same spot, the second takes over from the first.
+HANDOVER_SECONDS = 1.5
+
+
+def _foot(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    return (box[0] + box[2]) / 2, box[3]
+
+
+def _same_spot(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+    vehicle: bool,
+) -> bool:
+    """True when two boxes are one object.
+
+    Boxes that cover each other are. A vehicle also is when its foot is in
+    the same place and its size is close: Frigate's sizes come from a few
+    timeline samples, so two tracks of one van can disagree on size while
+    their path points agree. People keep the strict test, so two people
+    side by side stay two.
+    """
+    if _iou(left, right) > 0.45:
+        return True
+    if not vehicle:
+        return False
+    ratio = _area(left) / max(1.0, _area(right))
+    if not 0.4 <= ratio <= 2.5:
+        return False
+    left_foot, right_foot = _foot(left), _foot(right)
+    reach = 0.3 * max(
+        math.hypot(left[2] - left[0], left[3] - left[1]),
+        math.hypot(right[2] - right[0], right[3] - right[1]),
+    )
+    return (
+        math.hypot(left_foot[0] - right_foot[0], left_foot[1] - right_foot[1]) <= reach
+    )
+
+
 def dedupe_tracks(tracks: Sequence[MotionTrack]) -> dict[int, int]:
     """Drop a second track of the same physical object.
 
     Returns ``{dropped index: kept index}``. Parked-car synthetics are
     not passed in here. Two people sitting side by side are kept: only
     tracks whose boxes cover each other are merged.
+
+    Frigate also splits one object into several events: it loses it for a
+    moment, or changes its label (a delivery van seen as a car, then a bus).
+    A short track that hands over to a longer one at the same spot, within
+    ``HANDOVER_SECONDS``, is that object too, and the short one is dropped.
     """
     dropped: dict[int, int] = {}
     order = sorted(range(len(tracks)), key=lambda index: tracks[index].start)
@@ -430,13 +474,40 @@ def dedupe_tracks(tracks: Sequence[MotionTrack]) -> dict[int, int]:
         if left_i in dropped:
             continue
         left = tracks[left_i]
+        left_last = left.times[-1] if left.times else left.end
         for right_i in order[position + 1 :]:
             if right_i in dropped:
                 continue
             right = tracks[right_i]
-            if right.start > left.end:
+            if right.start > max(left.end, left_last + HANDOVER_SECONDS):
                 break
             if left.category == "parked" or right.category == "parked":
+                continue
+            if not left.boxes or not right.boxes:
+                continue
+            vehicle = left.category == "vehicle" and right.category == "vehicle"
+            right_first = right.times[0] if right.times else right.start
+            if right_first > left_last:
+                if (
+                    right_first - left_last <= HANDOVER_SECONDS
+                    and left.category == right.category
+                    and _same_spot(left.boxes[-1], right.boxes[0], vehicle)
+                ):
+                    left_span = left_last - (
+                        left.times[0] if left.times else left.start
+                    )
+                    right_span = (
+                        right.times[-1] if right.times else right.end
+                    ) - right_first
+                    if min(left_span, right_span) < 0.35 * max(left_span, right_span):
+                        keep, lose = (
+                            (left_i, right_i)
+                            if left_span >= right_span
+                            else (right_i, left_i)
+                        )
+                        dropped[lose] = keep
+                        if lose == left_i:
+                            break
                 continue
             compared = 0
             same = 0
@@ -445,17 +516,25 @@ def dedupe_tracks(tracks: Sequence[MotionTrack]) -> dict[int, int]:
                 if abs(right.times[other_i] - moment) > 0.4:
                     continue
                 compared += 1
-                if _iou(box, right.boxes[other_i]) > 0.45:
+                if _same_spot(box, right.boxes[other_i], vehicle):
                     same += 1
             if (
                 compared >= 0.4 * min(len(left.boxes), len(right.boxes))
                 and same >= 0.6 * compared
             ):
-                left_area = float(np.mean([_area(box) for box in left.boxes]))
-                right_area = float(np.mean([_area(box) for box in right.boxes]))
-                keep, lose = (
-                    (left_i, right_i) if left_area >= right_area else (right_i, left_i)
+                # The one seen longer, so the clip keeps the whole drive; of
+                # two about as long, the bigger box, which holds all of it.
+                left_span = left_last - (left.times[0] if left.times else left.start)
+                right_span = (right.times[-1] if right.times else right.end) - (
+                    right.times[0] if right.times else right.start
                 )
+                if min(left_span, right_span) < 0.7 * max(left_span, right_span):
+                    left_wins = left_span >= right_span
+                else:
+                    left_wins = float(
+                        np.mean([_area(box) for box in left.boxes])
+                    ) >= float(np.mean([_area(box) for box in right.boxes]))
+                keep, lose = (left_i, right_i) if left_wins else (right_i, left_i)
                 dropped[lose] = keep
                 if lose == left_i:
                     break

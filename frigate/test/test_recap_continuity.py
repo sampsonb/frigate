@@ -26,6 +26,7 @@ from frigate.recap.generate import (
 from frigate.recap.layout import (
     MotionTrack,
     ScheduledUnit,
+    dedupe_tracks,
     follows,
     schedule_units,
 )
@@ -289,6 +290,37 @@ class TestFollows(unittest.TestCase):
         person = _unit("person", 12, (280.0, 10.0, 300.0, 50.0))
         starts, _length = schedule_units([truck, person], WIDTH, HEIGHT, 200)
         self.assertEqual(starts, [0, 0])
+
+
+def _path(track_id, start, end, left_at, label="car", tall=60.0, wide=110.0):
+    """A path track sampled twice a second; ``left_at(t)`` is the box's left."""
+    times = [start + step * 0.5 for step in range(int((end - start) / 0.5) + 1)]
+    boxes = [(left_at(t), 100.0 - tall, left_at(t) + wide, 100.0) for t in times]
+    return _track(track_id, times, boxes, label)
+
+
+class TestSplitObjects(unittest.TestCase):
+    def test_a_van_seen_as_a_car_then_a_bus_is_one_van(self):
+        # 0.5 s as a car at the right edge, then 7 s as a bus driving left.
+        car = _path("car", 6.0, 6.5, lambda t: 300 - 20 * (t - 6.0))
+        bus = _path("bus", 6.9, 14.0, lambda t: 290 - 25 * (t - 6.9))
+        self.assertEqual(dedupe_tracks([car, bus]), {0: 1})
+
+    def test_a_second_box_of_different_size_on_the_same_van_is_dropped(self):
+        bus = _path("bus", 0.0, 7.0, lambda t: 300 - 25 * t)
+        # A brief car detection on the same van, its box a third bigger.
+        car = _path("car", 5.5, 6.0, lambda t: 300 - 25 * t - 15, tall=70.0, wide=140.0)
+        self.assertEqual(dedupe_tracks([bus, car]), {1: 0})
+
+    def test_two_long_drives_through_the_same_spot_are_kept(self):
+        first = _path("a", 0.0, 6.0, lambda t: 300 - 25 * t)
+        second = _path("b", 7.0, 13.0, lambda t: 150 - 25 * (t - 7.0))
+        self.assertEqual(dedupe_tracks([first, second]), {})
+
+    def test_two_people_side_by_side_stay_two(self):
+        left = _path("a", 0.0, 4.0, lambda t: 100 + 10 * t, "person", 80.0, 30.0)
+        right = _path("b", 0.0, 4.0, lambda t: 118 + 10 * t, "person", 80.0, 30.0)
+        self.assertEqual(dedupe_tracks([left, right]), {})
 
 
 class TestCleanPlates(unittest.TestCase):
