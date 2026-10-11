@@ -465,7 +465,10 @@ def _attach(
             kept_core = trimmed if int(trimmed.sum()) >= 0.25 * core_area else core
         else:
             kept_core = trimmed
-    mask = _smooth_contour(((kept_core > 0) | (extra > 0)).astype(np.uint8))
+    body = (kept_core > 0) | (extra > 0)
+    if category == "vehicle":
+        body &= ~_occluders(work_plate, diff, thresh)
+    mask = _smooth_contour(body.astype(np.uint8))
     if mask.shape[:2] != crop.shape[:2]:
         mask = cv2.resize(
             mask,
@@ -473,6 +476,27 @@ def _attach(
             interpolation=cv2.INTER_NEAREST,
         )
     return x0, y0, mask, moved
+
+
+# Local contrast of the plate (standard deviation over a few pixels) above
+# which it is busy scenery: leaves, a planter, a post, a fence.
+_SCENERY_TEXTURE = 14.0
+
+
+def _occluders(plate: np.ndarray, diff: np.ndarray, thresh: int) -> np.ndarray:
+    """Pixels of busy scenery that still look like the plate: in front of it.
+
+    A van passing behind a planter keeps the planter's leaves in front of it.
+    Those pixels barely differ from the plate, and the plate there is busy
+    texture. Paint, glass and tires over busy scenery would differ a lot,
+    and a dark car over smooth road is not busy, so neither is taken.
+    Cut out with the van, the leaves flickered around it in a new shape
+    every frame, brighter than the dimmed plate.
+    """
+    gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    mean = cv2.blur(gray, (7, 7))
+    spread = np.sqrt(np.maximum(cv2.blur(gray * gray, (7, 7)) - mean * mean, 0.0))
+    return (spread > _SCENERY_TEXTURE) & (diff < max(6, thresh // 2))
 
 
 def _vehicle_motion(
@@ -1118,9 +1142,13 @@ def _boxes_are_stable(
     previous: tuple[float, float, float, float],
     current: tuple[float, float, float, float],
 ) -> bool:
-    """True when the detector box barely moved or changed size.
+    """True when the detector box sits still: a parked car.
 
-    A parked car or a slow creep does not need a new mask every sample.
+    Its mask is measured once and reused. Anything that moves gets a fresh
+    mask every frame: a reused cutout slides with Frigate's sparse path, not
+    with the object, then snaps back when it is measured again. At 15 frames
+    a second a slow car moves only a few pixels a frame, and the old 4%
+    allowance turned every slow vehicle into that sawtooth.
     """
     previous_w = previous[2] - previous[0]
     previous_h = previous[3] - previous[1]
@@ -1128,11 +1156,11 @@ def _boxes_are_stable(
     current_h = current[3] - current[1]
     if min(previous_w, previous_h, current_w, current_h) < 1:
         return False
-    if abs(current_w - previous_w) > 0.08 * previous_w:
+    if abs(current_w - previous_w) > 0.02 * previous_w:
         return False
-    if abs(current_h - previous_h) > 0.08 * previous_h:
+    if abs(current_h - previous_h) > 0.02 * previous_h:
         return False
-    limit = max(3.0, 0.04 * max(previous_w, previous_h))
+    limit = max(1.0, 0.005 * max(previous_w, previous_h))
     dx = (current[0] + current[2]) / 2 - (previous[0] + previous[2]) / 2
     dy = (current[1] + current[3]) / 2 - (previous[1] + previous[3]) / 2
     return abs(dx) <= limit and abs(dy) <= limit
