@@ -312,6 +312,18 @@ class TestSplitObjects(unittest.TestCase):
         car = _path("car", 5.5, 6.0, lambda t: 300 - 25 * t - 15, tall=70.0, wide=140.0)
         self.assertEqual(dedupe_tracks([bus, car]), {1: 0})
 
+    def test_a_half_second_detection_sampled_densely_is_still_matched(self):
+        bus = _path("bus", 6.9, 14.1, lambda t: 290 - 25 * (t - 6.9))
+        # Frigate's path tracks get at least 16 samples, so half a second of
+        # a car on the same van is far denser than the bus.
+        times = [12.7 + 0.5 * step / 15 for step in range(16)]
+        boxes = [
+            (290 - 25 * (t - 6.9) - 15, 30.0, 290 - 25 * (t - 6.9) + 125, 100.0)
+            for t in times
+        ]
+        car = _track("car", times, boxes, "car")
+        self.assertEqual(dedupe_tracks([bus, car]), {1: 0})
+
     def test_two_long_drives_through_the_same_spot_are_kept(self):
         first = _path("a", 0.0, 6.0, lambda t: 300 - 25 * t)
         second = _path("b", 7.0, 13.0, lambda t: 150 - 25 * (t - 7.0))

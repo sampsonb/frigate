@@ -509,25 +509,24 @@ def dedupe_tracks(tracks: Sequence[MotionTrack]) -> dict[int, int]:
                         if lose == left_i:
                             break
                 continue
+            # Walk the shorter track: a half-second detection is sampled as
+            # densely as a long drive, so walking the long one finds only a
+            # sample or two inside it.
+            left_span = left_last - (left.times[0] if left.times else left.start)
+            right_span = (right.times[-1] if right.times else right.end) - right_first
+            brief, other = (left, right) if left_span <= right_span else (right, left)
             compared = 0
             same = 0
-            for box, moment in zip(left.boxes, left.times, strict=True):
-                other_i = _nearest_index(right.times, moment)
-                if abs(right.times[other_i] - moment) > 0.4:
+            for box, moment in zip(brief.boxes, brief.times, strict=True):
+                other_i = _nearest_index(other.times, moment)
+                if abs(other.times[other_i] - moment) > 0.4:
                     continue
                 compared += 1
-                if _same_spot(box, right.boxes[other_i], vehicle):
+                if _same_spot(box, other.boxes[other_i], vehicle):
                     same += 1
-            if (
-                compared >= 0.4 * min(len(left.boxes), len(right.boxes))
-                and same >= 0.6 * compared
-            ):
+            if compared >= 0.4 * len(brief.boxes) and same >= 0.6 * compared:
                 # The one seen longer, so the clip keeps the whole drive; of
                 # two about as long, the bigger box, which holds all of it.
-                left_span = left_last - (left.times[0] if left.times else left.start)
-                right_span = (right.times[-1] if right.times else right.end) - (
-                    right.times[0] if right.times else right.start
-                )
                 if min(left_span, right_span) < 0.7 * max(left_span, right_span):
                     left_wins = left_span >= right_span
                 else:
