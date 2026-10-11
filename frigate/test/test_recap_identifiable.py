@@ -12,9 +12,11 @@ from frigate.recap import cutcache
 from frigate.recap.align import estimate_shift
 from frigate.recap.clips import download_name
 from frigate.recap.cutout import (
+    _occluders,
     build_cutouts,
     needs_window,
     rounded_alpha,
+    static_scenery,
     window_ghost,
 )
 from frigate.recap.frames import concat_sample
@@ -337,6 +339,31 @@ class TestDaylightCutouts(unittest.TestCase):
         car_x = int(box[0]) + 14 + CAR_W // 2 - x0
         car_y = int(box[1]) + 14 + CAR_H // 2 - y0
         self.assertEqual(int(alpha[car_y, car_x]), 255)
+
+    def test_a_post_the_car_passes_behind_is_scenery(self):
+        frames, boxes = self._moving([True] * 24)
+        post = (slice(CAR_TOP + 8, CAR_TOP + CAR_H + 6), slice(120, 128))
+        background = np.full((HEIGHT, WIDTH, 3), DAYLIGHT, np.uint8)
+        background[post] = (150, 150, 150)
+        for frame in frames:
+            frame[post] = (150, 150, 150)
+        scenery = static_scenery(frames, background, boxes)
+        # The post stays in front of the car instead of riding along with it.
+        self.assertTrue(scenery[CAR_TOP + 16, 124])
+        # Road the car drove over, and road no box ever covered, are not.
+        self.assertFalse(scenery[CAR_TOP + 4, 124])
+        self.assertFalse(scenery[20, 20])
+
+    def test_leaves_over_busy_scenery_stay_in_front_of_the_car(self):
+        plate = np.full((HEIGHT, WIDTH, 3), DAYLIGHT, np.uint8)
+        plate[60:120, 100:160:2] = (30, 60, 30)
+        diff = np.zeros((HEIGHT, WIDTH), np.uint8)
+        leaves = _occluders(plate, diff, 22)
+        self.assertTrue(leaves[90, 130])
+        self.assertFalse(leaves[90, 40])
+        # Paint over the same busy patch differs a lot: that is the car.
+        diff[:] = 80
+        self.assertFalse(_occluders(plate, diff, 22)[90, 130])
 
 
 class TestSnapshots(unittest.TestCase):

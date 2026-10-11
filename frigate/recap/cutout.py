@@ -1007,6 +1007,61 @@ def _combine_sources(
     return x0, y0, (acc >= 0.5 * total - 1e-3).astype(np.uint8)
 
 
+# A pixel within this of the clip's background (strongest channel) is
+# unchanged. Scenery in front of the street is unchanged in nearly every
+# frame of the clip (``_STATIC_SHARE``) and also while inside the vehicle's
+# box: at least ``_STATIC_INSIDE`` frames there, changed in at most a tenth of
+# them or one, whichever is more (noise).
+_STATIC_DIFF = 18
+_STATIC_SHARE = 0.92
+_STATIC_INSIDE = 3
+_STATIC_NOISE = 0.1
+
+
+def static_scenery(
+    frames: list[np.ndarray],
+    background: np.ndarray,
+    boxes: list[tuple[float, float, float, float]],
+) -> np.ndarray:
+    """Pixels in front of the street: unchanged for the whole clip.
+
+    A planter, a post or a tree trunk stays the same while a car passes
+    behind it. Two tests keep the car's own pixels out. Over the whole clip,
+    the stretch of road a car parks on changes for every frame before it
+    arrives, even when the clip's plate has the parked car baked in. Inside
+    the car's box, the road a fast car crosses changes for every frame the
+    car covers it, which can be a tiny share of a long clip. Measured at
+    half size for speed.
+    """
+    height, width = background.shape[:2]
+    small = (max(1, width // 2), max(1, height // 2))
+    base = cv2.resize(background, small, interpolation=cv2.INTER_AREA).astype(np.int16)
+    changed_all = np.zeros((small[1], small[0]), np.int32)
+    inside = np.zeros((small[1], small[0]), np.int32)
+    changed_inside = np.zeros((small[1], small[0]), np.int32)
+    for frame, box in zip(frames, boxes, strict=True):
+        now = cv2.resize(frame, small, interpolation=cv2.INTER_AREA).astype(np.int16)
+        changed = np.abs(now - base).max(axis=2) > _STATIC_DIFF
+        changed_all += changed.astype(np.int32)
+        x0 = int(max(0, box[0] // 2))
+        y0 = int(max(0, box[1] // 2))
+        x1 = int(min(small[0], np.ceil(box[2] / 2)))
+        y1 = int(min(small[1], np.ceil(box[3] / 2)))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        inside[y0:y1, x0:x1] += 1
+        changed_inside[y0:y1, x0:x1] += changed[y0:y1, x0:x1].astype(np.int32)
+    count = max(1, len(frames))
+    still = (
+        (changed_all <= (1.0 - _STATIC_SHARE) * count)
+        & (inside >= _STATIC_INSIDE)
+        & (changed_inside <= np.maximum(1, np.floor(_STATIC_NOISE * inside)))
+    )
+    return cv2.resize(
+        still.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST
+    ).astype(bool)
+
+
 def _feather_piece(
     frame: np.ndarray,
     box: tuple[float, float, float, float],
@@ -1014,16 +1069,26 @@ def _feather_piece(
     origin_x: int,
     origin_y: int,
     category: str,
+    scenery: np.ndarray | None = None,
 ) -> dict[str, object] | None:
     """Feather a 0/1 mask. The crop is taken from ``frame`` at that mask.
 
     The interior stays fully opaque. Only about 3 pixels of edge fade.
     Vehicles fill the outer contour first. A motion mask on a car is often
-    a ring of edges, and the body would otherwise drop out.
+    a ring of edges, and the body would otherwise drop out. ``scenery`` (a
+    full-frame mask from ``static_scenery``) is then taken back out, so a
+    planter between a truck's bed and its cab is not filled in with it.
     """
     height, width = frame.shape[:2]
     if category == "vehicle" and _outline_worth_tracing(mask):
         mask = _trace_outline(mask)
+    if scenery is not None:
+        local = scenery[
+            max(0, origin_y) : max(0, origin_y) + mask.shape[0],
+            max(0, origin_x) : max(0, origin_x) + mask.shape[1],
+        ]
+        if local.shape == mask.shape:
+            mask = (mask & ~local).astype(np.uint8)
     mask = _smooth_contour(mask)
     ys, xs = np.nonzero(mask)
     if len(xs) < 6:
@@ -1343,6 +1408,9 @@ def build_cutouts(
     height, width = background.shape[:2]
     if needs_window(background):
         return window_ghosts(frames, boxes, category)
+    scenery = (
+        static_scenery(frames, background, boxes) if category == "vehicle" else None
+    )
     pieces, boxes = _motion_pieces(
         frames, boxes, background, category, fg_thresh, span, travel, avoid
     )
@@ -1402,7 +1470,7 @@ def build_cutouts(
             dx = int(round(float(centers[index][0] - centers[donor][0])))
             dy = int(round(float(centers[index][1] - centers[donor][1])))
             made = _feather_piece(
-                frames[donor], box, mask, origin_x, origin_y, category
+                frames[donor], box, mask, origin_x, origin_y, category, scenery
             )
             if made is None:
                 continue
@@ -1457,7 +1525,9 @@ def build_cutouts(
             combined = _combine_sources(sources, width, height)
             if combined is not None:
                 origin_x, origin_y, mask = combined
-                ghost = _feather_piece(frame, box, mask, origin_x, origin_y, category)
+                ghost = _feather_piece(
+                    frame, box, mask, origin_x, origin_y, category, scenery
+                )
         else:
             ghost = repair(index, box)
         if ghost is None:

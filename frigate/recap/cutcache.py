@@ -37,7 +37,9 @@ logger = logging.getLogger(__name__)
 # 4: the busiest stretch of a long event, a vehicle's arrival and departure
 # as separate clips, still snapshots only when the path does not line up,
 # and a vehicle's first and last frames kept to draw it parked.
-CACHE_VERSION = 4
+# 5: real-speed sampling, no sliding reused masks, scenery kept in front
+# of vehicles, and vehicle clips cut to where they move.
+CACHE_VERSION = 5
 # Longest window a cached cutout is useful for (72 hours) plus slack.
 MAX_AGE_HOURS = 74.0
 # A failed cutout is only cached once the recording is surely written.

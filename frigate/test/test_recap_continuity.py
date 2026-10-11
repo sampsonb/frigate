@@ -15,6 +15,7 @@ from frigate.recap.generate import (
     LEAVES,
     PIECE_SETTLE,
     STATIONARY_LAG,
+    _still_ends,
     _vehicle_stays,
     clip_window,
     frame_times,
@@ -23,6 +24,7 @@ from frigate.recap.generate import (
     parked_spans,
     vehicle_pieces,
 )
+from frigate.recap.cutout import static_scenery
 from frigate.recap.layout import (
     MotionTrack,
     ScheduledUnit,
@@ -477,6 +479,52 @@ class TestVehicleStays(unittest.TestCase):
         self.assertEqual(stay.sources, {first["id"], second["id"]})
         self.assertEqual((stay.arrival, stay.departure), (0, 1))
         self.assertAlmostEqual(stay.until, T0 + 62.6)
+
+
+class TestStillEnds(unittest.TestCase):
+    """A vehicle clip ends where it parks; the parked car is drawn from there."""
+
+    def _clip(self, begin: float, seconds: float, lost_after: float | None = None):
+        times = frame_times(T0 + begin, 8, int(seconds * 8) + 1)
+        frames = [
+            _road()
+            if lost_after is not None and moment - T0 > lost_after
+            else _scene(moment)
+            for moment in times
+        ]
+        boxes = []
+        for moment in times:
+            left = _car_left(moment)
+            boxes.append((left, CAR_TOP, left + CAR_W, CAR_TOP + CAR_H))
+        return frames, times, boxes
+
+    def test_a_pull_in_clip_ends_soon_after_it_stops(self):
+        frames, times, boxes = self._clip(0.0, 8.0)
+        start, end = _still_ends(frames, times, boxes)
+        self.assertEqual(start, 0)
+        self.assertGreater(times[end - 1] - T0, 2.0)
+        self.assertLess(times[end - 1] - T0, 3.5)
+
+    def test_a_drive_off_clip_starts_just_before_it_moves(self):
+        frames, times, boxes = self._clip(56.0, 8.0)
+        start, end = _still_ends(frames, times, boxes)
+        self.assertGreater(times[start] - T0, 61.0)
+        self.assertLess(times[start] - T0, 62.1)
+        self.assertEqual(end, len(frames))
+
+    def test_a_car_the_recording_lost_is_not_cut_as_parked(self):
+        # The path drives on while the recording goes quiet: a hole in the
+        # recording, not a car that parked.
+        frames, times, boxes = self._clip(0.0, 2.0, lost_after=0.5)
+        self.assertEqual(_still_ends(frames, times, boxes), (0, len(frames)))
+
+    def test_the_road_a_car_parks_on_is_not_scenery(self):
+        # The plate has the parked car baked in. The car's pixels differ from
+        # it for every frame before it arrived, so they are not mistaken for
+        # a planter in front of it.
+        frames, times, boxes = self._clip(0.0, 2.5)
+        scenery = static_scenery(frames, _scene(T0 + 30), boxes)
+        self.assertFalse(scenery[CAR_TOP + 12, int(PARK_LEFT) + 20])
 
 
 class TestCacheWindow(unittest.TestCase):

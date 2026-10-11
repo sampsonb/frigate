@@ -1781,6 +1781,86 @@ def _mostly_windows(ghosts: list[dict[str, object]]) -> bool:
     return sum(1 for ghost in drawn if ghost.get("window")) * 2 > len(drawn)
 
 
+# Seconds of a vehicle sitting still kept before it moves off or after it
+# stops, and the share of its box that has to change between frames about a
+# fifth of a second apart for it to count as moving.
+STILL_MARGIN = 0.5
+STILL_CHANGE = 0.05
+
+
+def _path_moved(boxes: Sequence[tuple[float, float, float, float]]) -> bool:
+    """True when Frigate's path moves the box at least half its width.
+
+    A path that never moves cannot say where the vehicle is once it has
+    driven out of the box, so a still box there is not a parked car.
+    """
+    if len(boxes) < 2:
+        return False
+    centers = [((box[0] + box[2]) / 2, (box[1] + box[3]) / 2) for box in boxes]
+    width = max(1.0, float(np.median([box[2] - box[0] for box in boxes])))
+    xs = [center[0] for center in centers]
+    ys = [center[1] for center in centers]
+    return float(np.hypot(max(xs) - min(xs), max(ys) - min(ys))) >= 0.5 * width
+
+
+def _still_ends(
+    frames: list[np.ndarray],
+    times: list[float],
+    boxes: list[tuple[float, float, float, float]],
+) -> tuple[int, int]:
+    """Where a vehicle clip starts and stops moving, as ``(start, end)``.
+
+    A pull-in clip ran on for seconds after the truck stopped, its cutout
+    flickering around the planter while the parked overlay could have taken
+    over; a drive-off clip likewise sat parked before it moved. Movement is
+    measured on the recording itself, the share of the box that changes
+    from one frame to the next, not on Frigate's sparse path. A clip that
+    hardly moves at all is left alone.
+    """
+    count = len(frames)
+    if count < 8 or len(times) != count or len(boxes) != count:
+        return 0, count
+    interval = max(1e-3, (times[-1] - times[0]) / max(1, count - 1))
+    gap = max(1, int(round(0.2 / interval)))
+    height, width = frames[0].shape[:2]
+    moving: list[bool] = []
+    for index in range(count):
+        other = index - gap if index >= gap else min(count - 1, index + gap)
+        box = boxes[index]
+        x0 = int(max(0, box[0]))
+        y0 = int(max(0, box[1]))
+        x1 = int(min(width, box[2]))
+        y1 = int(min(height, box[3]))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            moving.append(True)
+            continue
+        now = cv2.cvtColor(frames[index][y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        then = cv2.cvtColor(frames[other][y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        changed = cv2.absdiff(now, then) > 20
+        moving.append(float(changed.mean()) > STILL_CHANGE)
+    # Movement that lasts: three frames in a row. A door or a passer-by at
+    # the end of a parked stretch is not the vehicle driving.
+    runs = [
+        index
+        for index in range(count - 2)
+        if moving[index] and moving[index + 1] and moving[index + 2]
+    ]
+    if not runs:
+        return 0, count
+    first = runs[0]
+    last = runs[-1] + 2
+    margin = int(round(STILL_MARGIN / interval))
+    start, end = max(0, first - margin), min(count, last + margin + 1)
+    # Only where Frigate's path stands still too. A path that keeps going
+    # while the box goes quiet is the recording losing the vehicle, not the
+    # vehicle parking, and cutting there leaves mostly repaired frames.
+    if _path_moved(boxes[: start + 1]):
+        start = 0
+    if _path_moved(boxes[end - 1 :]):
+        end = count
+    return start, end
+
+
 def _others_in(
     others: Sequence[dict[str, Any]],
     times: Sequence[float],
@@ -1965,6 +2045,11 @@ def _cutouts_for(
     boxes = boxes_at(event, times, width, height, shift)
     if not boxes:
         return _Cut(status="no_box")
+    if category == "vehicle" and _path_moved(boxes):
+        # Before the cutouts: a parked stretch left in the clip is baked into
+        # the clip's own plate, and the parked car stops showing as itself.
+        start, end = _still_ends(frames, times, boxes)
+        frames, times, boxes = frames[start:end], times[start:end], boxes[start:end]
     avoid = (
         _others_in(others, times, width, height, shift)
         if category == "vehicle" and others
