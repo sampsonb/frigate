@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import subprocess
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -54,6 +55,9 @@ class GhostFrame:
     # A padded box copied as recorded, rather than a motion mask. It is
     # drawn with an outline in the category color, day or night.
     window: bool = False
+    # ``alpha_bytes`` is zlib-compressed. A mask is mostly runs of 0 and 255,
+    # and every frame of every object is held until the video is encoded.
+    alpha_zipped: bool = False
 
     def pixels(self) -> tuple[np.ndarray, np.ndarray] | None:
         if self.crop is not None and self.alpha is not None:
@@ -61,7 +65,10 @@ class GhostFrame:
         if not self.jpeg or not self.alpha_bytes or not self.alpha_shape:
             return None
         crop = cv2.imdecode(np.frombuffer(self.jpeg, np.uint8), cv2.IMREAD_COLOR)
-        alpha = np.frombuffer(self.alpha_bytes, np.uint8).reshape(self.alpha_shape)
+        raw = (
+            zlib.decompress(self.alpha_bytes) if self.alpha_zipped else self.alpha_bytes
+        )
+        alpha = np.frombuffer(raw, np.uint8).reshape(self.alpha_shape)
         if crop is None:
             return None
         return crop, alpha
@@ -77,7 +84,8 @@ class GhostFrame:
             return
         self.jpeg = encoded.tobytes()
         self.alpha_shape = (int(self.alpha.shape[0]), int(self.alpha.shape[1]))
-        self.alpha_bytes = self.alpha.tobytes()
+        self.alpha_bytes = zlib.compress(self.alpha.tobytes(), 1)
+        self.alpha_zipped = True
         self.crop = None
         self.alpha = None
 

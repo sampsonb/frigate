@@ -83,6 +83,14 @@ STAGES = (
 )
 
 
+class NothingRecorded(RuntimeError):
+    """The window has no recordings at all.
+
+    Frigate's motion-only retention deletes every segment without motion, so
+    a quiet half hour on a still camera can leave nothing to build from.
+    """
+
+
 def stage_for(percent: float) -> str:
     for limit, name in STAGES:
         if percent < limit:
@@ -526,6 +534,15 @@ class RecapJob(threading.Thread):
         except RecapCancelled:
             self._finish_failed("cancelled", "Cancelled")
             logger.info("Recap %s cancelled", self.recap_id)
+        except NothingRecorded as err:
+            if self.reason == "interval" and self.rolling_hours is None:
+                # A short automatic recap of a quiet stretch: nothing to show,
+                # and a failed card on the Recap page would only be noise.
+                logger.info("Recap %s skipped: %s", self.recap_id, err)
+                shutil.rmtree(self.directory, ignore_errors=True)
+            else:
+                logger.info("Recap %s: %s", self.recap_id, err)
+                self._finish_failed("failed", str(err), str(err))
         except Exception as err:
             logger.exception("Recap %s failed", self.recap_id)
             self._finish_failed(
@@ -620,7 +637,7 @@ class RecapJob(threading.Thread):
         delivery_ids, dog_ids = self._semantic(events)
         rows = load_recordings(self.camera, self.after, self.before)
         if not rows:
-            raise RuntimeError("No recordings in that time range")
+            raise NothingRecorded("No recordings in that time range")
         size = None
         for row in rows:
             size = probe_size(ffprobe, row["path"])

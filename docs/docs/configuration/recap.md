@@ -39,7 +39,7 @@ Useful knobs:
 | `retain_days` | 14 | Delete local recaps after this many days. `0` keeps them. |
 | `replace_superseded` | true | When a recap is Ready, delete older completed recaps of the same camera and kind. Last-N-hours buttons group by that length. An explicit range that is one local midnight-to-midnight day groups with the nightly recap for that date (`day:<date>`, including older `backfill-day:<date>` copies). Any other explicit range is kept on its own and is not treated as last-N hours. Running, failed, and archive copies are kept. |
 | `min_show_seconds` | 2.5 | Shortest time a ghost stays readable. A snapshot held in place stays at least 3 seconds. |
-| `output_fps` | 12 | Synopsis frame rate. |
+| `output_fps` | 15 | Synopsis frame rate. With `sample_fps` and `vehicle_sample_fps` (both 15) at the same rate, objects move at their real speed, every recorded frame of a 15 fps camera. Lower sampling looks like a fast, jumpy time-lapse. |
 | `max_width` | 1280 | Frames are scaled down to this. |
 | `pause_seconds` | 0.02 | Sleep between events so live detection keeps the CPU. |
 | `archive` | off | Optional older media. See below. |

@@ -581,5 +581,45 @@ class TestRollingFailureKeepsLive(unittest.TestCase):
                 self.assertEqual(manager.rolling_state["front"]["last"], "failed")
 
 
+class TestNothingRecorded(unittest.TestCase):
+    def _run(self, reason: str):
+        from frigate.recap import manager as manager_module
+        from frigate.recap.storage import read_manifest, recap_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch("frigate.recap.storage.RECAP_DIR", str(root)),
+                patch("frigate.recap.manager.RECAP_DIR", str(root)),
+                patch.object(manager_module.cutcache, "purge", return_value=(0, 0, 0)),
+            ):
+                manager = manager_module.RecapManager(_fake_config(tmp))
+
+                def empty(job):
+                    raise manager_module.NothingRecorded(
+                        "No recordings in that time range"
+                    )
+
+                with patch.object(manager_module.RecapJob, "_run", empty):
+                    manifest = manager.start("front", 0, 1800, reason=reason)
+                    job = manager._jobs.get(manifest["id"])
+                    if job is not None:
+                        job.join(timeout=5)
+                folder = recap_dir("front", manifest["id"])
+                return folder.is_dir(), (
+                    read_manifest(folder) if folder.is_dir() else None
+                )
+
+    def test_a_quiet_interval_leaves_no_failed_card(self):
+        exists, _manifest = self._run("interval")
+        self.assertFalse(exists)
+
+    def test_a_requested_recap_says_why_it_failed(self):
+        exists, manifest = self._run("manual")
+        self.assertTrue(exists)
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["message"], "No recordings in that time range")
+
+
 if __name__ == "__main__":
     unittest.main()

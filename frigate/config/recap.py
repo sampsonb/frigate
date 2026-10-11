@@ -234,19 +234,19 @@ class RecapConfig(FrigateBaseModel):
         ),
     )
     output_fps: int = Field(
-        default=12,
+        default=15,
         title="Frame rate of the synopsis video.",
         ge=5,
         le=30,
     )
     sample_fps: float = Field(
-        default=4,
+        default=15,
         title="Frames per second sampled from people and animals.",
         gt=0.5,
         le=15,
     )
     vehicle_sample_fps: float = Field(
-        default=8,
+        default=15,
         title="Frames per second sampled from vehicles so they stay readable.",
         gt=0.5,
         le=15,

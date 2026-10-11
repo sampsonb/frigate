@@ -185,6 +185,7 @@ def pack_frames(ghost_frames: list[Any]) -> list[dict[str, Any]]:
                 "jpeg": ghost.jpeg,
                 "alpha_shape": tuple(int(v) for v in ghost.alpha_shape),
                 "alpha_bytes": ghost.alpha_bytes,
+                "alpha_zipped": bool(getattr(ghost, "alpha_zipped", False)),
                 "window": bool(getattr(ghost, "window", False)),
             }
         )

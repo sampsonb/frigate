@@ -1637,6 +1637,7 @@ def _ghost_from_packed(item: dict[str, Any]) -> GhostFrame:
         jpeg=item.get("jpeg"),
         alpha_shape=tuple(item["alpha_shape"]) if item.get("alpha_shape") else None,  # type: ignore[arg-type]
         alpha_bytes=item.get("alpha_bytes"),
+        alpha_zipped=bool(item.get("alpha_zipped", False)),
         crop=item.get("crop"),
         alpha=item.get("alpha"),
         window=bool(item.get("window")),
