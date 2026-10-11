@@ -53,6 +53,9 @@ Files are stored at `/media/frigate/recap/<camera>/<id>/` (`manifest.json`, `vid
 - People are blue, vehicles orange, deliveries magenta, animals green, and a parked car someone got into or out of is teal.
 - The legend checkboxes hide labels and list rows. The ghosts are already part of the video.
 - A vehicle that barely moves is left out, unless a person gets in or out. That car is drawn once, labeled `12:26 PM got out` or `got in`, with a dotted line to the person.
+- A vehicle that pulls in, sits, and drives off is shown pulling in and, later, driving off, each with its own time. It stays parked on screen in between, and it is taken out of the background, so it is never on screen twice or popping in when the background changes. Frigate's stationary and active marks split the event, and the drive off starts when the vehicle was first seen away from its spot, a few seconds before Frigate marks it active. A vehicle Frigate loses and finds again at the same spot counts as one stay.
+- An object that comes into view in the middle of the picture, where another one is or just was, within a minute, waits for it. The people who get out of a truck appear once it has pulled in, and a car someone gets into drives off after they reach it. Cars passing at the edge of the picture keep their own pace. This can make a recap longer.
+- A long event is trimmed to `max_object_seconds` where it moves the most, and its label is the time of the first frame shown.
 - A delivery is a Frigate+ attribute or label (`fedex`, `ups`, `amazon`, `package`, and the other carrier names) when one is present. Otherwise semantic search is used if it is enabled.
 - A person overlapping a dog or cat is drawn as an animal, and the dog's own track is dropped, which is how a dog walker stays one green label.
 - Anything that moves with a person, and is connected to them against a clean background, is part of their cutout. That includes a golf cart, bicycle, scooter, or stroller the detector does not know as its own object.
@@ -191,6 +194,7 @@ Semantic search, when enabled, only looks at the nearest thumbnails Frigate alre
 
 - Filters hide labels and the event list. They do not erase ghosts already drawn into the video.
 - A parked car is shown only when Frigate tracked that stationary vehicle. A car the detector never saw cannot be labeled.
+- A vehicle parked through most of a background sample but never seen moving stays in the background. It can appear or disappear when the background is refreshed, about every 30 minutes.
 - Cutouts are weaker than a segmentation model on a cluttered background. A connected moving object is included. A shadow or a full-frame lighting change is not.
 - A snapshot held in place shows the object at its best moment, not its movement. Tap its time to play the clip.
 - The schedule is a single daily time, not a cron expression. If Frigate is down at that minute, that day's recap is skipped.

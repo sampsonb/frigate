@@ -49,8 +49,8 @@ class Alignment:
 
     ``seconds`` is added to a recording time to get the detector time.
     ``fill`` is the share of the boxes covered by motion at that shift.
-    ``found`` is False when the object did not move enough to tell, and
-    ``seconds`` is then the starting guess.
+    ``found`` is False when no shift stood out, and ``seconds`` is then the
+    starting guess, with ``fill`` measured there.
     """
 
     seconds: float
@@ -158,6 +158,10 @@ def estimate_shift(
     best = int(np.argmax(scores))
     typical = float(np.median(scores))
     if scores[best] < _MIN_FILL or scores[best] < _MIN_GAIN * max(typical, 1e-6):
-        return Alignment(default, float(scores[best]), False)
+        # No clear winner: a slow or distant object is covered at almost
+        # any shift. Report how well the starting guess covers it, so a
+        # well covered object still moves instead of becoming a still.
+        start_index = int(np.argmin(np.abs(candidates - default)))
+        return Alignment(default, float(scores[start_index]), False)
     middle = _peak_middle(scores, best)
     return Alignment(round(float(candidates[middle]), 2), float(scores[middle]), True)

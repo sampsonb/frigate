@@ -39,13 +39,30 @@ from frigate.recap.layout import (
     ScheduledUnit,
     assign_label_texts,
     dedupe_tracks,
+    follows,
     is_stationary,
     link_parked_cars,
     repeat_for_min_show,
     schedule_units,
 )
-from frigate.recap.plates import TimedPlate, build_timed_plates, cutout_is_visible
-from frigate.recap.render import GhostFrame, Tube, encode_video, layout_labels
+from frigate.recap.plates import (
+    ParkedSpan,
+    TimedPlate,
+    build_timed_plates,
+    clean_plates,
+    cutout_is_visible,
+    frame_is_ir,
+    parked_cutout,
+    parked_region,
+    plate_index_at,
+)
+from frigate.recap.render import (
+    GhostFrame,
+    ParkedPatch,
+    Tube,
+    encode_video,
+    layout_labels,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -317,22 +334,215 @@ def last_seen(event: dict[str, Any]) -> float:
     return min(end, max(max(stamps), start + 0.5))
 
 
+# Movement, as a share of the frame, that makes a stretch worth showing
+# over the best view. Less than this is a parked car's jitter.
+MOVE_SPAN = 0.05
+
+
+def _foot_at(
+    feet: list[tuple[float, float, float]], moment: float
+) -> tuple[float, float]:
+    times = [item[0] for item in feet]
+    return (
+        float(np.interp(moment, times, [item[1] for item in feet])),
+        float(np.interp(moment, times, [item[2] for item in feet])),
+    )
+
+
+def _spread(points: list[tuple[float, float]]) -> float:
+    """Diagonal of the box around ``points``, in frame units."""
+    if len(points) < 2:
+        return 0.0
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return float(np.hypot(max(xs) - min(xs), max(ys) - min(ys)))
+
+
+def travel(event: dict[str, Any]) -> float:
+    """How far the object moved over the whole event, in frame units."""
+    return _spread([(x, y) for _t, x, y in _foot_points(event)])
+
+
+def drove_in_or_out(event: dict[str, Any]) -> bool:
+    """True when a vehicle that ends up parked also drove while on camera.
+
+    Its event is mostly parked, so it looks stationary, but the arrival
+    or departure is the part worth seeing.
+    """
+    return travel(event) >= MOVE_SPAN
+
+
+def _busiest_stretch(
+    event: dict[str, Any],
+    start: float,
+    end: float,
+    max_seconds: float,
+    later_wins: bool = True,
+) -> float | None:
+    """Start of the ``max_seconds`` stretch with the most movement.
+
+    None when the object hardly moves anywhere, such as someone standing
+    at the door or a car waiting at a light. A tie goes to the later
+    stretch (an arrival ends where it parked) or, with ``later_wins``
+    off, the earlier one (a departure starts where it was parked).
+    """
+    feet = _foot_points(event)
+    if len(feet) < 2:
+        return None
+    best_left: float | None = None
+    best_spread = MOVE_SPAN
+    lefts = [float(item) for item in np.arange(start, end - max_seconds + 1e-6, 0.5)]
+    if not lefts or lefts[-1] < end - max_seconds - 1e-6:
+        # The stretch that ends with the event, where a car often leaves.
+        lefts.append(end - max_seconds)
+    for left in lefts:
+        right = left + max_seconds
+        points = [(x, y) for moment, x, y in feet if left < moment < right]
+        points.append(_foot_at(feet, left))
+        points.append(_foot_at(feet, right))
+        spread = _spread(points)
+        # Equal stretches differ in the last bits; those are ties too.
+        tie = abs(spread - best_spread) <= 1e-9
+        if (spread > best_spread and not tie) or (
+            tie and (later_wins or best_left is None)
+        ):
+            best_left, best_spread = left, max(spread, best_spread)
+    return best_left
+
+
 def clip_window(event: dict[str, Any], max_seconds: float) -> tuple[float, float]:
     """Stretch of the event to cut out, at most ``max_seconds`` long.
 
-    It ends at the last sighting, not at the event end. A long event
-    (someone loitering, a car waiting at the stop sign) is trimmed to the
-    part around its best view instead of its first seconds.
+    It ends at the last sighting, not at the event end. A long event is
+    trimmed to the stretch where it moves the most: a truck that turns
+    in and parks for ten minutes shows the turn in, not ten seconds of the
+    parked truck, and a car that sat and then drove off shows it leaving.
+    Frigate marks a car stationary only after a slow creep into the spot,
+    so that mark is not used. When the object hardly moves at all (someone
+    loitering), the stretch around its best view is used instead.
     """
+    window = event.get("window")
+    if window:
+        return float(window[0]), float(window[1])
     start, _end = _event_span(event)
     end = max(last_seen(event), start + 0.5)
     if max_seconds <= 0 or end - start <= max_seconds:
         return start, end
-    anchor = best_moment(event)
-    if anchor is None:
-        anchor = start + max_seconds / 2
-    left = min(max(start, anchor - max_seconds / 2), end - max_seconds)
+    left = _busiest_stretch(event, start, end, max_seconds)
+    if left is None:
+        anchor = best_moment(event)
+        if anchor is None:
+            anchor = start + max_seconds / 2
+        left = min(max(start, anchor - max_seconds / 2), end - max_seconds)
     return left, left + max_seconds
+
+
+# Seconds past Frigate's stationary mark kept at the end of a vehicle's
+# arrival, and before its active mark at the start of its departure.
+PIECE_SETTLE = 2.0
+# Seconds between the arrival clip and the departure clip under which the
+# two are one clip.
+PIECE_MIN_GAP = 4.0
+# Added to an event id for the clip of the vehicle driving off.
+LEAVES = "+leaves"
+
+
+def _window_in(
+    event: dict[str, Any],
+    start: float,
+    end: float,
+    max_seconds: float,
+    later_wins: bool,
+) -> tuple[float, float]:
+    """The busiest ``max_seconds`` of ``start`` to ``end``."""
+    end = max(end, start + 0.5)
+    if max_seconds <= 0 or end - start <= max_seconds:
+        return start, end
+    left = _busiest_stretch(event, start, end, max_seconds, later_wins=later_wins)
+    if left is None:
+        left = end - max_seconds if later_wins else start
+    return left, left + max_seconds
+
+
+def _box_foot(values: Sequence[float]) -> tuple[float, float]:
+    """Bottom center of a normalized xywh box."""
+    return values[0] + values[2] / 2, values[1] + values[3]
+
+
+def vehicle_pieces(
+    event: dict[str, Any], max_seconds: float
+) -> list[tuple[float, float]]:
+    """The stretches of a vehicle's event worth showing, oldest first.
+
+    Frigate's stationary and active marks split the event. It pulled in when
+    it was first seen somewhere other than where it stopped, and drove off
+    when it was last seen somewhere other than where it sat. Both give a
+    clip, and the recap draws it parked in between. Empty when it did
+    neither (it moved only while parked: doors, people, a jittery box).
+    Without a stationary mark it is one ``clip_window``.
+    """
+    rows = _timeline_rows(event)
+    stops = [(stamp, values) for stamp, kind, values in rows if kind == "stationary"]
+    feet = _foot_points(event)
+    if not stops or len(feet) < 2:
+        return [clip_window(event, max_seconds)]
+    start, _end = _event_span(event)
+    end = max(last_seen(event), start + 0.5)
+    stopped, first_box = stops[0]
+    last_stop, last_box = stops[-1]
+    pieces: list[tuple[float, float]] = []
+    stop_at = _box_foot(first_box)
+    if float(np.hypot(feet[0][1] - stop_at[0], feet[0][2] - stop_at[1])) >= MOVE_SPAN:
+        pieces.append(
+            _window_in(
+                event,
+                start,
+                min(end, stopped + PIECE_SETTLE),
+                max_seconds,
+                later_wins=True,
+            )
+        )
+    leaving = next(
+        (
+            stamp
+            for stamp, kind, _values in rows
+            if kind == "active" and stamp > last_stop
+        ),
+        None,
+    )
+    parked_at = _box_foot(last_box)
+    if (
+        leaving is not None
+        and float(np.hypot(feet[-1][1] - parked_at[0], feet[-1][2] - parked_at[1]))
+        >= MOVE_SPAN
+    ):
+        # Frigate marks it active a few seconds after it starts to move. Its
+        # path gets a point once it has moved, so the first point away from
+        # where it sat is when it was already going.
+        away = next(
+            (
+                moment
+                for moment, x, y in feet
+                if moment > last_stop
+                and float(np.hypot(x - parked_at[0], y - parked_at[1])) >= MOVE_SPAN / 2
+            ),
+            leaving,
+        )
+        moved = min(away, leaving) - PIECE_SETTLE
+        departure = _window_in(
+            event, max(start, moved), end, max_seconds, later_wins=False
+        )
+        if pieces and departure[0] - pieces[0][1] < PIECE_MIN_GAP:
+            # A short stop: one clip from pulling in to driving off.
+            pieces[0] = (pieces[0][0], departure[1])
+        else:
+            pieces.append(departure)
+    return pieces
+
+
+def _shown_start(track: MotionTrack) -> float:
+    """When the first frame a track shows was recorded."""
+    return track.times[0] if track.times else track.start
 
 
 def _event_span(event: dict[str, Any]) -> tuple[float, float]:
@@ -453,20 +663,83 @@ def _background(
     return fitted[len(fitted) // 2].image, fitted
 
 
+def _timeline_rows(event: dict[str, Any]) -> list[tuple[float, str, list[float]]]:
+    """``(time, kind, normalized xywh)`` timeline rows, oldest first."""
+    raw = event.get("timeline") or []
+    if not isinstance(raw, list):
+        return []
+    rows: list[tuple[float, str, list[float]]] = []
+    for item in raw:
+        try:
+            stamp = float(item[0])
+            kind = str(item[1])
+            values = [float(value) for value in item[2][:4]]
+        except (TypeError, ValueError, IndexError):
+            continue
+        if len(values) == 4:
+            rows.append((stamp, kind, values))
+    rows.sort(key=lambda row: row[0])
+    return rows
+
+
+# Frigate calls an object stationary once it has sat still for a while
+# (detect.stationary.threshold, 50 frames by default: 10 s at 5 fps).
+STATIONARY_LAG = 10.0
+
+
+def parked_spans(
+    event: dict[str, Any], width: int, height: int
+) -> list[tuple[float, float, tuple[float, float, float, float]]]:
+    """When the object sat still and where, from Frigate's timeline.
+
+    A span runs from about when it stopped (its stationary row, less the
+    time Frigate waits before calling it stationary) until it moved again
+    (an active row) or was last seen. The box is the stationary row's.
+    """
+    spans: list[tuple[float, float, tuple[float, float, float, float]]] = []
+    moved = _event_span(event)[0]
+    begin: float | None = None
+    box: tuple[float, float, float, float] | None = None
+    for stamp, kind, values in _timeline_rows(event):
+        if kind == "stationary" and begin is None and values[2] > 0 and values[3] > 0:
+            begin = max(moved, stamp - STATIONARY_LAG)
+            box = (
+                values[0] * width,
+                values[1] * height,
+                (values[0] + values[2]) * width,
+                (values[1] + values[3]) * height,
+            )
+        elif kind == "active":
+            if begin is not None and box is not None:
+                spans.append((begin, stamp, box))
+            begin = None
+            moved = stamp
+    if begin is not None and box is not None:
+        spans.append((begin, max(begin, last_seen(event)), box))
+    return spans
+
+
 def path_track(
     event: dict[str, Any],
     track: MotionTrack,
     width: int,
     height: int,
-    samples: int = 16,
+    samples: int | None = None,
 ) -> MotionTrack:
     """``track`` with boxes from the event's own path, in detector time.
 
     Used to decide whether two events are the same object or a walker and
     their dog, whatever frames their cutouts happened to keep.
     """
-    start, _end = _event_span(event)
-    end = max(last_seen(event), start + 0.5)
+    window = event.get("window")
+    if window:
+        start, end = float(window[0]), float(window[1])
+    else:
+        start, _end = _event_span(event)
+        end = max(last_seen(event), start + 0.5)
+    if samples is None:
+        # About two a second, so the pace at either end of the path is real.
+        samples = int(np.clip((end - start) / 0.5, 16, 240))
     times = [float(item) for item in np.linspace(start, end, samples)]
     boxes = boxes_at(event, times, width, height)
     if not boxes:
@@ -534,6 +807,211 @@ def _clock_range(after: float, before: float, zone: tzinfo) -> str:
     return f"{left} to {right}"
 
 
+# Seconds apart two stays at the same spot can be and still be one vehicle
+# (Frigate lost it for a moment and started a new event).
+STAY_JOIN = 60.0
+
+
+@dataclass
+class _Stay:
+    """A vehicle the recap shows moving, parked in one spot for a while."""
+
+    begin: float
+    until: float
+    box: tuple[float, float, float, float]
+    sources: set[str]
+    arrival: int | None = None
+    departure: int | None = None
+
+    def covers(self, moment: float) -> bool:
+        return self.begin <= moment <= self.until
+
+
+def _box_iou(
+    left: tuple[float, float, float, float], right: tuple[float, float, float, float]
+) -> float:
+    width = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+    height = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
+    inter = width * height
+    union = (
+        (left[2] - left[0]) * (left[3] - left[1])
+        + (right[2] - right[0]) * (right[3] - right[1])
+        - inter
+    )
+    return inter / union if union > 0 else 0.0
+
+
+def _vehicle_stays(
+    units: Sequence[ScheduledUnit],
+    track_of: dict[str, MotionTrack],
+    events_by_id: dict[str, dict[str, Any]],
+    width: int,
+    height: int,
+    after: float,
+    before: float,
+) -> list[_Stay]:
+    """Where the vehicles shown moving sat still, and their clips either side.
+
+    Stays at the same spot moments apart are one vehicle, even across two
+    Frigate events (a truck that is lost and found again as it leaves).
+    """
+    stays: list[_Stay] = []
+    seen: set[str] = set()
+    for unit in units:
+        if unit.category != "vehicle" or unit.clip_event_id in seen:
+            continue
+        event = events_by_id.get(unit.event_id)
+        if event is None:
+            continue
+        seen.add(unit.clip_event_id)
+        for begin, until, box in parked_spans(event, width, height):
+            begin, until = max(begin, after), min(until, before)
+            if until - begin >= 1.0:
+                stays.append(_Stay(begin, until, box, {unit.clip_event_id}))
+    joined: list[_Stay] = []
+    for stay in sorted(stays, key=lambda item: item.begin):
+        for other in joined:
+            if (
+                stay.begin - other.until <= STAY_JOIN
+                and other.begin - stay.until <= STAY_JOIN
+                and _box_iou(stay.box, other.box) >= 0.3
+            ):
+                other.begin = min(other.begin, stay.begin)
+                other.until = max(other.until, stay.until)
+                other.box = (
+                    min(other.box[0], stay.box[0]),
+                    min(other.box[1], stay.box[1]),
+                    max(other.box[2], stay.box[2]),
+                    max(other.box[3], stay.box[3]),
+                )
+                other.sources |= stay.sources
+                break
+        else:
+            joined.append(stay)
+    for stay in joined:
+        best_in: float | None = None
+        best_out: float | None = None
+        for index, unit in enumerate(units):
+            if unit.category != "vehicle" or unit.clip_event_id not in stay.sources:
+                continue
+            track = track_of.get(unit.event_id)
+            if track is None or not track.times:
+                continue
+            first, last = track.times[0], track.times[-1]
+            # Its clip ends about when it stopped: it pulled in.
+            if first < stay.begin + 5 and stay.begin - 5 <= last <= stay.begin + 25:
+                gap = abs(last - stay.begin)
+                if best_in is None or gap < best_in:
+                    stay.arrival, best_in = index, gap
+            # Its clip starts about when it moved again: it drove off.
+            if stay.until - 25 <= first <= stay.until + 10:
+                gap = abs(first - stay.until)
+                if best_out is None or gap < best_out:
+                    stay.departure, best_out = index, gap
+        if stay.arrival == stay.departure:
+            stay.departure = None
+    return joined
+
+
+def _parked_patches(
+    stays: Sequence[_Stay],
+    units: Sequence[ScheduledUnit],
+    starts: Sequence[int],
+    tubes: Sequence[Tube],
+    plates: Sequence[TimedPlate],
+    samples: Sequence[tuple[float, np.ndarray]],
+    width: int,
+    height: int,
+    fade_frames: int,
+) -> tuple[list[ParkedPatch], list[TimedPlate]]:
+    """Each stay drawn parked, and the plates with those vehicles taken out.
+
+    In a plate, a truck parked for ten minutes sat at the curb while it was
+    still pulling in, and popped in when the plate changed. Taken out of
+    the plates, it is drawn from the moment its arrival clip ends until its
+    departure clip starts.
+    """
+    if not stays or not plates:
+        return [], list(plates)
+    cleaned = clean_plates(
+        plates,
+        samples,
+        [ParkedSpan(stay.begin, stay.until, stay.box) for stay in stays],
+        width,
+        height,
+    )
+    tube_of = {tube.event_id: tube for tube in tubes}
+    lit = [
+        (float(moment), frame, frame_is_ir(frame))
+        for moment, frame in samples
+        if frame is not None and getattr(frame, "size", 0)
+    ]
+    patches: list[ParkedPatch] = []
+    for stay in stays:
+        region = parked_region(stay.box, width, height)
+        if region is None:
+            continue
+        context: list[np.ndarray] = []
+        for index, which in ((stay.arrival, "last"), (stay.departure, "first")):
+            tube = tube_of.get(units[index].event_id) if index is not None else None
+            image = tube.context_image(which) if tube is not None else None
+            if image is not None and image.shape[:2] == (height, width):
+                context.append(image)
+        first = plate_index_at(cleaned, stay.begin - 60)
+        last = plate_index_at(cleaned, stay.until + 60)
+        crops: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for plate_index in range(first, last + 1):
+            plate = cleaned[plate_index]
+            inside = sorted(
+                (
+                    item
+                    for item in lit
+                    if stay.covers(item[0]) and item[2] == plate.is_ir
+                ),
+                key=lambda item: abs(item[0] - plate.time),
+            )
+            frames = [item[1] for item in inside[:3]]
+            if not frames:
+                frames = [
+                    image for image in context if frame_is_ir(image) == plate.is_ir
+                ]
+            cut = parked_cutout(
+                [
+                    frame
+                    if frame.shape[:2] == (height, width)
+                    else cv2.resize(
+                        frame, (width, height), interpolation=cv2.INTER_AREA
+                    )
+                    for frame in frames
+                ],
+                plate.image,
+                region,
+            )
+            if cut is not None:
+                crops[plate_index] = cut
+        if not crops:
+            continue
+        on_frame = None
+        if stay.arrival is not None:
+            end = starts[stay.arrival] + len(units[stay.arrival].boxes)
+            on_frame = max(starts[stay.arrival], end - fade_frames)
+        off_frame = None
+        if stay.departure is not None:
+            off_frame = starts[stay.departure] + fade_frames
+        patches.append(
+            ParkedPatch(
+                x=region[0],
+                y=region[1],
+                begin=stay.begin,
+                until=stay.until,
+                crops=crops,
+                on_frame=on_frame,
+                off_frame=off_frame,
+            )
+        )
+    return patches, cleaned
+
+
 def generate_recap(
     *,
     camera: str,
@@ -596,19 +1074,21 @@ def generate_recap(
             and settings.parked_cars
             and vehicle_is_parked(event, track, width, height, settings.stationary_path)
         ):
-            excluded.append(
-                {
-                    "id": event.get("id"),
-                    "label": event.get("label"),
-                    "reason": "parked",
-                    "start_time": event.get("start_time"),
-                    "category": "vehicle",
-                }
-            )
             # Kept aside so a person getting in or out can still find the car.
             track.category = "vehicle"
             classified.append((event, "parked-candidate", track))
-            continue
+            if not drove_in_or_out(event):
+                excluded.append(
+                    {
+                        "id": event.get("id"),
+                        "label": event.get("label"),
+                        "reason": "parked",
+                        "start_time": event.get("start_time"),
+                        "category": "vehicle",
+                    }
+                )
+                continue
+            # It pulled in or drove off on camera. That drive is shown too.
         if too_small(event, category, settings.min_object_area):
             excluded.append(
                 {
@@ -619,6 +1099,40 @@ def generate_recap(
                 }
             )
             continue
+        if category == "vehicle":
+            pieces = vehicle_pieces(event, settings.max_object_seconds)
+            if not pieces and vehicle_is_parked(
+                event, track, width, height, settings.stationary_path
+            ):
+                # Its box only wobbled while it sat: doors, people, rain.
+                excluded.append(
+                    {
+                        "id": event.get("id"),
+                        "label": event.get("label"),
+                        "reason": "parked",
+                        "start_time": event.get("start_time"),
+                        "category": "vehicle",
+                    }
+                )
+                continue
+            pieces = pieces or [clip_window(event, settings.max_object_seconds)]
+            if len(pieces) > 1:
+                # Pulled in, sat, and drove off: the drive off is its own clip.
+                classified.append((dict(event, window=pieces[0]), category, track))
+                classified.append(
+                    (
+                        dict(
+                            event,
+                            id=f"{event['id']}{LEAVES}",
+                            source_id=str(event["id"]),
+                            window=pieces[1],
+                        ),
+                        category,
+                        track,
+                    )
+                )
+                continue
+            event = dict(event, window=pieces[0])
         classified.append((event, category, track))
 
     active = [
@@ -708,6 +1222,18 @@ def generate_recap(
                 }
             )
             continue
+        if cut.still and event.get("source_id"):
+            # The snapshot is one moment. Held a second time it would show the
+            # parked car again, not it driving off.
+            excluded.append(
+                {
+                    "id": event.get("id"),
+                    "label": event.get("label"),
+                    "reason": "drive off only shown as a clip",
+                    "start_time": event.get("start_time"),
+                }
+            )
+            continue
         ghost_frames = [_ghost_from_packed(item) for item in cut.frames]
         boxes = list(cut.boxes)
         times = list(cut.times)
@@ -717,7 +1243,10 @@ def generate_recap(
         ghost_frames = ghost_frames[:count]
         boxes = boxes[:count]
         times = times[:count]
-        start, end = _event_span(event)
+        window = event.get("window")
+        start, end = (
+            (float(window[0]), float(window[1])) if window else _event_span(event)
+        )
         track = MotionTrack(
             id=str(event["id"]),
             label=str(event["label"]),
@@ -730,7 +1259,7 @@ def generate_recap(
         tubes.append(
             Tube(
                 event_id=track.id,
-                clip_event_id=track.id,
+                clip_event_id=str(event.get("source_id") or track.id),
                 label=track.label,
                 category=category,
                 start_time=track.start,
@@ -788,11 +1317,20 @@ def generate_recap(
         if tube.event_id not in dropped_ids and tube.event_id not in dropped_animals
     ]
     by_id = {tube.event_id: tube for tube in tubes}
+    shown_sources = {
+        by_id[track.id].clip_event_id
+        for track in tracks
+        if track.category == "vehicle" and track.id in by_id
+    }
 
     if settings.parked_cars and tracks:
+        # A person held as a snapshot has one box at their best moment, not
+        # where they started, so the car they got out of is found on their path.
+        # A vehicle shown pulling in or driving off is drawn parked on its
+        # own between the two (see ``_parked_patches``).
         links = link_parked_cars(
-            [track for track in tracks if track.label == "person"],
-            parked_candidates,
+            [paths.get(track.id, track) for track in tracks if track.label == "person"],
+            [car for car in parked_candidates if car.id not in shown_sources],
             width,
             height,
             settings.stationary_path,
@@ -803,8 +1341,9 @@ def generate_recap(
     progress(78, "Placing labels")
     units: list[ScheduledUnit] = []
     repeats: list[int] = []
-    # Chronological, so the plate moves from afternoon into night.
-    for track in sorted(tracks, key=lambda item: item.start):
+    # Chronological by what is shown, so the plate moves from afternoon into
+    # night, and a car parked all day is placed and labeled when it leaves.
+    for track in sorted(tracks, key=_shown_start):
         tube = by_id.get(track.id)
         if tube is None:
             continue
@@ -816,16 +1355,30 @@ def generate_recap(
         units.append(
             ScheduledUnit(
                 event_id=track.id,
-                clip_event_id=track.id,
+                clip_event_id=tube.clip_event_id,
                 label=track.label,
                 category=track.category,
-                start_time=track.start,
+                start_time=_shown_start(track),
                 boxes=expanded,
                 member_ids=[track.id],
             )
         )
         repeats.append(repeat)
         tube.category = track.category
+    track_of = {track.id: track for track in tracks}
+    waits = follows(
+        [track_of[unit.event_id] for unit in units],
+        [paths.get(unit.event_id, track_of[unit.event_id]) for unit in units],
+        width,
+        height,
+    )
+    for unit, earlier in zip(units, waits, strict=True):
+        unit.after = earlier
+    stays = _vehicle_stays(units, track_of, events_by_id, width, height, after, before)
+    for stay in stays:
+        if stay.arrival is not None and stay.departure is not None:
+            # It drives off after it has pulled in, however long it sat.
+            units[stay.departure].after.append((stay.arrival, 1.0))
 
     person_unit = {unit.event_id: index for index, unit in enumerate(units)}
     for link in links:
@@ -914,6 +1467,20 @@ def generate_recap(
         max_active=settings.max_labels,
         max_overlap=settings.max_overlap,
     )
+    fade_frames = max(1, int(round(settings.fade_seconds * settings.output_fps)))
+    patches, timed_plates = _parked_patches(
+        stays,
+        units,
+        starts,
+        tubes,
+        timed_plates,
+        _plate_samples(plate_frames, after, before),
+        width,
+        height,
+        fade_frames,
+    )
+    if timed_plates:
+        plate = timed_plates[len(timed_plates) // 2].image
     header_h = max(28, int(round(0.075 * height)))
     rects = layout_labels(
         units,
@@ -939,13 +1506,14 @@ def generate_recap(
         fps=settings.output_fps,
         header=header,
         header_h=header_h,
-        fade_frames=max(1, int(round(settings.fade_seconds * settings.output_fps))),
+        fade_frames=fade_frames,
         label_opacity=settings.label_opacity,
         font_scale=settings.font_scale,
         repeats=repeats,
         cancel_check=cancel,
         plates=timed_plates,
         plate_fade_frames=max(1, int(round(0.5 * settings.output_fps))),
+        patches=patches,
     )
     if thumb is None:
         raise RecapCancelled()
@@ -1184,6 +1752,7 @@ def _cutouts_for(
             settings.max_object_seconds,
             category,
             time_shift,
+            window=event.get("window"),
         )
         hit = cutcache.load(key, cache_root)
         if hit is not None and hit.status in ("ok", "no_frames", "no_cutout"):
@@ -1274,7 +1843,7 @@ def _cutouts_for(
         valid=(window_start, window_end),
     )
     shift = aligned.seconds
-    if not aligned.found or aligned.fill < ALIGNED_FILL:
+    if aligned.fill < ALIGNED_FILL:
         held = still(f"path does not line up, fill {aligned.fill:.2f}")
         if held is not None and held.status == "ok":
             return held
@@ -1316,8 +1885,9 @@ def _cutouts_for(
         aligned.fill,
         "windows" if ghosts and _mostly_windows(ghosts) else "masks",
     )
-    # Only a person's clip is used to crop a parked car they get in or out of.
-    wants_context = str(event.get("label") or "") == "person"
+    # A person's clip is used to crop a parked car they get in or out of, and
+    # a vehicle's to draw it parked between pulling in and driving off.
+    wants_context = str(event.get("label") or "") == "person" or category == "vehicle"
     context_first = _jpeg(frames[0]) if wants_context else None
     context_last = _jpeg(frames[-1]) if wants_context else None
     if not ghosts:

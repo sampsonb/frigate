@@ -165,7 +165,9 @@ class TestBoxes(unittest.TestCase):
         self.assertAlmostEqual(end, 2.0 + LAG)
         self.assertLess(end, event["end_time"] - 2.5)
 
-    def test_long_event_is_trimmed_around_its_best_view(self):
+    def test_long_event_is_trimmed_to_where_it_moves_most(self):
+        # Faster before 40 s than after: the stretch ends there, the latest
+        # of the equally busy ones.
         event = {
             "id": "0.0-p",
             "label": "person",

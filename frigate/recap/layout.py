@@ -6,6 +6,7 @@ the unit tests both call these functions.
 
 from __future__ import annotations
 
+import bisect
 import math
 from collections import Counter
 from dataclasses import dataclass, field
@@ -58,6 +59,92 @@ class ScheduledUnit:
     link_index: int | None = None
     text: str = ""
     member_ids: list[str] = field(default_factory=list)
+    # Earlier units this one waits for, each with the share of that unit's
+    # clip that plays first (see ``follows``).
+    after: list[tuple[int, float]] = field(default_factory=list)
+
+
+# An object that comes into view where another one is or just was, at most
+# this many seconds later, waits for it in the synopsis.
+FOLLOW_SECONDS = 60.0
+# A box this close to the edge of the frame (share of the frame) is coming
+# in from, or going out of, the picture.
+EDGE_MARGIN = 0.02
+
+
+def _near(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> bool:
+    """True when two boxes are within about one and a half object lengths."""
+    reach = 1.5 * max(
+        math.hypot(left[2] - left[0], left[3] - left[1]),
+        math.hypot(right[2] - right[0], right[3] - right[1]),
+    )
+    left_center = _center(left)
+    right_center = _center(right)
+    return (
+        math.hypot(left_center[0] - right_center[0], left_center[1] - right_center[1])
+        <= reach
+    )
+
+
+def _mid_frame(
+    box: tuple[float, float, float, float], width: float, height: float
+) -> bool:
+    """True when the box keeps clear of every edge of the frame."""
+    return (
+        box[0] > EDGE_MARGIN * width
+        and box[1] > EDGE_MARGIN * height
+        and box[2] < (1 - EDGE_MARGIN) * width
+        and box[3] < (1 - EDGE_MARGIN) * height
+    )
+
+
+def follows(
+    shown: Sequence[MotionTrack],
+    paths: Sequence[MotionTrack],
+    width: float,
+    height: float,
+) -> list[list[tuple[int, float]]]:
+    """For each shown track, the earlier ones it has to wait for.
+
+    ``shown`` holds what each unit plays, in schedule order, and ``paths``
+    the same objects' whole paths. An object that comes into view in the
+    middle of the picture, next to where another one is or just was, at
+    most ``FOLLOW_SECONDS`` later, waits until the other has played up to
+    that moment. The people who get out of a truck then appear once it has
+    pulled in, not while it is still down the street, and a car someone got
+    into drives off after they reach it. Cars passing each other at the
+    edge of the picture keep their own pace.
+
+    Each entry is the earlier unit's index and the share of its clip that
+    plays first, 0 to 1.
+    """
+    result: list[list[tuple[int, float]]] = [[] for _ in shown]
+    for later, (track, path) in enumerate(zip(shown, paths, strict=True)):
+        if not track.boxes or not track.times:
+            continue
+        begin = track.times[0]
+        firsts = [track.boxes[0], *path.boxes[:1]]
+        for earlier in range(later):
+            other = shown[earlier]
+            count = min(len(other.boxes), len(other.times))
+            if not count:
+                continue
+            if not other.times[0] <= begin <= other.times[count - 1] + FOLLOW_SECONDS:
+                continue
+            played = bisect.bisect_left(other.times, begin, 0, count)
+            there = other.boxes[max(0, played - 1)]
+            if not any(_near(there, first) for first in firsts):
+                continue
+            if not (
+                _mid_frame(there, width, height)
+                or any(_mid_frame(first, width, height) for first in firsts)
+            ):
+                continue
+            result[later].append((earlier, played / count))
+    return result
 
 
 def format_clock(timestamp: float, zone: tzinfo, *, seconds: bool) -> str:
@@ -449,6 +536,12 @@ def schedule_units(
             area = sum((b[1] - b[0]) * (b[3] - b[2]) for b in occupied) or 1
             limit = threshold * area
             start0 = last
+            for prior, share in units[index].after:
+                if 0 <= prior < len(starts):
+                    start0 = max(
+                        start0,
+                        starts[prior] + int(math.ceil(share * len(cells[prior]))),
+                    )
             if max_active:
                 while (
                     start0 + length < horizon

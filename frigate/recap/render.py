@@ -108,6 +108,53 @@ class Tube:
         return cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
 
 
+@dataclass
+class ParkedPatch:
+    """A vehicle drawn parked between pulling in and driving off.
+
+    ``crops`` holds, per plate index, the crop at ``(x, y)`` and its alpha.
+    It is drawn from ``on_frame`` (as its arrival clip fades out) until
+    ``off_frame`` (once its departure clip has faded in). Without a clip on
+    that side, the story moment decides: on from ``begin``, off after
+    ``until``.
+    """
+
+    x: int
+    y: int
+    begin: float
+    until: float
+    crops: dict[int, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    on_frame: int | None = None
+    off_frame: int | None = None
+
+    def wanted(self, frame_index: int, moment: float) -> tuple[bool, bool]:
+        """Whether to draw it, and whether the change is a cut, not a fade."""
+        if self.on_frame is not None and frame_index < self.on_frame:
+            return False, True
+        if self.off_frame is not None and frame_index >= self.off_frame:
+            return False, True
+        if self.on_frame is None and moment < self.begin:
+            return False, False
+        if self.off_frame is None and moment > self.until:
+            return False, False
+        return True, self.on_frame is not None and frame_index >= self.on_frame
+
+
+def _paste_underlay(
+    canvas: np.ndarray, x: int, y: int, crop: np.ndarray, alpha: np.ndarray
+) -> None:
+    height, width = canvas.shape[:2]
+    x1 = min(width, x + crop.shape[1])
+    y1 = min(height, y + crop.shape[0])
+    if x1 <= x or y1 <= y or x < 0 or y < 0:
+        return
+    part = alpha[: y1 - y, : x1 - x, None]
+    region = canvas[y:y1, x:x1].astype(np.float32)
+    canvas[y:y1, x:x1] = (
+        crop[: y1 - y, : x1 - x].astype(np.float32) * part + region * (1 - part)
+    ).astype(np.uint8)
+
+
 def _text_size(text: str, scale: float, thickness: int) -> tuple[int, int]:
     (width, height), baseline = cv2.getTextSize(text, FONT, scale, thickness)
     return width, height + baseline
@@ -409,14 +456,21 @@ def compose_frame(
     repeats: list[int],
     plate_is_ir: bool | None = None,
     plate_is_dark: bool | None = None,
+    underlay: Sequence[tuple[int, int, np.ndarray, np.ndarray]] = (),
 ) -> np.ndarray:
-    """One synopsis frame. ``repeats[i]`` is how many output frames share a source frame."""
+    """One synopsis frame. ``repeats[i]`` is how many output frames share a source frame.
+
+    ``underlay`` is parked vehicles ``(x, y, crop, alpha)``, drawn at full
+    strength over the plate and under every moving object.
+    """
     canvas = recede_plate(plate)
     height, width = canvas.shape[:2]
     if plate_is_ir is None:
         plate_is_ir = frame_is_ir(plate)
     if plate_is_dark is None:
         plate_is_dark = frame_is_dark(plate)
+    for x, y, crop, alpha in underlay:
+        _paste_underlay(canvas, x, y, crop, alpha)
     night = plate_is_ir or plate_is_dark
     thickness = max(1, int(round(height / 1080 * 2)))
     scale = max(0.45, height / 1080 * font_scale)
@@ -686,6 +740,7 @@ def encode_video(
     cancel_check,
     plates: Sequence[TimedPlate] | None = None,
     plate_fade_frames: int = 6,
+    patches: Sequence[ParkedPatch] = (),
 ) -> np.ndarray | None:
     """Pipe raw frames to ffmpeg. Returns a thumbnail frame, or None if cancelled."""
     height, width = plate.shape[:2]
@@ -724,6 +779,8 @@ def encode_video(
     timed = [item for item in (plates or []) if item.image.shape[:2] == (height, width)]
     fade = PlateFade(plate_fade_frames)
     moment = timed[0].time if timed else 0.0
+    levels = [0.0 for _ in patches]
+    step = 1.0 / max(1, plate_fade_frames)
     try:
         for frame_index in range(max(1, frame_count)):
             if cancel_check():
@@ -736,9 +793,25 @@ def encode_video(
                 plate, plate_is_ir, plate_is_dark = _plate_for_frame(
                     timed, fade, moment
                 )
+                plate_index = plate_index_at(timed, moment)
             else:
                 plate_is_ir = None
                 plate_is_dark = None
+                plate_index = 0
+            underlay = []
+            for slot, patch in enumerate(patches):
+                want, cut = patch.wanted(frame_index, moment)
+                if cut:
+                    levels[slot] = 1.0 if want else 0.0
+                else:
+                    levels[slot] = min(
+                        1.0, max(0.0, levels[slot] + (step if want else -step))
+                    )
+                piece = patch.crops.get(plate_index)
+                if levels[slot] > 0 and piece is not None:
+                    underlay.append(
+                        (patch.x, patch.y, piece[0], piece[1] * levels[slot])
+                    )
             image = compose_frame(
                 plate,
                 units,
@@ -754,6 +827,7 @@ def encode_video(
                 repeats=repeats,
                 plate_is_ir=plate_is_ir,
                 plate_is_dark=plate_is_dark,
+                underlay=underlay,
             )
             visible = sum(
                 1

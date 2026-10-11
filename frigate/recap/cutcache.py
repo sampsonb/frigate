@@ -5,7 +5,9 @@ overlaps the last build. Cutting an object out of its recording is the
 slow part, so the finished ghost frames for each event are kept on disk
 and reused. The key covers everything that changes the pixels: the
 event id and end time, the output size, the sample rate, the per-object
-time cap, the category, the camera's time shift, and ``CACHE_VERSION``.
+time cap, the category, the camera's time shift, the stretch of the event
+shown (a vehicle's arrival and departure are cut apart), and
+``CACHE_VERSION``.
 Entries not used for ``MAX_AGE_HOURS`` are deleted.
 """
 
@@ -18,6 +20,7 @@ import os
 import pickle
 import time
 import zlib
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,7 +34,10 @@ logger = logging.getLogger(__name__)
 # window ghosts for infrared and dusk.
 # 3: no empty windows inside a moving track, vehicle masks without the road
 # halo, clips cut at retention holes.
-CACHE_VERSION = 3
+# 4: the busiest stretch of a long event, a vehicle's arrival and departure
+# as separate clips, still snapshots only when the path does not line up,
+# and a vehicle's first and last frames kept to draw it parked.
+CACHE_VERSION = 4
 # Longest window a cached cutout is useful for (72 hours) plus slack.
 MAX_AGE_HOURS = 74.0
 # A failed cutout is only cached once the recording is surely written.
@@ -51,6 +57,7 @@ def cache_key(
     max_object_seconds: float,
     category: str,
     time_shift: float = 0.0,
+    window: Sequence[float] | None = None,
 ) -> str:
     """Stable digest for one event's cutouts.
 
@@ -69,6 +76,7 @@ def cache_key(
             round(float(max_object_seconds), 3),
             str(category),
             round(float(time_shift), 3),
+            None if not window else [round(float(item), 2) for item in window[:2]],
         ],
         separators=(",", ":"),
     )

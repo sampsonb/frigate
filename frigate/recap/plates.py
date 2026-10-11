@@ -8,8 +8,9 @@ The plate nearest the objects on screen is the one that is drawn.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -307,6 +308,178 @@ def plate_index_at(plates: Sequence[TimedPlate], moment: float) -> int:
         if when >= boundary:
             chosen = index
     return chosen
+
+
+# Room left around a parked vehicle's box, as a share of the box, so its
+# shadow and mirrors go with it.
+PARKED_PAD = 0.12
+# Pixels at the edge of a replaced region that blend into what was there.
+PARKED_FEATHER = 6
+# Difference from the plate, on the strongest color channel, that counts as
+# vehicle. Lighting drifts by less between samples minutes apart.
+PARKED_DIFF = 30
+# Least share of its region a parked vehicle has to cover to be drawn.
+PARKED_MIN_SHARE = 0.08
+
+
+@dataclass(frozen=True)
+class ParkedSpan:
+    """A vehicle sitting still from ``begin`` to ``until``, box in pixels."""
+
+    begin: float
+    until: float
+    box: tuple[float, float, float, float]
+
+    def covers(self, moment: float) -> bool:
+        return self.begin <= moment <= self.until
+
+
+def parked_region(
+    box: tuple[float, float, float, float], width: int, height: int
+) -> tuple[int, int, int, int] | None:
+    """Pixel rectangle around a parked vehicle, or None when it is tiny."""
+    pad_x = (box[2] - box[0]) * PARKED_PAD
+    pad_y = (box[3] - box[1]) * PARKED_PAD
+    left = max(0, int(box[0] - pad_x))
+    top = max(0, int(box[1] - pad_y))
+    right = min(width, int(math.ceil(box[2] + pad_x)))
+    bottom = min(height, int(math.ceil(box[3] + pad_y)))
+    if right - left < 8 or bottom - top < 8:
+        return None
+    return left, top, right, bottom
+
+
+def _fit(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+    if frame.shape[1] != width or frame.shape[0] != height:
+        return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    return frame
+
+
+def _edge_ramp(height: int, width: int, feather: int) -> np.ndarray:
+    """1 inside, falling to 0 over ``feather`` pixels at every edge."""
+    ys = np.minimum(np.arange(height), np.arange(height)[::-1]).astype(np.float32)
+    xs = np.minimum(np.arange(width), np.arange(width)[::-1]).astype(np.float32)
+    ramp = np.minimum(ys[:, None], xs[None, :]) / max(1, feather)
+    return np.clip(ramp, 0.0, 1.0)
+
+
+def _overlaps(
+    left: tuple[int, int, int, int], right: tuple[int, int, int, int]
+) -> bool:
+    return (
+        left[0] < right[2]
+        and right[0] < left[2]
+        and left[1] < right[3]
+        and right[1] < left[3]
+    )
+
+
+def clean_plates(
+    plates: Sequence[TimedPlate],
+    samples: Sequence[tuple[float, np.ndarray]],
+    spans: Sequence[ParkedSpan],
+    width: int,
+    height: int,
+) -> list[TimedPlate]:
+    """Plates with these parked vehicles taken out.
+
+    A vehicle the recap shows pulling in or driving off is drawn parked by
+    the recap itself, only while it was there. Left in a plate it sat at the
+    curb while it pulled in (on screen twice), and it popped in or out
+    whenever the plate changed. Its spot is filled from the samples that do
+    not have it: from the same plate when there are any, else from the
+    nearest ones with the same lighting.
+    """
+    if not spans:
+        return list(plates)
+    timed = [
+        (float(moment), _fit(frame, width, height))
+        for moment, frame in samples
+        if frame is not None and getattr(frame, "size", 0)
+    ]
+    timed = [(moment, frame, frame_is_ir(frame)) for moment, frame in timed]
+    regions = [parked_region(span.box, width, height) for span in spans]
+    cleaned: list[TimedPlate] = []
+    for plate in plates:
+        image = plate.image
+        own = [
+            item
+            for item in timed
+            if plate.start - 1 <= item[0] <= plate.end + 1 and item[2] == plate.is_ir
+        ]
+        for span, region in zip(spans, regions, strict=True):
+            if region is None or not any(span.covers(item[0]) for item in own):
+                continue
+
+            def clear(
+                moment: float, region: tuple[int, int, int, int] = region
+            ) -> bool:
+                return not any(
+                    other.covers(moment)
+                    and other_region is not None
+                    and _overlaps(other_region, region)
+                    for other, other_region in zip(spans, regions, strict=True)
+                )
+
+            pool = [frame for moment, frame, _ir in own if clear(moment)]
+            if not pool:
+                nearest = sorted(
+                    (
+                        item
+                        for item in timed
+                        if item[2] == plate.is_ir and clear(item[0])
+                    ),
+                    key=lambda item: abs(item[0] - plate.time),
+                )
+                pool = [frame for _moment, frame, _ir in nearest[:3]]
+            if not pool:
+                continue
+            if image is plate.image:
+                image = image.copy()
+            x0, y0, x1, y1 = region
+            fill = _median_image([frame[y0:y1, x0:x1] for frame in pool])
+            ramp = _edge_ramp(y1 - y0, x1 - x0, PARKED_FEATHER)[:, :, None]
+            image[y0:y1, x0:x1] = (
+                fill.astype(np.float32) * ramp
+                + image[y0:y1, x0:x1].astype(np.float32) * (1 - ramp)
+            ).astype(np.uint8)
+        cleaned.append(plate if image is plate.image else replace(plate, image=image))
+    return cleaned
+
+
+def parked_cutout(
+    frames: Sequence[np.ndarray],
+    plate: np.ndarray,
+    region: tuple[int, int, int, int],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """A parked vehicle cut from frames that have it, against a plate without it.
+
+    Returns the crop of ``region`` and its alpha (0 to 1), or None when the
+    frames hardly differ from the plate there.
+    """
+    if not frames:
+        return None
+    x0, y0, x1, y1 = region
+    crop = _median_image([frame[y0:y1, x0:x1] for frame in frames])
+    base = plate[y0:y1, x0:x1]
+    if crop.shape != base.shape:
+        return None
+    diff = cv2.absdiff(crop, base).max(axis=2)
+    mask = (diff > PARKED_DIFF).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    points = cv2.findNonZero(mask)
+    if points is None or len(points) < PARKED_MIN_SHARE * mask.size:
+        return None
+    # The whole vehicle, windows and dark paint that match the road included.
+    hull = cv2.convexHull(points)
+    shape = np.zeros_like(mask)
+    cv2.fillConvexPoly(shape, hull, 255)
+    shape = cv2.dilate(shape, kernel)
+    sigma = max(1.5, 0.012 * max(shape.shape))
+    alpha = cv2.GaussianBlur(shape.astype(np.float32) / 255.0, (0, 0), sigma)
+    alpha *= _edge_ramp(alpha.shape[0], alpha.shape[1], PARKED_FEATHER)
+    return crop, alpha
 
 
 class PlateFade:
