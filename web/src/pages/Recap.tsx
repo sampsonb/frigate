@@ -21,6 +21,7 @@ import {
   recapDownloadUrl,
   recapFileName,
   recapSpanLabel,
+  recapVideoUrl,
   useRecapDownload,
 } from "@/views/recap/recapDownload";
 import RecapRangePicker from "@/views/recap/RecapRangePicker";
@@ -318,6 +319,7 @@ export default function Recap() {
           key,
           url: recapDownloadUrl(item.id, name, version),
           name,
+          openUrl: recapVideoUrl(item.id, version),
         }),
     };
   };

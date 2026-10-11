@@ -8,8 +8,11 @@ export type DownloadState = "idle" | "preparing" | "ready";
 export type DownloadRequest = {
   // Identifies one file, so a rebuilt rolling recap is fetched again.
   key: string;
+  // Serves the file to save (an attachment with a readable name).
   url: string;
   name: string;
+  // Plays the video. Opened in its own tab from inside another page's frame.
+  openUrl?: string;
 };
 
 export function recapVideoUrl(id: string, version?: number) {
@@ -90,8 +93,10 @@ function inFrame() {
  * Where the share sheet is allowed (an HTTPS page on iPhone or iPad), the
  * file is fetched and handed to it, so Save Video and Save to Files work.
  * Inside another page's frame, such as Home Assistant's webpage card, a
- * download is blocked and an HTTP page has no share sheet, so the video
- * opens in its own window to save from there. Anywhere else it downloads.
+ * download is blocked and an HTTP page has no share sheet. A window opened
+ * from that frame inherits its sandbox, so a download there can be blocked
+ * too. The video plays in its own tab instead: Safari's Share > Save Video,
+ * or a desktop browser's Save As, keeps it. Anywhere else it downloads.
  */
 export function useRecapDownload() {
   const { t } = useTranslation(["views/recap"]);
@@ -129,7 +134,7 @@ export function useRecapDownload() {
   );
 
   const download = useCallback(
-    async ({ key, url, name }: DownloadRequest) => {
+    async ({ key, url, name, openUrl }: DownloadRequest) => {
       if (canShareFiles()) {
         if (cached.current?.key === key) {
           await share(key, cached.current.file);
@@ -153,7 +158,7 @@ export function useRecapDownload() {
         return;
       }
       if (inFrame()) {
-        window.open(url, "_blank", "noopener");
+        window.open(openUrl ?? url, "_blank", "noopener");
         return;
       }
       const link = document.createElement("a");

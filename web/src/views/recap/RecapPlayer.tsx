@@ -25,6 +25,7 @@ import {
   recapDownloadUrl,
   recapFileName,
   recapSpanLabel,
+  recapVideoUrl,
   safeFileName,
   useRecapDownload,
 } from "./recapDownload";
@@ -196,6 +197,7 @@ export default function RecapPlayer({
       key: fileKey,
       url: recapDownloadUrl(recap.id, fileName, version ?? recap.finished),
       name: fileName,
+      openUrl: recapVideoUrl(recap.id, version ?? recap.finished),
     });
 
   const categories = useMemo(() => recap.categories ?? [], [recap.categories]);
