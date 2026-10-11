@@ -17,6 +17,12 @@ import { RecapManifest, RecapRollingStatus, RecapSummary } from "@/types/recap";
 import RecapBuildProgress from "@/views/recap/RecapBuildProgress";
 import RecapListItem from "@/views/recap/RecapListItem";
 import RecapPlayer from "@/views/recap/RecapPlayer";
+import {
+  recapDownloadUrl,
+  recapFileName,
+  recapSpanLabel,
+  useRecapDownload,
+} from "@/views/recap/recapDownload";
 import RecapRangePicker from "@/views/recap/RecapRangePicker";
 import {
   LongerChoice,
@@ -58,6 +64,7 @@ export default function Recap() {
   const { t } = useTranslation(["views/recap", "common"]);
   const times = useRecapTime();
   const now = useNow(30000);
+  const downloads = useRecapDownload();
   const [searchParams] = useSearchParams();
   const requested = useRef({
     id: searchParams.get("id") || "",
@@ -294,6 +301,27 @@ export default function Recap() {
     pinned !== undefined &&
     latestVersion > pinned;
 
+  const downloadProps = (item: RecapSummary) => {
+    if (item.status !== "complete") {
+      return {};
+    }
+    const version = item.finished || item.created || 0;
+    const key = `${item.id}:${version}`;
+    const name = recapFileName(
+      resolveCameraName(config, item.camera),
+      recapSpanLabel(times, item.after, item.before, item.created),
+    );
+    return {
+      downloadState: downloads.stateOf(key),
+      onDownload: () =>
+        downloads.download({
+          key,
+          url: recapDownloadUrl(item.id, name, version),
+          name,
+        }),
+    };
+  };
+
   const renderItem = (item: RecapSummary) => (
     <RecapListItem
       key={item.id}
@@ -314,6 +342,7 @@ export default function Recap() {
           ? () => setPendingDelete(item)
           : undefined
       }
+      {...downloadProps(item)}
     />
   );
 
@@ -459,6 +488,7 @@ export default function Recap() {
                   now={now}
                   badge={t("readyToWatch")}
                   active={view.kind === "rolling"}
+                  {...downloadProps(rollingCurrent as RecapSummary)}
                   onOpen={() => {
                     if (latestVersion) {
                       setPinned(latestVersion);

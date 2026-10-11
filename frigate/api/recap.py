@@ -34,6 +34,7 @@ from frigate.recap.archive import (
     remote_recap_summaries,
 )
 from frigate.recap.clips import (
+    download_name,
     live_clip_urls,
     playable_mp4_response,
     render_faststart_mp4,
@@ -427,7 +428,13 @@ async def recap_delete(request: Request, recap_id: str):
     dependencies=[Depends(allow_any_authenticated())],
     summary="Play a recap",
 )
-async def recap_video(request: Request, recap_id: str):
+async def recap_video(
+    request: Request,
+    recap_id: str,
+    download: bool = False,
+    name: str | None = None,
+):
+    """Play a recap inline, or save it with ``?download=1&name=...``."""
     found = await _authorized(request, recap_id)
     if isinstance(found, JSONResponse):
         return found
@@ -435,6 +442,13 @@ async def recap_video(request: Request, recap_id: str):
     if directory is not None:
         path = directory / "video.mp4"
         if path.is_file():
+            if download:
+                return FileResponse(
+                    path,
+                    media_type="video/mp4",
+                    filename=download_name(name),
+                    content_disposition_type="attachment",
+                )
             return playable_mp4_response(path, "recap.mp4")
     if remote:
         camera = str(manifest.get("camera") or "")

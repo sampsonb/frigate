@@ -2,6 +2,8 @@ import { baseUrl } from "@/api/baseUrl";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { resolveCameraName } from "@/hooks/use-camera-friendly-name";
+import { FrigateConfig } from "@/types/frigateConfig";
 import { RecapClipSource, RecapManifest, RecapTrack } from "@/types/recap";
 import axios from "axios";
 import Hls from "hls.js";
@@ -14,8 +16,19 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { LuDownload, LuLoaderCircle, LuShare } from "react-icons/lu";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
+import useSWR from "swr";
+import {
+  DownloadState,
+  recapDownloadUrl,
+  recapFileName,
+  recapSpanLabel,
+  safeFileName,
+  useRecapDownload,
+} from "./recapDownload";
+import { useRecapTime } from "./recapUtils";
 
 type RecapPlayerProps = {
   recap: RecapManifest;
@@ -111,6 +124,44 @@ function RecapClipVideo({ src, hls }: { src: string; hls: boolean }) {
   );
 }
 
+export function DownloadButton({
+  state,
+  onClick,
+  label,
+  className,
+}: {
+  state: DownloadState;
+  onClick: () => void;
+  label: string;
+  className?: string;
+}) {
+  const { t } = useTranslation(["views/recap"]);
+  const Icon =
+    state === "preparing"
+      ? LuLoaderCircle
+      : state === "ready"
+        ? LuShare
+        : LuDownload;
+  return (
+    <Button
+      size="sm"
+      variant="outline"
+      className={className}
+      disabled={state === "preparing"}
+      onClick={onClick}
+    >
+      <Icon
+        className={`mr-1 size-4 ${state === "preparing" ? "animate-spin" : ""}`}
+      />
+      {state === "preparing"
+        ? t("downloadPreparing")
+        : state === "ready"
+          ? t("downloadSave")
+          : label}
+    </Button>
+  );
+}
+
 export default function RecapPlayer({
   recap,
   version,
@@ -131,6 +182,21 @@ export default function RecapPlayer({
   });
   const [enabled, setEnabled] = useState<Record<string, boolean>>({});
   const [open, setOpen] = useState<OpenClip>();
+  const { data: config } = useSWR<FrigateConfig>("config");
+  const times = useRecapTime();
+  const downloads = useRecapDownload();
+  const cameraName = resolveCameraName(config, recap.camera);
+  const fileName = recapFileName(
+    cameraName,
+    recapSpanLabel(times, recap.after, recap.before, recap.created),
+  );
+  const fileKey = `${recap.id}:${version ?? recap.finished ?? 0}`;
+  const saveRecap = () =>
+    downloads.download({
+      key: fileKey,
+      url: recapDownloadUrl(recap.id, fileName, version ?? recap.finished),
+      name: fileName,
+    });
 
   const categories = useMemo(() => recap.categories ?? [], [recap.categories]);
   const tracks = useMemo(() => recap.tracks ?? [], [recap.tracks]);
@@ -280,7 +346,7 @@ export default function RecapPlayer({
     <div className="flex min-h-0 flex-1 flex-col gap-3 xl:flex-row">
       <div className="flex min-w-0 flex-1 flex-col gap-2">
         {header}
-        <div className="flex flex-wrap gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           {categories.map((category) => (
             <label
               key={category.key}
@@ -303,6 +369,12 @@ export default function RecapPlayer({
               <span className="text-muted-foreground">{category.count}</span>
             </label>
           ))}
+          <DownloadButton
+            className="ml-auto h-8"
+            state={downloads.stateOf(fileKey)}
+            label={t("downloadRecap")}
+            onClick={saveRecap}
+          />
         </div>
         <p className="text-xs text-muted-foreground">{t("clickHint")}</p>
         <div
@@ -419,11 +491,20 @@ export default function RecapPlayer({
           )}
           <div className="flex flex-wrap gap-2">
             {open?.download && (
-              <Button variant="select" asChild>
-                <a href={open.download} download>
-                  {t("download")}
-                </a>
-              </Button>
+              <DownloadButton
+                state={downloads.stateOf(open.download)}
+                label={t("download")}
+                onClick={() =>
+                  open.download &&
+                  downloads.download({
+                    key: open.download,
+                    url: open.download,
+                    name: safeFileName(
+                      `${cameraName} ${open.track.label} ${open.track.text}`,
+                    ),
+                  })
+                }
+              />
             )}
             <Button
               variant="outline"

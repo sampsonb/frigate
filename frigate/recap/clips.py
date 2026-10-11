@@ -45,6 +45,26 @@ def live_clip_urls(
     }
 
 
+def download_name(name: str | None) -> str:
+    """A safe file name for a saved recap, ending in .mp4.
+
+    Clock colons become dots. Only letters, digits, spaces, and ``.,_-()``
+    are kept, so the name works in the Files app, Photos, and a desktop
+    download folder.
+    """
+    cleaned = "".join(
+        char
+        for char in str(name or "").replace(":", ".")
+        if char.isalnum() or char in " .,_-()"
+    )
+    cleaned = " ".join(cleaned.split()).strip(" .")[:120]
+    if not cleaned:
+        return "recap.mp4"
+    if not cleaned.lower().endswith(".mp4"):
+        cleaned = f"{cleaned}.mp4"
+    return cleaned
+
+
 def playable_mp4_response(
     path: Path, filename: str, *, delete_after: bool = False
 ) -> FileResponse:

@@ -4,7 +4,16 @@ import { cn } from "@/lib/utils";
 import { RecapSummary } from "@/types/recap";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { LuHistory, LuMoon, LuTrash2, LuX } from "react-icons/lu";
+import {
+  LuDownload,
+  LuHistory,
+  LuLoaderCircle,
+  LuMoon,
+  LuShare,
+  LuTrash2,
+  LuX,
+} from "react-icons/lu";
+import { DownloadState } from "./recapDownload";
 import { isBusy, useRecapTime } from "./recapUtils";
 
 type RecapListItemProps = {
@@ -14,6 +23,8 @@ type RecapListItemProps = {
   onOpen: () => void;
   onCancel?: () => void;
   onDelete?: () => void;
+  onDownload?: () => void;
+  downloadState?: DownloadState;
   badge?: string;
 };
 
@@ -24,6 +35,8 @@ export default function RecapListItem({
   onOpen,
   onCancel,
   onDelete,
+  onDownload,
+  downloadState = "idle",
   badge,
 }: RecapListItemProps) {
   const { t } = useTranslation(["views/recap"]);
@@ -148,8 +161,31 @@ export default function RecapListItem({
           </span>
         </span>
       </button>
-      {(onCancel || onDelete) && (
+      {(onCancel || onDelete || onDownload) && (
         <div className="flex shrink-0 items-start">
+          {onDownload && (
+            <Button
+              size="xs"
+              variant="ghost"
+              aria-label={t("downloadRecap")}
+              title={
+                downloadState === "ready"
+                  ? t("downloadSave")
+                  : t("downloadRecap")
+              }
+              className="text-muted-foreground hover:text-primary"
+              disabled={downloadState === "preparing"}
+              onClick={onDownload}
+            >
+              {downloadState === "preparing" ? (
+                <LuLoaderCircle className="size-4 animate-spin" />
+              ) : downloadState === "ready" ? (
+                <LuShare className="size-4 text-selected" />
+              ) : (
+                <LuDownload className="size-4" />
+              )}
+            </Button>
+          )}
           {onCancel && (
             <Button
               size="xs"

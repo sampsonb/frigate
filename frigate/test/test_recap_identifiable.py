@@ -10,6 +10,7 @@ import numpy as np
 from frigate.config.recap import RecapConfig
 from frigate.recap import cutcache
 from frigate.recap.align import estimate_shift
+from frigate.recap.clips import download_name
 from frigate.recap.cutout import (
     build_cutouts,
     needs_window,
@@ -543,6 +544,18 @@ class TestRetentionHoles(unittest.TestCase):
         segments, first = clip_segments(rows, 104.0, 115.0)
         self.assertEqual([item[0] for item in segments], ["/a.mp4", "/b.mp4"])
         self.assertEqual(first, 104.0)
+
+
+class TestDownloadName(unittest.TestCase):
+    def test_saved_recaps_get_a_safe_readable_name(self):
+        self.assertEqual(
+            download_name("Street recap Sat Oct 10, 12:35 PM to 6:35 PM"),
+            "Street recap Sat Oct 10, 12.35 PM to 6.35 PM.mp4",
+        )
+        self.assertEqual(download_name("../../etc/passwd"), "etcpasswd.mp4")
+        self.assertEqual(download_name("Door.mp4"), "Door.mp4")
+        self.assertEqual(download_name(None), "recap.mp4")
+        self.assertEqual(download_name("  ...  "), "recap.mp4")
 
 
 class TestSegmentJoin(unittest.TestCase):
