@@ -62,6 +62,9 @@ class ScheduledUnit:
     # Earlier units this one waits for, each with the share of that unit's
     # clip that plays first (see ``follows``).
     after: list[tuple[int, float]] = field(default_factory=list)
+    # An earlier unit this one plays alongside, and how many frames into it
+    # this one starts: two objects that were on screen together.
+    together: tuple[int, int] | None = None
 
 
 # An object that comes into view where another one is or just was, at most
@@ -523,6 +526,22 @@ def schedule_units(
         for index, occupied in enumerate(cells):
             length = len(occupied)
             partner = link[index]
+            together = units[index].together
+            if together is not None and together[0] < len(starts):
+                start = starts[together[0]] + together[1]
+                if start + length >= horizon:
+                    start = max(0, horizon - length - 1)
+                end = min(horizon, start + length)
+                active[start:end] += weight[index]
+                for step, bounds in enumerate(occupied):
+                    if start + step >= horizon:
+                        break
+                    occupancy[
+                        start + step, bounds[0] : bounds[1], bounds[2] : bounds[3]
+                    ] += 1
+                starts.append(start)
+                last = max(last, start)
+                continue
             if partner is not None and partner < len(starts):
                 start = starts[partner]
                 if start + length >= horizon:

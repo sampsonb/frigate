@@ -275,6 +275,15 @@ class TestFollows(unittest.TestCase):
         self.assertGreaterEqual(starts[1], starts[0] + 24)
         self.assertGreaterEqual(starts[2], starts[0] + 12)
 
+    def test_objects_that_were_together_play_together(self):
+        pickup = _unit("pickup", 24, (100.0, 60.0, 160.0, 120.0), "vehicle")
+        trailer = _unit("trailer", 24, (160.0, 60.0, 260.0, 120.0), "vehicle")
+        # The trailer came into view 6 frames into the pickup's clip, right
+        # beside it. Without this the two overlap, so one would wait.
+        trailer.together = (0, 6)
+        starts, _length = schedule_units([pickup, trailer], WIDTH, HEIGHT, 200)
+        self.assertEqual(starts[1] - starts[0], 6)
+
     def test_without_a_wait_far_apart_objects_share_the_screen(self):
         truck = _unit("truck", 24, (10.0, 60.0, 110.0, 120.0), "vehicle")
         person = _unit("person", 12, (280.0, 10.0, 300.0, 50.0))

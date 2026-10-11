@@ -7,6 +7,7 @@ The job in ``manager`` loads recordings and calls ``generate_recap``.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -1421,12 +1422,26 @@ def generate_recap(
         height,
     )
     for unit, earlier in zip(units, waits, strict=True):
-        unit.after = earlier
+        unit.after = [item for item in earlier if item[1] >= 1.0]
+        alongside = [item for item in earlier if item[1] < 1.0]
+        if alongside:
+            # It came into view next to an object still on screen: a pickup
+            # and the trailer Frigate tracked apart, or someone stepping out.
+            # They were there together, so they play together.
+            partner, share = max(alongside)
+            unit.together = (
+                partner,
+                int(math.ceil(share * len(units[partner].boxes))),
+            )
     stays = _vehicle_stays(units, track_of, events_by_id, width, height, after, before)
     for stay in stays:
         if stay.arrival is not None and stay.departure is not None:
             # It drives off after it has pulled in, however long it sat.
             units[stay.departure].after.append((stay.arrival, 1.0))
+    for unit in units:
+        if unit.together is not None and unit.after:
+            # Order wins over company: it must not start before what it waits for.
+            unit.together = None
 
     person_unit = {unit.event_id: index for index, unit in enumerate(units)}
     for link in links:
