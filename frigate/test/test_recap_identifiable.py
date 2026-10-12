@@ -13,6 +13,8 @@ from frigate.recap.align import estimate_shift
 from frigate.recap.clips import download_name
 from frigate.recap.cutout import (
     _attach,
+    follow,
+    retrack,
     _occluders,
     _outside_others,
     _steady_outlines,
@@ -572,6 +574,48 @@ class TestPeople(unittest.TestCase):
         # The other frames are untouched, and nothing is added anywhere.
         self.assertIs(steady[0], ghosts[0])
         self.assertLessEqual(int((middle > 0).sum()), int((ghosts[1]["alpha"] > 0).sum()))
+
+
+class TestFollowingPeople(unittest.TestCase):
+    """People Frigate saw late or boxed wrong are followed on the recording."""
+
+    def _runner(self, count: int = 20):
+        road = np.full((HEIGHT, WIDTH, 3), DAYLIGHT, np.uint8)
+        frames, lefts = [], []
+        for index in range(count):
+            frame = road.copy()
+            left = 260 - 10 * index
+            frame[60:130, left : left + 20] = (200, 170, 150)
+            frames.append(frame)
+            lefts.append(left)
+        return road, frames, lefts
+
+    def test_a_runner_is_followed_frame_by_frame(self):
+        road, frames, lefts = self._runner()
+        start = (float(lefts[0]), 60.0, float(lefts[0] + 20), 130.0)
+        boxes = follow(frames[1:], start, road)
+        self.assertEqual(len(boxes), len(frames) - 1)
+        for box, left in zip(boxes, lefts[1:], strict=True):
+            self.assertAlmostEqual((box[0] + box[2]) / 2, left + 10, delta=3)
+
+    def test_following_stops_where_he_is_gone(self):
+        road, frames, lefts = self._runner()
+        frames[12:] = [road.copy() for _ in frames[12:]]
+        start = (float(lefts[0]), 60.0, float(lefts[0] + 20), 130.0)
+        self.assertEqual(len(follow(frames[1:], start, road)), 11)
+
+    def test_boxes_a_second_behind_the_runner_are_replaced(self):
+        # Frigate's box ran a second behind a jogger, beside him in every
+        # frame and covering him in none.
+        _road, frames, lefts = self._runner()
+        lagging = [(float(left) + 22, 60.0, float(left) + 42, 130.0) for left in lefts]
+        found = retrack(frames, lagging, "person")
+        assert found is not None
+        start, end, boxes = found
+        self.assertLessEqual(start, 1)
+        self.assertGreaterEqual(end, len(frames) - 1)
+        for box, left in zip(boxes, lefts[start:end], strict=True):
+            self.assertAlmostEqual((box[0] + box[2]) / 2, left + 10, delta=3)
 
 
 class TestSnapshots(unittest.TestCase):

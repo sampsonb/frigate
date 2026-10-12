@@ -32,6 +32,10 @@ class MotionTrack:
     boxes: list[tuple[float, float, float, float]]
     times: list[float]
     zone_note: str = ""
+    # Seconds added to recording times to get ``times`` (detector times).
+    # Cutouts show the recording, so objects that play together are lined
+    # up on it (see ``crossings``).
+    shift: float = 0.0
 
 
 @dataclass
@@ -184,33 +188,39 @@ def crossings(shown: Sequence[MotionTrack]) -> list[list[tuple[int, float]]]:
     starts, as in ``follows``.
     """
     result: list[list[tuple[int, float]]] = [[] for _ in shown]
+    # On the recording's own clock: each track's detector times carry its own
+    # estimate of the recording's drift. A jogger whose estimate failed was
+    # played a second away from the man he passed, who showed him twice.
+    clock = [[moment - track.shift for moment in track.times] for track in shown]
     for later, track in enumerate(shown):
         count_later = min(len(track.boxes), len(track.times))
         if not count_later:
             continue
-        begin = track.times[0]
+        mine = clock[later]
+        begin = mine[0]
         for earlier in range(later):
             other = shown[earlier]
-            count = min(len(other.boxes), len(other.times))
-            if count < 2 or not other.times[0] <= begin <= other.times[count - 1]:
+            theirs = clock[earlier]
+            count = min(len(other.boxes), len(theirs))
+            if count < 2 or not theirs[0] <= begin <= theirs[count - 1]:
                 continue
             touching = 0
             for box, moment in zip(
-                track.boxes[:count_later], track.times[:count_later], strict=True
+                track.boxes[:count_later], mine[:count_later], strict=True
             ):
-                if moment > other.times[count - 1] + CROSS_SLACK:
+                if moment > theirs[count - 1] + CROSS_SLACK:
                     break
-                index = min(count - 1, bisect.bisect_left(other.times, moment, 0, count))
-                if index > 0 and abs(other.times[index - 1] - moment) < abs(
-                    other.times[index] - moment
+                index = min(count - 1, bisect.bisect_left(theirs, moment, 0, count))
+                if index > 0 and abs(theirs[index - 1] - moment) < abs(
+                    theirs[index] - moment
                 ):
                     index -= 1
-                if abs(other.times[index] - moment) > CROSS_SLACK:
+                if abs(theirs[index] - moment) > CROSS_SLACK:
                     continue
                 if _overlap_share(box, other.boxes[index]) >= CROSS_SHARE:
                     touching += 1
             if touching >= CROSS_FRAMES:
-                played = bisect.bisect_left(other.times, begin, 0, count)
+                played = bisect.bisect_left(theirs, begin, 0, count)
                 result[later].append((earlier, played / count))
     return result
 

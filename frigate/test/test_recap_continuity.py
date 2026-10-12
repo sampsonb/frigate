@@ -302,6 +302,22 @@ class TestFollows(unittest.TestCase):
         self.assertEqual([partner for partner, _share in result[1]], [0])
         self.assertAlmostEqual(result[1][0][1], 20 / 60, places=2)
 
+    def test_company_is_lined_up_on_the_recording(self):
+        # Frigate's clock and the recording drift apart, and each clip has its
+        # own estimate. His was 0.8 s, the jogger's failed at 0: lined up on
+        # Frigate's clock, the man's cutout showed the jogger a second away
+        # from where the jogger's own cutout had him.
+        man = _track(
+            "man", [100.8 + 0.1 * step for step in range(60)], [(100.0, 100.0, 140.0, 200.0)] * 60
+        )
+        man.shift = 0.8
+        jogger = _track(
+            "jogger", [102.0 + 0.1 * step for step in range(40)], [(120.0, 60.0, 150.0, 140.0)] * 40
+        )
+        result = crossings([man, jogger])
+        # On the recording he starts 2.0 s into the man's clip, not 1.2 s.
+        self.assertAlmostEqual(result[1][0][1], 20 / 60, places=2)
+
     def test_people_who_stayed_apart_are_not_tied(self):
         woman = _track(
             "woman", [100.0 + 0.1 * step for step in range(60)], [(100.0, 100.0, 140.0, 200.0)] * 60

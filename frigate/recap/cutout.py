@@ -1466,6 +1466,139 @@ _PLATE_RETRY = 0.25
 _SAME_COLORS = 0.55
 
 
+# Shares of the box, around where a person is expected next, searched for
+# them when following them (see ``follow``). Wide enough that a person next
+# to the box is not cut off at the window's edge, which shifted the box.
+_FOLLOW_REACH = 1.5
+# Their motion has to cover this share of the box, and at most this many
+# boxes (another person they passed joins them in one blob).
+_FOLLOW_LEAST = 0.08
+_FOLLOW_MOST = 1.6
+
+
+def follow(
+    frames: Sequence[np.ndarray],
+    box: tuple[float, float, float, float],
+    background: np.ndarray,
+    fg_thresh: int = 22,
+    first_gap: float = 1.0,
+) -> list[tuple[float, float, float, float]]:
+    """Boxes for ``frames`` in the order given, following a person from ``box``.
+
+    In each frame the moving shape nearest where they should be next is
+    taken while it is about their size, at most a box away (``first_gap``
+    boxes in the first frame, for a box known to sit beside them). The box
+    keeps their size and
+    stands where the shape stands. It stops where they are lost, join
+    someone else (the shape grows past ``_FOLLOW_MOST`` boxes), or leave the
+    frame, so the result can be shorter than ``frames``.
+    """
+    height, width = background.shape[:2]
+    box_w = max(1.0, box[2] - box[0])
+    box_h = max(1.0, box[3] - box[1])
+    area = box_w * box_h
+    current = box
+    vx = vy = 0.0
+    found: list[tuple[float, float, float, float]] = []
+    for step, frame in enumerate(frames):
+        most = first_gap if step == 0 else 1.0
+        guess = (current[0] + vx, current[1] + vy, current[2] + vx, current[3] + vy)
+        x0 = int(max(0, np.floor(guess[0] - _FOLLOW_REACH * box_w)))
+        x1 = int(min(width, np.ceil(guess[2] + _FOLLOW_REACH * box_w)))
+        y0 = int(max(0, np.floor(guess[1] - 0.3 * box_h)))
+        y1 = int(min(height, np.ceil(guess[3] + 0.3 * box_h)))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            break
+        moving = _motion(frame[y0:y1, x0:x1], background[y0:y1, x0:x1], fg_thresh)
+        # A runner's motion comes apart (blur, and his shadow taken out):
+        # pieces a little apart are one person.
+        joined = cv2.morphologyEx(
+            (moving > 0).astype(np.uint8),
+            cv2.MORPH_CLOSE,
+            np.ones((max(3, int(box_h / 6)), max(3, int(box_w / 3))), np.uint8),
+        )
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            joined, connectivity=8
+        )
+        best: tuple[float, int] | None = None
+        for label in range(1, count):
+            size = float(stats[label, cv2.CC_STAT_AREA])
+            if size < _FOLLOW_LEAST * area or size > _FOLLOW_MOST * area:
+                continue
+            cx = x0 + float(centroids[label][0])
+            cy = y0 + float(centroids[label][1])
+            gap = float(
+                np.hypot(
+                    (cx - (guess[0] + guess[2]) / 2) / box_w,
+                    (cy - (guess[1] + guess[3]) / 2) / box_h,
+                )
+            )
+            if gap <= most and (best is None or gap < best[0]):
+                best = (gap, label)
+        if best is None:
+            break
+        label = best[1]
+        left = x0 + float(stats[label, cv2.CC_STAT_LEFT])
+        right = left + float(stats[label, cv2.CC_STAT_WIDTH])
+        bottom = y0 + float(stats[label, cv2.CC_STAT_TOP] + stats[label, cv2.CC_STAT_HEIGHT])
+        middle = (left + right) / 2
+        moved = (middle - box_w / 2, bottom - box_h, middle + box_w / 2, bottom)
+        if moved[2] <= 0 or moved[0] >= width or moved[1] >= height:
+            break
+        vx = 0.5 * vx + 0.5 * (moved[0] - current[0])
+        vy = 0.5 * vy + 0.5 * (moved[1] - current[1])
+        current = moved
+        found.append(moved)
+    return found
+
+
+def follow_back(
+    frames: Sequence[np.ndarray],
+    box: tuple[float, float, float, float],
+    background: np.ndarray,
+    fg_thresh: int = 22,
+) -> list[tuple[float, float, float, float]]:
+    """Boxes for the frames before ``box``, oldest first (see ``follow``)."""
+    found = follow(list(reversed(frames)), box, background, fg_thresh)
+    found.reverse()
+    return found
+
+
+def retrack(
+    frames: Sequence[np.ndarray],
+    boxes: Sequence[tuple[float, float, float, float]],
+    category: str,
+    fg_thresh: int = 22,
+) -> tuple[int, int, list[tuple[float, float, float, float]]] | None:
+    """A person's boxes found by following them, where Frigate's do not line up.
+
+    Frigate saw a jogger once and then held a box by the hydrant for ten
+    seconds; a second behind him, it covered him in no frame. The box that
+    covers the most motion is moved onto the moving shape beside it, and he
+    is followed forward and back from there. Returns ``(start, end,
+    boxes)`` for the frames he was followed through, or None when there is
+    no one beside any box.
+    """
+    if len(frames) < 3 or len(frames) != len(boxes):
+        return None
+    pool = list(frames)[:: max(1, len(frames) // 9)]
+    background = np.median(np.stack(pool), axis=0).astype(np.uint8)
+    support = [
+        _support(frame, background, box, category, fg_thresh)
+        for frame, box in zip(frames, boxes, strict=True)
+    ]
+    # The box covering the most motion, moved onto the person beside it.
+    seed = int(np.argmax(support))
+    snapped = follow([frames[seed]], boxes[seed], background, fg_thresh, first_gap=1.5)
+    if not snapped:
+        return None
+    after = follow(list(frames)[seed + 1 :], snapped[0], background, fg_thresh)
+    before = follow_back(list(frames)[:seed], snapped[0], background, fg_thresh)
+    start = seed - len(before)
+    end = seed + 1 + len(after)
+    return start, end, before + snapped + after
+
+
 def _colors(
     frames: Sequence[np.ndarray], pieces: Sequence[tuple[int, int, np.ndarray]]
 ) -> np.ndarray | None:

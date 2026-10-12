@@ -69,6 +69,7 @@ from frigate.recap.plates import (
     prepare_cutout,
     recede_plate,
 )
+from frigate.recap.categories import CAT_COLOR
 from frigate.recap.render import (
     GhostFrame,
     Tube,
@@ -2403,6 +2404,53 @@ class TestDrawOrder(unittest.TestCase):
         # Where the two overlap, the pixel is hers.
         self.assertGreater(int(frame[75, 140][0]), 150)
         self.assertLess(int(frame[75, 140][2]), 60)
+
+    def test_every_object_gets_a_rectangle_in_its_color(self):
+        plate = np.full((180, 320, 3), (80, 140, 70), np.uint8)
+        box = (100.0, 40.0, 140.0, 120.0)
+        unit = ScheduledUnit(
+            event_id="walker",
+            clip_event_id="walker",
+            label="person",
+            category="person",
+            start_time=0.0,
+            boxes=[box],
+            text="5:50 PM",
+        )
+        tube = Tube(
+            event_id="walker",
+            clip_event_id="walker",
+            label="person",
+            category="person",
+            start_time=0.0,
+            frames=[
+                GhostFrame(
+                    x=100,
+                    y=40,
+                    box=box,
+                    crop=np.full((80, 40, 3), (40, 40, 40), np.uint8),
+                    alpha=np.full((80, 40), 255, np.uint8),
+                )
+            ],
+        )
+        frame = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [(200, 10, 270, 36)],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        color = np.array(CAT_COLOR["person"], np.int16)
+        # Left edge of the rectangle, 4 px outside the cutout, mid-height.
+        edge = frame[80, 96].astype(np.int16)
+        self.assertLess(int(np.abs(edge - color).max()), 40)
 
 
 class TestNightAndLabels(unittest.TestCase):

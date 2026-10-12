@@ -177,6 +177,9 @@ class TestCutoutReuse(unittest.TestCase):
                 cache_root=root,
                 stats=stats,
             )
+            # The first build decodes the clip, and the recording before it
+            # to follow the person back; the second decodes nothing.
+            decoded = len(calls)
             second = _cutouts_for(
                 event,
                 "person",
@@ -190,7 +193,8 @@ class TestCutoutReuse(unittest.TestCase):
                 stats=stats,
             )
         self.assertEqual(first.status, "ok")
-        self.assertEqual(len(calls), 1)
+        self.assertGreaterEqual(decoded, 1)
+        self.assertEqual(len(calls), decoded)
         self.assertTrue(second.from_cache)
         self.assertEqual((stats.hits, stats.misses, stats.stored), (1, 1, 1))
         self.assertEqual(len(second.frames), len(first.frames))

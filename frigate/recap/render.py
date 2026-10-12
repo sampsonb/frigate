@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 # Frames on each side averaged into a leader's end point (see Tube.leaders).
 LEADER_SMOOTH = 3
+# How every object is outlined in its category color: "box" draws a
+# rectangle around it (Sampson: "keep the square outline of everything"),
+# "shape" traces the cutout, which showed every ragged edge.
+OUTLINE_STYLE = "box"
 DRAW_RANK = {"vehicle": 0, "parked": 1, "delivery": 2, "animal": 3, "person": 4}
 
 
@@ -346,7 +350,7 @@ def _paint_outline(
     color: tuple[int, int, int],
     alpha_scale: float,
 ) -> None:
-    """Thin category-colored ring, plus a soft glow, around a night cutout.
+    """Thin category-colored ring, plus a soft glow, around a cutout.
 
     The ring is about 2 px. It is drawn outside the opaque pixels so a
     dark car on a dark road still has an edge.
@@ -386,6 +390,40 @@ def _paint_outline(
     region[:] = mixed.astype(np.uint8)
 
 
+def _paint_box(
+    canvas: np.ndarray,
+    x0: int,
+    y0: int,
+    alpha: np.ndarray,
+    color: tuple[int, int, int],
+    alpha_scale: float,
+) -> None:
+    """Thin category-colored rectangle around a cutout's opaque pixels."""
+    ys, xs = np.nonzero(alpha >= 64)
+    if alpha_scale <= 0.01 or len(xs) == 0:
+        return
+    height, width = canvas.shape[:2]
+    pad = 4
+    left = max(0, x0 + int(xs.min()) - pad)
+    top = max(0, y0 + int(ys.min()) - pad)
+    right = min(width - 1, x0 + int(xs.max()) + pad)
+    bottom = min(height - 1, y0 + int(ys.max()) + pad)
+    if right <= left or bottom <= top:
+        return
+    thickness = max(2, int(round(height / 1080 * 3)))
+    region = canvas[
+        max(0, top - thickness) : bottom + thickness + 1,
+        max(0, left - thickness) : right + thickness + 1,
+    ]
+    before = region.copy()
+    cv2.rectangle(canvas, (left, top), (right, bottom), color, thickness, cv2.LINE_AA)
+    if alpha_scale < 0.999:
+        region[:] = (
+            region.astype(np.float32) * alpha_scale
+            + before.astype(np.float32) * (1 - alpha_scale)
+        ).astype(np.uint8)
+
+
 def _paste_ghost(
     canvas: np.ndarray,
     ghost: GhostFrame,
@@ -421,7 +459,7 @@ def _paste_ghost(
     if not visible:
         return False, None
     fitted = prepare_cutout(crop, alpha, plate_is_ir=plate_is_ir)
-    if outline is not None:
+    if outline is not None and OUTLINE_STYLE == "shape":
         _paint_outline(canvas, x0, y0, alpha, outline, alpha_scale)
     dest = canvas[y0:y1, x0:x1]
     factor = (alpha.astype(np.float32) * (alpha_scale / 255.0))[..., None]
@@ -429,6 +467,8 @@ def _paste_ghost(
         1 - factor
     )
     dest[:] = blended.astype(np.uint8)
+    if outline is not None and OUTLINE_STYLE == "box":
+        _paint_box(canvas, x0, y0, alpha, outline, alpha_scale)
     anchor = mask_centroid(alpha, x0, y0)
     if anchor is None or not label_should_draw(alpha):
         return True, None
@@ -503,7 +543,6 @@ def compose_frame(
         plate_is_dark = frame_is_dark(plate)
     for x, y, crop, alpha in underlay:
         _paste_underlay(canvas, x, y, crop, alpha)
-    night = plate_is_ir or plate_is_dark
     thickness = max(1, int(round(height / 1080 * 2)))
     scale = max(0.45, height / 1080 * font_scale)
     line_w = max(1, int(round(height / 1080 * 1.5)))
@@ -567,12 +606,14 @@ def compose_frame(
         )
         color = CAT_COLOR.get(unit.category, (255, 255, 255))
         ghost = tube.frames[source_index]
+        # Every object gets the thin ring in its label's color, day and
+        # night, so it reads as the thing its label points at.
         drawn, tip = _paste_ghost(
             canvas,
             ghost,
             ghost_alpha,
             plate_is_ir=plate_is_ir,
-            outline=color if (night or ghost.window) else None,
+            outline=color,
         )
         if drawn and tip is not None:
             shown.add(index)

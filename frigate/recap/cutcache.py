@@ -97,6 +97,7 @@ class CachedCutout:
     context_first: bytes | None = None
     context_last: bytes | None = None
     still: bool = False
+    shift: float = 0.0
 
 
 @dataclass
@@ -140,6 +141,7 @@ def load(key: str, root: Path | None = None) -> CachedCutout | None:
         context_first=data.get("context_first"),
         context_last=data.get("context_last"),
         still=bool(data.get("still")),
+        shift=float(data.get("shift") or 0.0),
     )
 
 
@@ -154,6 +156,7 @@ def store(key: str, entry: CachedCutout, root: Path | None = None) -> bool:
         "context_first": entry.context_first,
         "context_last": entry.context_last,
         "still": bool(entry.still),
+        "shift": float(entry.shift),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

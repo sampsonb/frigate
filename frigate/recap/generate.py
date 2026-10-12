@@ -31,7 +31,9 @@ from frigate.recap.categories import (
 )
 from frigate.recap.cutout import (
     build_cutouts,
+    follow_back,
     parked_car_ghost,
+    retrack,
     window_ghost,
 )
 from frigate.recap.layout import (
@@ -1304,6 +1306,7 @@ def generate_recap(
             end=end,
             boxes=boxes,
             times=list(times),
+            shift=cut.shift,
         )
         tubes.append(
             Tube(
@@ -1423,13 +1426,25 @@ def generate_recap(
     )
     crossed = crossings([track_of[unit.event_id] for unit in units])
     for unit, earlier, crossing in zip(units, waits, crossed, strict=True):
+        if crossing:
+            # It crossed paths with an object on screen, so they play at the
+            # real offset, and waits that come only from appearing near
+            # someone give way: a jogger who ran past a man waited for a
+            # passenger who had walked off on the other side, and the man's
+            # cutout showed him vanish and come back seconds later.
+            partner, share = max(crossing)
+            unit.together = (
+                partner,
+                int(math.ceil(share * len(units[partner].boxes))),
+            )
+            unit.after = []
+            continue
         unit.after = [item for item in earlier if item[1] >= 1.0]
-        alongside = [item for item in earlier if item[1] < 1.0] + crossing
+        alongside = [item for item in earlier if item[1] < 1.0]
         if alongside:
-            # It came into view next to an object still on screen (a pickup
-            # and the trailer Frigate tracked apart, or someone stepping out),
-            # or it crossed paths with one. They were there together, so
-            # they play together.
+            # It came into view next to an object still on screen: a pickup
+            # and the trailer Frigate tracked apart, or someone stepping out.
+            # They were there together, so they play together.
             partner, share = max(alongside)
             unit.together = (
                 partner,
@@ -1625,6 +1640,8 @@ class _Cut:
     from_cache: bool = False
     # Frigate's snapshot of the object, held in place, instead of a clip.
     still: bool = False
+    # Seconds added to recording times to get ``times`` (detector times).
+    shift: float = 0.0
 
 
 def _ghost_from_packed(item: dict[str, Any]) -> GhostFrame:
@@ -1677,6 +1694,7 @@ def _keep_visible(cut: _Cut, width: int, height: int) -> _Cut:
         context_last=cut.context_last,
         from_cache=cut.from_cache,
         still=cut.still,
+        shift=cut.shift,
     )
 
 
@@ -1868,6 +1886,75 @@ def _avoids(category: str, other: str) -> bool:
     return category == "vehicle" or category == "animal" or other != "animal"
 
 
+# Most seconds of recording before Frigate first saw someone that are
+# searched for them (see ``_extend_back``).
+EXTEND_SECONDS = 3.0
+# Below this share of motion covered by Frigate's boxes, a person's path is
+# found by following them instead (see ``retrack``).
+RETRACK_FILL = 0.15
+
+
+def _extend_back(
+    event: dict[str, Any],
+    frames: list[np.ndarray],
+    times: list[float],
+    boxes: list[tuple[float, float, float, float]],
+    load_clip: LoadClip,
+    sample_fps: float,
+    width: int,
+    height: int,
+    settings: RecapConfig,
+) -> tuple[list[np.ndarray], list[float], list[tuple[float, float, float, float]]]:
+    """The clip with the frames before Frigate first saw them, where they can be followed.
+
+    A jogger ran most of the way across the picture before Frigate saw him.
+    He flashed by inside another man's cutout, vanished, and reappeared on
+    the far side. The recording before his first box is followed back
+    (``follow_back``) for up to ``EXTEND_SECONDS``, within
+    ``max_object_seconds``.
+    """
+    if not frames or not boxes or len(times) != len(frames):
+        return frames, times, boxes
+    budget = min(
+        EXTEND_SECONDS, settings.max_object_seconds - (times[-1] - times[0])
+    )
+    if budget < 0.5:
+        return frames, times, boxes
+    first = float(times[0])
+    step = 1.0 / max(1.0, sample_fps)
+    loaded = load_clip(
+        dict(event, start_time=first - budget, end_time=first - 0.5 * step),
+        sample_fps,
+        width,
+        height,
+    )
+    if not loaded:
+        return frames, times, boxes
+    earlier, earlier_times = loaded
+    keep = [
+        index
+        for index, moment in enumerate(earlier_times)
+        if moment < first - 0.5 * step and index < len(earlier)
+    ]
+    if len(keep) < 3:
+        return frames, times, boxes
+    earlier = [earlier[index] for index in keep]
+    earlier_times = [float(earlier_times[index]) for index in keep]
+    # From the earlier frames only: someone who slows down at the start of
+    # their clip is part of a plate made with it.
+    pool = earlier[:: max(1, len(earlier) // 12)]
+    background = np.median(np.stack(pool), axis=0).astype(np.uint8)
+    found = follow_back(earlier, boxes[0], background)
+    if len(found) < 3:
+        return frames, times, boxes
+    count = len(found)
+    return (
+        earlier[-count:] + frames,
+        earlier_times[-count:] + list(times),
+        found + list(boxes),
+    )
+
+
 def _others_in(
     others: Sequence[dict[str, Any]],
     times: Sequence[float],
@@ -1953,6 +2040,7 @@ def _cutouts_for(
                     context_last=hit.context_last,
                     from_cache=True,
                     still=hit.still,
+                    shift=hit.shift,
                 ),
                 width,
                 height,
@@ -1974,6 +2062,7 @@ def _cutouts_for(
                 context_first=cut.context_first,
                 context_last=cut.context_last,
                 still=cut.still,
+                shift=cut.shift,
             ),
             cache_root,
         ):
@@ -2055,6 +2144,16 @@ def _cutouts_for(
         # the clip's own plate, and the parked car stops showing as itself.
         start, end = _still_ends(frames, times, boxes)
         frames, times, boxes = frames[start:end], times[start:end], boxes[start:end]
+    if category != "vehicle" and aligned.fill < RETRACK_FILL:
+        # Frigate's boxes cover the person in almost no frame: follow them.
+        followed = retrack(frames, boxes, category)
+        if followed is not None and followed[1] - followed[0] >= 3:
+            start, end, boxes = followed
+            frames, times = frames[start:end], times[start:end]
+    if category != "vehicle":
+        frames, times, boxes = _extend_back(
+            event, frames, times, boxes, load_clip, sample_fps, width, height, settings
+        )
     avoid = _others_in(others, times, width, height, shift) if others else None
     plate = (
         plate_at((float(times[0]) + float(times[-1])) / 2 + shift)
@@ -2121,6 +2220,7 @@ def _cutouts_for(
                 times=kept_times,
                 context_first=context_first,
                 context_last=context_last,
+                shift=shift,
             ),
             width,
             height,
