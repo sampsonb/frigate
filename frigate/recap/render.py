@@ -41,9 +41,12 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 # Frames on each side averaged into a leader's end point (see Tube.leaders).
 LEADER_SMOOTH = 3
 # How every object is outlined in its category color: "box" draws a
-# rectangle around it (Sampson: "keep the square outline of everything"),
-# "shape" traces the cutout, which showed every ragged edge.
-OUTLINE_STYLE = "box"
+# rectangle around it, "shape" traces the cutout (every ragged edge showed),
+# and "none" draws no outline: the time label and the leader line with its
+# dot mark the object. Sampson, 2026-10-14: "I don't think we need the square
+# boxes around objects ... just the time and the line with the dot on the
+# object is clean and fine."
+OUTLINE_STYLE = "none"
 DRAW_RANK = {"vehicle": 0, "parked": 1, "delivery": 2, "animal": 3, "person": 4}
 
 
@@ -59,8 +62,8 @@ class GhostFrame:
     jpeg: bytes | None = None
     alpha_shape: tuple[int, int] | None = None
     alpha_bytes: bytes | None = None
-    # A padded box copied as recorded, rather than a motion mask. It is
-    # drawn with an outline in the category color, day or night.
+    # A padded box copied as recorded, rather than a motion mask. Like every
+    # object it gets an outline only when OUTLINE_STYLE asks for one.
     window: bool = False
     # ``alpha_bytes`` is zlib-compressed. A mask is mostly runs of 0 and 255,
     # and every frame of every object is held until the video is encoded.

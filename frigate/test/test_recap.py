@@ -2096,7 +2096,7 @@ class TestLightingPlates(unittest.TestCase):
         )
         self.assertEqual(orange(edged), 0)
 
-    def test_night_cutout_gets_an_outline_and_the_leader_hits_the_object(self):
+    def test_night_cutout_has_no_outline_and_the_leader_hits_the_object(self):
         plate = _ir_frame(180, 320, 30)
         box = (80.0, 20.0, 200.0, 150.0)
         alpha = np.zeros((90, 100), np.uint8)
@@ -2139,11 +2139,11 @@ class TestLightingPlates(unittest.TestCase):
             font_scale=1.0,
             repeats=[1],
         )
-        edge = drawn[80:110, 96:102].astype(np.int16)
-        # Outline just left of the car body: orange, not the gray plate.
-        self.assertGreater(float(edge[:, :, 2].mean()), 70)
-        self.assertGreater(
-            float(edge[:, :, 2].mean()), float(edge[:, :, 0].mean()) + 30
+        edge = drawn[80:110, 96:100].astype(np.int16)
+        # Just left of the car body there is no colored outline any more
+        # (OUTLINE_STYLE "none"): the plate stays gray, red no stronger than blue.
+        self.assertLess(
+            float(edge[:, :, 2].mean()), float(edge[:, :, 0].mean()) + 10
         )
         # The old leader aimed at the box top (y=20). That row stays the plate.
         canopy = drawn[16:24, 130:160].astype(np.int16)
