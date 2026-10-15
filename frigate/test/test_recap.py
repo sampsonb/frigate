@@ -2405,7 +2405,7 @@ class TestDrawOrder(unittest.TestCase):
         self.assertGreater(int(frame[75, 140][0]), 150)
         self.assertLess(int(frame[75, 140][2]), 60)
 
-    def test_every_object_gets_a_rectangle_in_its_color(self):
+    def test_no_object_gets_a_rectangle(self):
         plate = np.full((180, 320, 3), (80, 140, 70), np.uint8)
         box = (100.0, 40.0, 140.0, 120.0)
         unit = ScheduledUnit(
@@ -2447,10 +2447,14 @@ class TestDrawOrder(unittest.TestCase):
             font_scale=1.0,
             repeats=[1],
         )
+        # Where the rectangle used to be, 4 px outside the cutout at mid-height,
+        # the background shows, the same as far from the walker, and nothing in
+        # the person color (Sampson, 2026-10-14: no boxes, OUTLINE_STYLE "none").
         color = np.array(CAT_COLOR["person"], np.int16)
-        # Left edge of the rectangle, 4 px outside the cutout, mid-height.
         edge = frame[80, 96].astype(np.int16)
-        self.assertLess(int(np.abs(edge - color).max()), 40)
+        background = frame[150, 20].astype(np.int16)
+        self.assertLess(int(np.abs(edge - background).max()), 10)
+        self.assertGreater(int(np.abs(edge - color).max()), 60)
 
 
 class TestNightAndLabels(unittest.TestCase):
