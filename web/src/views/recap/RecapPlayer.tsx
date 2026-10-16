@@ -52,6 +52,20 @@ type OpenClip = {
   message?: string;
 };
 
+// Speed buttons above the recap (Sampson, 2026-10-16: "Can there be playback speed options?"). The choice is kept in
+// localStorage, so every recap opens at the last speed picked.
+const PLAYBACK_RATES = [1, 1.5, 2];
+const PLAYBACK_RATE_KEY = "recapPlaybackRate";
+
+function storedPlaybackRate() {
+  try {
+    const value = Number(window.localStorage.getItem(PLAYBACK_RATE_KEY));
+    return PLAYBACK_RATES.includes(value) ? value : 1;
+  } catch {
+    return 1;
+  }
+}
+
 const FALLBACK_COLORS: Record<string, string> = {
   person: "#3cb9ff",
   vehicle: "#ffa528",
@@ -183,6 +197,7 @@ export default function RecapPlayer({
   });
   const [enabled, setEnabled] = useState<Record<string, boolean>>({});
   const [open, setOpen] = useState<OpenClip>();
+  const [rate, setRate] = useState<number>(storedPlaybackRate);
   const { data: config } = useSWR<FrigateConfig>("config");
   const times = useRecapTime();
   const downloads = useRecapDownload();
@@ -239,6 +254,25 @@ export default function RecapPlayer({
       h: height,
     });
   }, [recap.height, recap.width]);
+
+  // defaultPlaybackRate carries the speed across a new src load; the video element is replaced when the recap changes.
+  const applyRate = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    video.defaultPlaybackRate = rate;
+    video.playbackRate = rate;
+  }, [rate]);
+
+  useEffect(() => {
+    applyRate();
+    try {
+      window.localStorage.setItem(PLAYBACK_RATE_KEY, String(rate));
+    } catch {
+      // private browsing: the speed still applies, it just isn't remembered
+    }
+  }, [applyRate, rate, recap.id, version]);
 
   useEffect(() => {
     measure();
@@ -371,8 +405,26 @@ export default function RecapPlayer({
               <span className="text-muted-foreground">{category.count}</span>
             </label>
           ))}
+          <div
+            role="group"
+            aria-label={t("playbackSpeed")}
+            className="ml-auto flex items-center gap-1"
+          >
+            {PLAYBACK_RATES.map((value) => (
+              <Button
+                key={value}
+                size="sm"
+                variant={rate === value ? "select" : "outline"}
+                className="h-8 px-2"
+                aria-pressed={rate === value}
+                onClick={() => setRate(value)}
+              >
+                {`${value}x`}
+              </Button>
+            ))}
+          </div>
           <DownloadButton
-            className="ml-auto h-8"
+            className="h-8"
             state={downloads.stateOf(fileKey)}
             label={t("downloadRecap")}
             onClick={saveRecap}
@@ -395,6 +447,7 @@ export default function RecapPlayer({
             onEnded={() => onEnded?.()}
             onLoadedMetadata={(event) => {
               measure();
+              applyRate();
               setCurrent(event.currentTarget.currentTime);
             }}
             onTimeUpdate={(event) =>
