@@ -405,30 +405,32 @@ export default function RecapPlayer({
               <span className="text-muted-foreground">{category.count}</span>
             </label>
           ))}
-          <div
-            role="group"
-            aria-label={t("playbackSpeed")}
-            className="ml-auto flex items-center gap-1"
-          >
-            {PLAYBACK_RATES.map((value) => (
-              <Button
-                key={value}
-                size="sm"
-                variant={rate === value ? "select" : "outline"}
-                className="h-8 px-2"
-                aria-pressed={rate === value}
-                onClick={() => setRate(value)}
-              >
-                {`${value}x`}
-              </Button>
-            ))}
+          <div className="ml-auto flex items-center gap-2">
+            <div
+              role="group"
+              aria-label={t("playbackSpeed")}
+              className="flex items-center gap-1"
+            >
+              {PLAYBACK_RATES.map((value) => (
+                <Button
+                  key={value}
+                  size="sm"
+                  variant={rate === value ? "select" : "outline"}
+                  className="h-8 px-2"
+                  aria-pressed={rate === value}
+                  onClick={() => setRate(value)}
+                >
+                  {`${value}x`}
+                </Button>
+              ))}
+            </div>
+            <DownloadButton
+              className="h-8"
+              state={downloads.stateOf(fileKey)}
+              label={t("downloadRecap")}
+              onClick={saveRecap}
+            />
           </div>
-          <DownloadButton
-            className="h-8"
-            state={downloads.stateOf(fileKey)}
-            label={t("downloadRecap")}
-            onClick={saveRecap}
-          />
         </div>
         <p className="text-xs text-muted-foreground">{t("clickHint")}</p>
         <div
