@@ -20,7 +20,12 @@ from unittest.mock import patch
 from frigate.config import FrigateConfig
 from frigate.recap import cutcache
 from frigate.recap.manager import RecapMaintainer, RecapManager
-from frigate.recap.storage import list_visible_recaps, purge_expired, safe_id
+from frigate.recap.storage import (
+    delete_recap,
+    list_visible_recaps,
+    purge_expired,
+    safe_id,
+)
 from frigate.util.config import migrate_frigate_config
 
 # Live sections from the 2026-11-09 install, plus the prepared snippet's
@@ -323,6 +328,97 @@ class TestExistingRecapFiles(unittest.TestCase):
             self.assertEqual(removed, 0)
             self.assertTrue(recording.is_file())
             self.assertEqual(recording.read_bytes(), b"recording-bytes")
+
+    def test_retention_rejects_symlink_and_parent_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            recap = root / "recap"
+            outside = root / "recordings" / "oldid"
+            outside.mkdir(parents=True)
+            (outside / "00.00.mp4").write_bytes(b"recording-bytes")
+            (outside / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "id": "oldid",
+                        "camera": "front",
+                        "status": "complete",
+                        "created": 1,
+                        "after": 0,
+                        "before": 10,
+                        "reason": "manual",
+                    }
+                )
+            )
+            (root / "recordings" / "keep.mp4").write_bytes(b"keep")
+            recap.mkdir()
+            (recap / "front").symlink_to(root / "recordings", target_is_directory=True)
+            _write_manifest(recap, "yard", "young", created=10**12)
+            (recap / "yard" / "young" / "video.mp4").write_bytes(b"young")
+
+            with patch("frigate.recap.storage.RECAP_DIR", str(recap)):
+                removed = purge_expired({"front": 14, "yard": 14}, now=10**12)
+                direct = delete_recap("front", "oldid")
+            self.assertEqual(removed, 0)
+            self.assertFalse(direct)
+            self.assertEqual((outside / "00.00.mp4").read_bytes(), b"recording-bytes")
+            self.assertEqual((root / "recordings" / "keep.mp4").read_bytes(), b"keep")
+            self.assertTrue((recap / "yard" / "young" / "video.mp4").is_file())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            recap = root / "recap"
+            _write_manifest(recap, "front", "holder", created=1)
+            manifest_path = recap / "front" / "holder" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["id"] = ".."
+            manifest_path.write_text(json.dumps(manifest))
+            _write_manifest(recap, "front", "young", created=10**12)
+            (recap / "front" / "young" / "video.mp4").write_bytes(b"young")
+            with patch("frigate.recap.storage.RECAP_DIR", str(recap)):
+                removed = purge_expired({"front": 14}, now=10**12)
+                direct = delete_recap("front", "..")
+            self.assertEqual(removed, 0)
+            self.assertFalse(direct)
+            self.assertEqual(
+                (recap / "front" / "young" / "video.mp4").read_bytes(), b"young"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            recap = root / "recap"
+            outside = root / "outside" / "clip"
+            outside.mkdir(parents=True)
+            (outside / "00.00.mp4").write_bytes(b"outside")
+            (outside / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "id": "oldid",
+                        "camera": "front",
+                        "status": "complete",
+                        "created": 1,
+                        "after": 0,
+                        "before": 10,
+                        "reason": "manual",
+                    }
+                )
+            )
+            front = recap / "front"
+            front.mkdir(parents=True)
+            (front / "oldid").symlink_to(outside, target_is_directory=True)
+            yard = recap / "yard" / "young"
+            _write_manifest(recap, "yard", "young", created=10**12)
+            (yard / "video.mp4").write_bytes(b"young")
+            # A symlink that stays inside the recap root still names another recap.
+            (front / "alias").symlink_to(yard, target_is_directory=True)
+            with patch("frigate.recap.storage.RECAP_DIR", str(recap)):
+                removed = purge_expired({"front": 14, "yard": 14}, now=10**12)
+                escaped = delete_recap("front", "oldid")
+                aliased = delete_recap("front", "alias")
+            self.assertEqual(removed, 0)
+            self.assertFalse(escaped)
+            self.assertFalse(aliased)
+            self.assertEqual((outside / "00.00.mp4").read_bytes(), b"outside")
+            self.assertEqual((yard / "video.mp4").read_bytes(), b"young")
 
 
 class TestRecapFollowsConfigHolder(unittest.TestCase):

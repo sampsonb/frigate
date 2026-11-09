@@ -106,12 +106,12 @@
     "startTime": "Start time",
     "endTime": "End time",
     "buildCustom": "Make recap",
-    "notYet_one": "picker.notYet",
-    "notYet_other": "picker.notYet",
-    "readyNights_one": "picker.readyNights",
-    "readyNights_other": "picker.readyNights",
-    "hoursShort_one": "picker.hoursShort",
-    "hoursShort_other": "picker.hoursShort"
+    "notYet_one": "Not available yet. Needs {{count}} nightly recap, {{have}} so far.",
+    "notYet_other": "Not available yet. Needs {{count}} nightly recaps, {{have}} so far.",
+    "readyNights_one": "Ready now, {{count}} night",
+    "readyNights_other": "Ready now, {{count}} nights",
+    "hoursShort_one": "{{count}}h",
+    "hoursShort_other": "{{count}}h"
   },
   "rangeLongHours": "The longest recap is {{count}} hours.",
   "rangeFuture": "The end can't be in the future.",
@@ -127,10 +127,10 @@
     "none": "No {{count}} hour recap yet. It is made in the background.",
     "lastFailed": "The last refresh failed. Check the Frigate logs.",
     "buildNow": "Make it now",
-    "firstBuild_one": "rolling.firstBuild",
-    "firstBuild_other": "rolling.firstBuild",
-    "none_one": "rolling.none",
-    "none_other": "rolling.none"
+    "firstBuild_one": "Making the first {{count}} hour recap",
+    "firstBuild_other": "Making the first {{count}} hour recap",
+    "none_one": "No {{count}} hour recap yet. It is made in the background.",
+    "none_other": "No {{count}} hour recap yet. It is made in the background."
   },
   "alreadyBuilding": "That recap is already being made.",
   "cancelled": "Cancelled.",

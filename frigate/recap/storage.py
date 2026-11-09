@@ -207,10 +207,21 @@ def _scan(root: Path) -> list[dict[str, Any]]:
     if not root.is_dir():
         return found
     for camera_path in root.iterdir():
-        if not camera_path.is_dir() or camera_path.name.startswith("."):
+        # A symlink named like a camera can point at recordings. Do not
+        # follow it. "." and ".." are not real directory entries here.
+        if (
+            camera_path.is_symlink()
+            or not camera_path.is_dir()
+            or camera_path.name.startswith(".")
+            or camera_path.name in {".", ".."}
+        ):
             continue
         for recap_path in camera_path.iterdir():
-            if not recap_path.is_dir():
+            if (
+                recap_path.is_symlink()
+                or not recap_path.is_dir()
+                or recap_path.name in {".", ".."}
+            ):
                 continue
             manifest = read_manifest(recap_path)
             if manifest is None:
@@ -315,15 +326,32 @@ def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def delete_recap(camera: str, recap_id: str) -> bool:
+    """Delete one recap directory that is a real child of the recap root.
+
+    ``.`` and ``..`` are rejected by ``safe_id``. A camera or recap directory
+    that is a symlink is also rejected, including one that points at
+    recordings or at another recap. ``rmtree`` is only called on the
+    resolved path after that path is still exactly ``root/camera/id``.
+    """
     if not safe_id(camera) or not safe_id(recap_id):
         return False
     root = recap_root().resolve()
-    path = recap_dir(camera, recap_id).resolve()
-    if path == root or root not in path.parents:
+    camera_path = root / camera
+    target = camera_path / recap_id
+    if camera_path.is_symlink() or target.is_symlink():
         return False
-    if not path.is_dir():
+    resolved = target.resolve()
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError:
         return False
-    shutil.rmtree(path, ignore_errors=True)
+    # Exactly root/<camera>/<id>, so a resolved symlink cannot land on a
+    # sibling recap or on the recordings directory beside the recap root.
+    if relative.parts != (camera, recap_id):
+        return False
+    if not resolved.is_dir():
+        return False
+    shutil.rmtree(resolved, ignore_errors=True)
     return True
 
 
@@ -344,9 +372,15 @@ def find_manifest(
         if not root.is_dir():
             continue
         for camera_path in root.iterdir():
-            if not camera_path.is_dir() or camera_path.name.startswith("."):
+            if (
+                camera_path.is_symlink()
+                or not camera_path.is_dir()
+                or camera_path.name.startswith(".")
+            ):
                 continue
             directory = camera_path / recap_id
+            if directory.is_symlink():
+                continue
             manifest = read_manifest(directory)
             if manifest is not None and manifest.get("id") == recap_id:
                 return directory, manifest

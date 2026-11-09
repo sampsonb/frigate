@@ -43,6 +43,7 @@ NEW_TAG=frigate:recap-0.18.2
 # that point rolls the compose file and the database back.
 SWAPPED=0
 SUCCESS=0
+STOPPED=0
 # A second full Frigate image is about 8 GB. Below this, docker pulls or
 # unpacks can fill the LXC and stop recordings. Nothing is deleted to get
 # under this line.
@@ -98,6 +99,75 @@ docker run --rm --entrypoint test "$NEW_TAG" -f /openvino-model/ssdlite_mobilene
 docker run --rm --entrypoint sh "$NEW_TAG" -c 'grep -lq recapPlaybackRate /opt/frigate/web/assets/Recap-*.js' || { log "ABORT: image has no speed buttons"; exit 1; }
 grep -qE '^\s+image:\s*' "$COMPOSE" || { log "ABORT: no image line in compose"; exit 1; }
 
+restore_db() {
+  log "restoring pre-swap database from $SNAP"
+  compose stop frigate || true
+  # Move the live generation into the backup dir so a 0.18 WAL cannot replay
+  # onto the restored 0.17 file. Those files are kept. Nothing is deleted.
+  moved=$SNAP/replaced-by-rollback
+  mkdir -p "$moved"
+  [[ -f "$DB" ]] && mv -f "$DB" "$moved/frigate.db"
+  [[ -f "$DB-wal" ]] && mv -f "$DB-wal" "$moved/frigate.db-wal"
+  [[ -f "$DB-shm" ]] && mv -f "$DB-shm" "$moved/frigate.db-shm"
+  if [[ -f "$SNAP/frigate.db.consistent.ok" && -s "$SNAP/frigate.db.consistent" ]]; then
+    cp -a "$SNAP/frigate.db.consistent" "$DB"
+    log "restored consistent snapshot (WAL contents included); live files kept in $moved"
+  elif [[ -f "$SNAP/frigate.db" ]]; then
+    cp -a "$SNAP/frigate.db" "$DB"
+    [[ -f "$SNAP/frigate.db-wal" ]] && cp -a "$SNAP/frigate.db-wal" "$DB-wal"
+    [[ -f "$SNAP/frigate.db-shm" ]] && cp -a "$SNAP/frigate.db-shm" "$DB-shm"
+    log "restored raw db and WAL; previous live files kept in $moved"
+  else
+    log "WARNING: no database copy in $SNAP"
+  fi
+}
+
+rollback() {
+  [[ "$SWAPPED" == "1" ]] || return 0
+  SWAPPED=0
+  STOPPED=0
+  log "!!! deploy unhealthy -> rolling back to $LIVE_TAG and the pre-swap database"
+  docker logs --since 10m frigate 2>&1 | tail -40 || true
+  cp -a "$SNAP/docker-compose.yml" "$COMPOSE"
+  cp -a "$SNAP/config.yml" "$CONFIG"
+  restore_db
+  docker image inspect "$LIVE_TAG" >/dev/null || { log "FATAL: rollback image $LIVE_TAG is missing. Config and database were restored. The container was not recreated."; exit 1; }
+  if ! compose up -d --pull never --force-recreate frigate; then
+    log "ROLLBACK FAILED: could not start $LIVE_TAG. Config and database were restored. Image line: $(grep -E '^[[:space:]]+image:' "$COMPOSE" || true)"
+    exit 1
+  fi
+  if wait_api 300 >/dev/null; then
+    log "rolled back, API up ($(curl -fs --max-time 3 "$API/api/version" || true))"
+  else
+    log "ROLLBACK FAILED: $LIVE_TAG was started but the API did not answer. Config and database were restored."
+    exit 1
+  fi
+}
+
+# Stop Frigate before the snapshot. A backup taken while 0.17 is still
+# writing misses the rows it commits before shutdown, and rollback would
+# restore that earlier file. If we fail before the image line changes,
+# the exit trap starts 0.17 again.
+on_exit() {
+  local code=$?
+  if [[ "$SWAPPED" == "1" && "$SUCCESS" != "1" ]]; then
+    rollback || true
+  elif [[ "$STOPPED" == "1" && "$SUCCESS" != "1" ]]; then
+    log "Frigate was stopped before the image change. Starting $LIVE_TAG again."
+    compose up -d --pull never frigate || log "FAILED to start $LIVE_TAG again. The image line was not changed."
+  fi
+  exit "$code"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+log "stopping frigate so the snapshot matches the database 0.17 leaves behind"
+if ! compose stop frigate; then
+  log "ABORT: could not stop frigate. The image line was not changed."
+  exit 1
+fi
+STOPPED=1
+
 # Exact pre-swap copies. sqlite .backup folds the WAL into one consistent
 # file. The raw db, WAL, and shm are kept beside it so the rollback can put
 # back the files Frigate had open.
@@ -136,66 +206,35 @@ if [[ -f "$DB-shm" ]]; then
 fi
 log "pre-swap copies in $SNAP (left in place; this script does not remove them)"
 
-# Point compose at the new tag without touching the 0.17.2 tag.
+# Retag only the line that is still the 0.17.2 image. Other services
+# (mqtt, for example) keep their own image lines.
 cp -a "$COMPOSE" "$SNAP/docker-compose.yml.before-edit"
-sed -i -E "s|^(\\s+image:\\s*).*$|\\1${NEW_TAG}|" "$COMPOSE"
-log "compose image -> $(grep -E '^\\s+image:' "$COMPOSE")"
+python3 - "$COMPOSE" "$LIVE_TAG" "$NEW_TAG" << 'PY'
+import sys
+from pathlib import Path
+
+path, live, new = sys.argv[1:]
+lines = Path(path).read_text().splitlines(keepends=True)
+changed = 0
+out = []
+for line in lines:
+    stripped = line.strip()
+    if stripped in {f"image: {live}", f'image: "{live}"', f"image: '{live}'"}:
+        indent = line[: len(line) - len(line.lstrip(" "))]
+        newline = "\n" if line.endswith("\n") else ""
+        out.append(f"{indent}image: {new}{newline}")
+        changed += 1
+    else:
+        out.append(line)
+if changed != 1:
+    raise SystemExit(
+        f"expected exactly one image line for {live}, changed {changed}"
+    )
+Path(path).write_text("".join(out))
+PY
+log "compose image -> $(grep -E '^[[:space:]]+image:' "$COMPOSE" | tr '\n' ' ')"
 SWAPPED=1
-on_exit() {
-  local code=$?
-  if [[ "$SWAPPED" == "1" && "$SUCCESS" != "1" ]]; then
-    rollback || true
-  fi
-  exit "$code"
-}
-trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 compose config -q || { log "ABORT: compose invalid"; cp -a "$SNAP/docker-compose.yml" "$COMPOSE"; SWAPPED=0; exit 1; }
-
-restore_db() {
-  log "restoring pre-swap database from $SNAP"
-  compose stop frigate || true
-  # Move the live generation into the backup dir so a 0.18 WAL cannot replay
-  # onto the restored 0.17 file. Those files are kept. Nothing is deleted.
-  moved=$SNAP/replaced-by-rollback
-  mkdir -p "$moved"
-  [[ -f "$DB" ]] && mv -f "$DB" "$moved/frigate.db"
-  [[ -f "$DB-wal" ]] && mv -f "$DB-wal" "$moved/frigate.db-wal"
-  [[ -f "$DB-shm" ]] && mv -f "$DB-shm" "$moved/frigate.db-shm"
-  if [[ -f "$SNAP/frigate.db.consistent.ok" && -s "$SNAP/frigate.db.consistent" ]]; then
-    cp -a "$SNAP/frigate.db.consistent" "$DB"
-    log "restored consistent snapshot (WAL contents included); live files kept in $moved"
-  elif [[ -f "$SNAP/frigate.db" ]]; then
-    cp -a "$SNAP/frigate.db" "$DB"
-    [[ -f "$SNAP/frigate.db-wal" ]] && cp -a "$SNAP/frigate.db-wal" "$DB-wal"
-    [[ -f "$SNAP/frigate.db-shm" ]] && cp -a "$SNAP/frigate.db-shm" "$DB-shm"
-    log "restored raw db and WAL; previous live files kept in $moved"
-  else
-    log "WARNING: no database copy in $SNAP"
-  fi
-}
-
-rollback() {
-  [[ "$SWAPPED" == "1" ]] || return 0
-  SWAPPED=0
-  log "!!! deploy unhealthy -> rolling back to $LIVE_TAG and the pre-swap database"
-  docker logs --since 10m frigate 2>&1 | tail -40 || true
-  cp -a "$SNAP/docker-compose.yml" "$COMPOSE"
-  cp -a "$SNAP/config.yml" "$CONFIG"
-  restore_db
-  docker image inspect "$LIVE_TAG" >/dev/null || { log "FATAL: rollback image $LIVE_TAG is missing. Config and database were restored. The container was not recreated."; exit 1; }
-  if ! compose up -d --pull never --force-recreate frigate; then
-    log "ROLLBACK FAILED: could not start $LIVE_TAG. Config and database were restored. Image line: $(grep -E '^[[:space:]]+image:' "$COMPOSE" || true)"
-    exit 1
-  fi
-  if wait_api 300 >/dev/null; then
-    log "rolled back, API up ($(curl -fs --max-time 3 "$API/api/version" || true))"
-  else
-    log "ROLLBACK FAILED: $LIVE_TAG was started but the API did not answer. Config and database were restored."
-    exit 1
-  fi
-}
 
 compose up -d --pull never --force-recreate frigate
 if V=$(wait_api 300); then log "API up: $V"; else log "API did not come up"; V=""; fi
