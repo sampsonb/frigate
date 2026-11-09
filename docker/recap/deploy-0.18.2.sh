@@ -17,6 +17,9 @@
 # (the db file and its WAL and shm).
 #
 # Modeled on deploy-c55234a.sh. Expects /root/frigate-recap-deploy/common.sh.
+# The backup directory must be a bind mount of a Proxmox host path. A directory
+# on the container root filesystem is refused, so the database copy cannot land
+# on the LXC disk.
 set -uo pipefail
 
 if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -36,6 +39,10 @@ fi
 NEW=${1:-$DEFAULT_IMAGE}
 LIVE_TAG=frigate:recap-0.17.2
 NEW_TAG=frigate:recap-0.18.2
+# Set once the compose image line points at the new tag. An interrupt after
+# that point rolls the compose file and the database back.
+SWAPPED=0
+SUCCESS=0
 # A second full Frigate image is about 8 GB. Below this, docker pulls or
 # unpacks can fill the LXC and stop recordings. Nothing is deleted to get
 # under this line.
@@ -62,6 +69,13 @@ if (( root_free < IMAGE_FREE_GB )); then
 fi
 if (( backup_free < BACKUP_FREE_GB )); then
   log "ABORT: only ${backup_free}G free in $BACKUP_DIR. Need ${BACKUP_FREE_GB}G for the database, WAL, config, and compose. Nothing was deleted."
+  exit 1
+fi
+root_dev=$(stat -c %d /)
+backup_dev=$(stat -c %d "$BACKUP_DIR")
+if [[ "$root_dev" == "$backup_dev" ]]; then
+  log "ABORT: $BACKUP_DIR is on the container root filesystem (device $root_dev)."
+  log "Pass a Proxmox host directory that is bind-mounted into this LXC. Nothing was changed."
   exit 1
 fi
 
@@ -93,8 +107,25 @@ cp -a "$CONFIG" "$SNAP/config.yml"
 cp -a "$COMPOSE" "$SNAP/docker-compose.yml"
 if [[ -f "$DB" ]]; then
   cp -a "$DB" "$SNAP/frigate.db"
-  nice -n 19 sqlite3 "$DB" ".timeout 20000" ".backup $SNAP/frigate.db.consistent" \
-    && log "consistent db snapshot $SNAP/frigate.db.consistent"
+  consistent=$SNAP/frigate.db.consistent
+  # A failed .backup can leave a partial file. Publish it only after the
+  # command exits 0 and integrity_check passes, and do this before compose
+  # is edited. A later rollback must not prefer a partial file over the
+  # raw copy.
+  if ! nice -n 19 sqlite3 "$DB" ".timeout 20000" ".backup $consistent"; then
+    if [[ -e "$consistent" ]]; then
+      mv -f "$consistent" "$SNAP/frigate.db.consistent.failed"
+    fi
+    log "ABORT: sqlite backup failed. Compose was not changed and the live database was left in place."
+    exit 1
+  fi
+  if [[ ! -s "$consistent" ]] || ! sqlite3 "$consistent" "PRAGMA integrity_check;" | grep -qx ok; then
+    mv -f "$consistent" "$SNAP/frigate.db.consistent.failed"
+    log "ABORT: sqlite backup failed its integrity check. Compose was not changed."
+    exit 1
+  fi
+  : > "$SNAP/frigate.db.consistent.ok"
+  log "consistent db snapshot $consistent"
 fi
 if [[ -f "$DB-wal" ]]; then
   cp -a "$DB-wal" "$SNAP/frigate.db-wal"
@@ -109,7 +140,18 @@ log "pre-swap copies in $SNAP (left in place; this script does not remove them)"
 cp -a "$COMPOSE" "$SNAP/docker-compose.yml.before-edit"
 sed -i -E "s|^(\\s+image:\\s*).*$|\\1${NEW_TAG}|" "$COMPOSE"
 log "compose image -> $(grep -E '^\\s+image:' "$COMPOSE")"
-compose config -q || { log "ABORT: compose invalid"; cp -a "$SNAP/docker-compose.yml" "$COMPOSE"; exit 1; }
+SWAPPED=1
+on_exit() {
+  local code=$?
+  if [[ "$SWAPPED" == "1" && "$SUCCESS" != "1" ]]; then
+    rollback || true
+  fi
+  exit "$code"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+compose config -q || { log "ABORT: compose invalid"; cp -a "$SNAP/docker-compose.yml" "$COMPOSE"; SWAPPED=0; exit 1; }
 
 restore_db() {
   log "restoring pre-swap database from $SNAP"
@@ -121,7 +163,7 @@ restore_db() {
   [[ -f "$DB" ]] && mv -f "$DB" "$moved/frigate.db"
   [[ -f "$DB-wal" ]] && mv -f "$DB-wal" "$moved/frigate.db-wal"
   [[ -f "$DB-shm" ]] && mv -f "$DB-shm" "$moved/frigate.db-shm"
-  if [[ -f "$SNAP/frigate.db.consistent" ]]; then
+  if [[ -f "$SNAP/frigate.db.consistent.ok" && -s "$SNAP/frigate.db.consistent" ]]; then
     cp -a "$SNAP/frigate.db.consistent" "$DB"
     log "restored consistent snapshot (WAL contents included); live files kept in $moved"
   elif [[ -f "$SNAP/frigate.db" ]]; then
@@ -135,6 +177,8 @@ restore_db() {
 }
 
 rollback() {
+  [[ "$SWAPPED" == "1" ]] || return 0
+  SWAPPED=0
   log "!!! deploy unhealthy -> rolling back to $LIVE_TAG and the pre-swap database"
   docker logs --since 10m frigate 2>&1 | tail -40 || true
   cp -a "$SNAP/docker-compose.yml" "$COMPOSE"
@@ -164,6 +208,7 @@ print("  recordings days:", len(body))
 if [[ -n "$V" ]] && [[ "$V" == *0.18.2* ]] && sleep 20 && check_cameras && check_restarts && recordings_ok && curl -fs --max-time 5 "$API/api/recap" >/dev/null; then
   log "=== DEPLOY OK: $NEW_TAG ($VER)"
   log "rollback copies remain in $SNAP"
+  SUCCESS=1
   exit 0
 fi
 rollback
