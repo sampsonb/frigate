@@ -184,12 +184,16 @@ rollback() {
   cp -a "$SNAP/docker-compose.yml" "$COMPOSE"
   cp -a "$SNAP/config.yml" "$CONFIG"
   restore_db
-  docker image inspect "$LIVE_TAG" >/dev/null || { log "FATAL: $LIVE_TAG disappeared"; exit 1; }
-  compose up -d --pull never --force-recreate frigate
+  docker image inspect "$LIVE_TAG" >/dev/null || { log "FATAL: rollback image $LIVE_TAG is missing. Config and database were restored. The container was not recreated."; exit 1; }
+  if ! compose up -d --pull never --force-recreate frigate; then
+    log "ROLLBACK FAILED: could not start $LIVE_TAG. Config and database were restored. Image line: $(grep -E '^[[:space:]]+image:' "$COMPOSE" || true)"
+    exit 1
+  fi
   if wait_api 300 >/dev/null; then
     log "rolled back, API up ($(curl -fs --max-time 3 "$API/api/version" || true))"
   else
-    log "rolled back, API not up yet"
+    log "ROLLBACK FAILED: $LIVE_TAG was started but the API did not answer. Config and database were restored."
+    exit 1
   fi
 }
 
