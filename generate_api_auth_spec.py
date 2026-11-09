@@ -60,6 +60,7 @@ from frigate.api import (
     motion_search,
     notification,
     preview,
+    recap,
     record,
     review,
 )
@@ -152,6 +153,7 @@ def build_app() -> FastAPI:
         preview.router,
         notification.router,
         export.router,
+        recap.router,
         event.router,
         media.router,
         motion_search.router,

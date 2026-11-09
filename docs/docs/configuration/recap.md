@@ -1,0 +1,205 @@
+---
+id: recap
+title: Recap
+---
+
+Recap builds a short video synopsis of a long stretch of footage. Every tracked object from the window is cut out and played over a background from the same time of day, with a stationary time label. Hours of a camera can be reviewed in about two minutes. The idea is the same as FLIR RapidRecap.
+
+Recap is off unless you enable it. Leaving it out of the config does not change detection, recording, or review.
+
+## Configuration
+
+```yaml
+recap:
+  enabled: true
+  # Daily local time. Omit this to generate recaps only from the UI.
+  schedule: "02:00"
+  # Hours of footage each scheduled recap covers.
+  window_hours: 24
+  retain_days: 14
+```
+
+The same block can be set on one camera. A camera value replaces the global value for that field. `enabled: false` is the default, so a stock config never starts a job.
+
+Useful knobs:
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `schedule` | none | Daily `HH:MM` in `ui.timezone`. The container clock is often UTC, and this time is not UTC unless that setting is unset. Frigate has to be running within about 90 seconds of this time. |
+| `interval_minutes` | off | Build a recap of the last this many minutes on that interval. The kind is `rolling-<minutes>m`, so the previous one of that kind is replaced when the new one is Ready. A run is skipped while that one is still queued or rendering, and a missed interval is not queued behind it. Separate from the rolling recap that stays ready. |
+| `window_hours` | 24 | How far back a scheduled recap looks. |
+| `max_window_hours` | 48 | Longest on-demand range. |
+| `labels` | people, vehicles, animals, delivery names | Tracked labels to consider. |
+| `target_length` | 120 | Aim for this many seconds. Busy hours run longer rather than stacking objects on each other. |
+| `label_opacity` | 0.5 | Time-label background. |
+| `max_labels` | 4 | Most objects, and time labels, on screen at once. |
+| `max_overlap` | 0.3 | Most of an object's footprint that others may cover when a busy window does not fit `target_length`. Past this the recap runs longer. Raise it (or `max_labels`) for shorter, busier recaps. |
+| `min_object_area` | 0.0012 | Smallest vehicle shown, as a fraction of the frame, measured on Frigate's snapshot box. People and animals use a third of it. Far-street traffic below this is left out. `0` shows everything. |
+| `fade_seconds` | 0.2 | Fade for the ghost, the leader line, and the label. |
+| `retain_days` | 14 | Delete local recaps after this many days. `0` keeps them. |
+| `replace_superseded` | true | When a recap is Ready, delete older completed recaps of the same camera and kind. Last-N-hours buttons group by that length. An explicit range that is one local midnight-to-midnight day groups with the nightly recap for that date (`day:<date>`, including older `backfill-day:<date>` copies). Any other explicit range is kept on its own and is not treated as last-N hours. Running, failed, and archive copies are kept. |
+| `min_show_seconds` | 2.5 | Shortest time a ghost stays readable. A snapshot held in place stays at least 3 seconds. |
+| `output_fps` | 15 | Synopsis frame rate. With `sample_fps` and `vehicle_sample_fps` (both 15) at the same rate, objects move at their real speed, every recorded frame of a 15 fps camera. Lower sampling looks like a fast, jumpy time-lapse. |
+| `max_width` | 1280 | Frames are scaled down to this. |
+| `pause_seconds` | 0.02 | Sleep between events so live detection keeps the CPU. |
+| `archive` | off | Optional older media. See below. |
+
+Generation runs one job at a time, at a lower CPU priority. Another request waits in a queue. Cancel from the Recap page.
+
+Files are stored at `/media/frigate/recap/<camera>/<id>/` (`manifest.json`, `video.mp4`, `thumb.jpg`).
+
+## What gets drawn
+
+- People are blue, vehicles orange, deliveries magenta, animals green, and a parked car someone got into or out of is teal.
+- The legend checkboxes hide labels and list rows. The ghosts are already part of the video.
+- A vehicle that barely moves is left out, unless a person gets in or out. That car is drawn once, labeled `12:26 PM got out` or `got in`, with a dotted line to the person.
+- A vehicle that pulls in, sits, and drives off is shown pulling in and, later, driving off, each with its own time. It stays parked on screen in between, and it is taken out of the background, so it is never on screen twice or popping in when the background changes. Frigate's stationary and active marks split the event, and the drive off starts when the vehicle was first seen away from its spot, a few seconds before Frigate marks it active. The pull-in clip ends half a second after the vehicle stops moving in the recording, and the drive off starts half a second before it moves, so the parked vehicle is drawn whole in between instead of as a cutout of a car sitting still. A vehicle Frigate loses and finds again at the same spot counts as one stay.
+- An object that comes into view in the middle of the picture, where another one is or just was, within a minute, waits for it. The people who get out of a truck appear once it has pulled in, and a car someone gets into drives off after they reach it. Cars passing at the edge of the picture keep their own pace. An object that comes into view next to one still on screen plays alongside it, at the same offset as in the recording: a pickup and the trailer Frigate tracked apart leave together. So do objects whose boxes overlapped in the recording, such as a man walking past a woman: each cutout holds a piece of the other, and only at the real offset do those pieces line up. Waiting still wins: an object never starts before one it waits for. This can make a recap longer.
+- A long event is trimmed to `max_object_seconds` where it moves the most, and its label is the time of the first frame shown.
+- A delivery is a Frigate+ attribute or label (`fedex`, `ups`, `amazon`, `package`, and the other carrier names) when one is present. Otherwise semantic search is used if it is enabled.
+- A person overlapping a dog or cat is drawn as an animal, and the dog's own track is dropped, which is how a dog walker stays one green label.
+- Anything that moves with a person, and is connected to them against a clean background, is part of their cutout. That includes a golf cart, bicycle, scooter, or stroller the detector does not know as its own object. Another person or vehicle Frigate tracks is its own cutout: a person's cutout keeps out of their boxes, except for what is inside the person's own box, so someone walking behind another does not take them along. Of two people, the one nearer the camera (reaching lower in the frame) is drawn on top. A dog someone walks stays with them.
+- Times are local, without seconds (`5:50 PM`). If two labels fall in the same clock minute, those labels show seconds (`5:50:12 PM`, `5:50:47 PM`). Labels are not grouped with a count.
+- The background matches the lighting of the objects on screen. A frame with almost no color is treated as infrared. Color and infrared are never averaged into one plate. Within one lighting period the plate is the sample nearest those objects, refreshed about every 30 minutes. Each plate is the per-pixel median of at least three frames taken about 10 minutes apart, for windows up to a day, so a car that passed in one of them is not in it. A frame that falls in a recording hole (motion-only retention drops quiet segments) comes from the nearest recording within five minutes, and two frames are never averaged, which used to leave a see-through car parked in the plate. Objects stay in time order, so a dusk recap moves from afternoon to night, and the plate crossfades for about half a second when the lighting changes. The plate is dimmed and desaturated by about 18% so the objects read first.
+- Each object's position comes from every exact sample Frigate kept: the timeline rows (first seen, entered a zone, stopped, last seen) and the path. Sizes follow the timeline, so a car coming up the street grows. A clip ends at the last sighting. Frigate keeps an event open a few seconds after the object leaves, and those frames are empty road.
+- The recording and the detector run on different clocks. Recording segments are dated to the whole second, so a frame can be anywhere from a fraction of a second to about two seconds away from the detector's time for the same moment. Each event is lined up with its own frames: the path is slid in time until it covers the most motion. `detect.annotation_offset` is the starting guess.
+- Objects are drawn as recorded. Nothing is brightened or darkened to match the plate. A color object on an infrared plate is only turned gray.
+- In daylight, an object is a moving cutout: fully opaque inside its mask, with a 2 to 3 pixel soft edge and a 0.2 second fade in and out. A vehicle's or person's mask keeps only the part of its detector box that differs from the background, so no rectangle of road or pale patch of pavement travels with it. A frame where the object cannot be found holds the nearest good cutout, and frames after it has gone are left out instead of freezing it in the road. A person who stops (getting out of a car and standing by it) becomes part of the clip's own background and the mask finds nothing, so as long as the frame still shows them where their cutout last was, they are held there standing instead of vanishing. When more than half the clip has to be filled that way, the snapshot is shown instead.
+- When Frigate first sees someone late (a jogger who had already run most of the way across), the recording before that is searched for them, following their moving shape back for up to 3 seconds. When Frigate's boxes miss a person in nearly every frame, the person is followed from the box nearest them instead. Objects that play together are lined up on the recording's own clock. Frigate's path is sparse, so a car speeding up runs ahead of its box. When almost nothing under a vehicle's box moves and something its size moves next to it, the box is moved onto it, and that correction carries to the next frames until the path is back on the vehicle, so the cutout follows it. A person's box is never moved: someone standing still barely differs from the background, and the motion beside them is someone or something else.
+- A vehicle stays whole behind a planter, a pole, or a tree trunk. The detector box only covers the part it can see, so the mask also takes the pieces at the vehicle's height on the far side of the occluder (found at half the usual threshold, since black paint on dark road barely differs), as long as the whole keeps a vehicle's proportions (at most 3.2 times as long as it is tall) and stays out of the other objects' boxes. What stands in front of it stays in front: leaves that barely change over the planter's busy texture, and anything inside the vehicle's box that does not change for the whole clip, such as a pot between a truck's cab and bed. A vehicle that turns out longer than its detector box (the box lags a truck pulling in) is looked for again in a window long enough for a whole vehicle, so its front shows past the planter as soon as it is visible there. Warm light that only brightens the road, such as tail lights in mist behind a truck, is not taken as part of it.
+- Every object is drawn with a thin rectangle around it in its category color, day and night. At night and at dusk, objects are cut out and move just as in daylight. Where a mask does not hold, the object moves as a window: its padded box as recorded, outlined. Frigate's snapshot of it (its best view) is held in place only when there is no recording to cut it from, or when most of the clip would have to be filled in.
+- At most `max_labels` objects are on screen at once, and objects on the same spot wait for each other instead of stacking. A busy six hours can run three or four minutes. The player's own speed control plays it faster.
+- Vehicles smaller than `min_object_area` (far-street traffic) and people smaller than a third of it are left out. They are listed with the reason "too small to see".
+- The cutout window is the union of the detector boxes in that clip, plus about 12% on the sides. People and animals also get about 20% above the box, and a vehicle gets extra room in the direction it is moving, so a nose or a head is not cropped off. The outline follows a closed, simplified contour rather than every jagged pixel.
+- Each time label is drawn once. The player does not paint the same words again on top of the frame.
+- Every object that is drawn keeps its time label and leader. The leader ends on the centroid of the mask that was painted. Only a ghost of a few dozen pixels, or a box that sits mostly off the frame, gets no line.
+
+Tap a time on the video, or a row in the event list, to pause and open that clip. The dialog has download, previous, and next, and a link to Frigate review at that time. While the synopsis is paused, every time on screen can be tapped. Live clips play from the camera's HLS VOD playlist (`/vod/<camera>/start/<ts>/end/<ts>/index.m3u8`), which Safari plays natively. Archived files are served as a faststart H.264 MP4 with range requests. If Frigate has already deleted the recording, and `recap.archive` is set, the player uses the archived file for the same event.
+
+## Archive
+
+Frigate's own retention is often 10 to 14 days. A nightly job outside Frigate can keep recordings for about two months and events for a year or more. Point recap at that copy and it will play clips, and list recaps, after the live files are gone.
+
+```yaml
+recap:
+  enabled: true
+  archive:
+    # Mount of the external drive. Same layout as /media/frigate.
+    path: /mnt/frigate-archive
+    # Optional. Used when the drive is not mounted and the tree is served over HTTP.
+    url: https://archive.example/frigate
+```
+
+Both fields are optional. With neither set, recap never reads the archive.
+
+The archive root should keep Frigate's paths:
+
+- `recordings/YYYY-MM-DD/HH/<camera>/MM.SS.mp4` in UTC, the same names Frigate writes
+- `clips/<camera>-<event id>.jpg` snapshots
+- `recap/<camera>/<id>/manifest.json`, `video.mp4`, and `thumb.jpg` if the nightly copy includes recaps
+
+Also include a per-day index and, if you have them, dated database copies:
+
+- `index/YYYY-MM-DD.json` (`.jsonl` and `.csv` are read too, as are `YYYY-MM-DD/index.json`)
+- `db/frigate-YYYY-MM-DD.db`
+
+An index row needs the event id, camera, label, start, end, and archive-relative paths. A clip path or the recording segments both work. Paths may also be the original `/media/frigate/...` location. They are rewritten onto the archive root. Paths that leave the archive (`..`) are ignored.
+
+```json
+[
+  {
+    "id": "1728330612.481-a1b2c3",
+    "camera": "front",
+    "label": "person",
+    "start": 1728330612.481,
+    "end": 1728330640.2,
+    "paths": [
+      "recordings/2024-10-07/20/front/50.12.mp4",
+      "recordings/2024-10-07/20/front/50.22.mp4"
+    ],
+    "snapshot": "clips/front-1728330612.481-a1b2c3.jpg"
+  }
+]
+```
+
+`event_id`, `start_time`, `end_time`, `files`, and `clip` are accepted names for the same fields. CSV uses a header row, with several paths separated by `|`.
+
+The nightly index at `index/YYYY-MM-DD.json` is a list of rows. Each row has `id`, `camera`, `label`, `start`, `end` (epoch seconds), `paths` (for example `events/<review id>.mp4`), and `snapshot`. Frigate-built recaps copied to `recap/` use Frigate's own `<camera>/<id>/manifest.json` layout.
+
+When the index does not list files, recap looks up the event in a dated database and then the UTC recording tree. One file is served directly. Several files are joined the same way Frigate builds an event clip. Every file is checked again immediately before it is opened. If one was deleted after the index was read, the player gets "This clip is no longer archived" instead of a server error. If only the snapshot is left, the player shows the snapshot.
+
+Archived recaps show in the Recap list with an Archive badge. They are not deleted from the UI. The local `retain_days` cleanup does not touch the archive.
+
+If you only set `url`, clip fallback reads `index/YYYY-MM-DD.json` from that host, and the list reads `recap/index.json`. Playing a recording that spans multiple files needs `path`, because Frigate has to join them.
+
+## Rolling recap
+
+Each recap camera keeps one rolling recap of the last `rolling_hours` (default 6) ready, so the Recap page can play it right away. Every `rolling_interval_minutes` (default 30, `0` turns it off) Frigate checks the events in that window. If no event is new and none changed its end time, the refresh is skipped. Otherwise the recap is rebuilt in a staging folder and swapped into place, so there is only ever one live rolling recap per camera and the previous one keeps playing until the new one is ready. If a refresh fails or is cancelled, the last good one stays. The rolling recap it replaces is moved into the saved list (marked as an earlier rolling recap), unless it held exactly the same events. Saved copies are removed after `rolling_keep_hours` (default 72, `0` deletes them on replace). Nightly, custom, and manual recaps are never removed by this. After `rolling_max_age_minutes` (default 180) it is rebuilt even with no new events, so objects that aged out of the window drop off.
+
+```yaml
+recap:
+  rolling_hours: 6
+  rolling_interval_minutes: 30
+  rolling_max_age_minutes: 180
+  rolling_keep_hours: 72
+```
+
+Queue rules: one recap is built at a time. A request from the UI (a longer range, a custom range, or Refresh now) runs before scheduled work. A refresh never waits behind another refresh of the same camera, and a request that is already waiting or running is returned instead of being queued twice.
+
+Each event's cutouts are cached under `/media/frigate/recap/.cutcache`, keyed on the event id and end time, output size, sample rate, the per-object time cap, the category, and a cache version. A refresh only decodes events it has not seen. Entries unused for 74 hours are removed after each job, and the size is written to the log. Manifests record `started`, `finished`, `took_s`, the start of each stage, and cache hits and misses.
+
+`interval_minutes` is a separate optional job, off unless you set it. It builds a new recap of only the last that many minutes, with kind `rolling-<minutes>m`. Saved copies of that kind are replaced when the new one is Ready. Each object is still trimmed to `max_object_seconds` of samples, so a 30 minute run is a small fraction of a nightly 24 hour recap. The finished-recap log includes `rendered in` seconds (`took_s` on the manifest). If that render is still going when the next interval opens, that run is skipped instead of queued.
+
+`GET /api/recap/rolling/<camera>` returns the rolling recap, any refresh in progress, and the last outcome. `POST /api/recap/rolling/<camera>/refresh` checks now (`?force=true` rebuilds even when nothing changed).
+
+## Install on an existing 0.17.2 container
+
+Build the overlay on the host. The repository is public, so this does not need a GitHub login. It starts from stock `ghcr.io/blakeblackshear/frigate:0.17.2` (pinned by digest) and does not compile Frigate. On a Beelink that already has that image, expect about 15 to 25 minutes. Most of that is `npm install` and the web UI production build. The first run also downloads the `node:20` image used only for that build.
+
+```bash
+docker build -t frigate:recap-0.17.2 -f docker/recap/Dockerfile https://github.com/sampsonb/frigate.git#cursor/recap-3a01
+```
+
+In `docker-compose.yml`, point the service at the local tag. Leave the config volume, media volume, and `/dev/dri` device (OpenVINO on `/dev/dri/renderD128`) as they are. Do not `docker compose pull` this tag. It is not in a registry.
+
+```yaml
+image: frigate:recap-0.17.2
+```
+
+```bash
+docker compose up -d
+```
+
+Add `recap:` to `config.yml`, including `ui.timezone`, and restart once more. Until `recap.enabled` is true, behavior matches stock 0.17.2.
+
+Roll back by restoring the stock image and recreating the container:
+
+```yaml
+image: ghcr.io/blakeblackshear/frigate:0.17.2
+```
+
+```bash
+docker compose up -d
+```
+
+Recap files under `/media/frigate/recap` are left in place and are ignored by the stock image.
+
+A GitHub Actions workflow on this fork can also push `ghcr.io/sampsonb/frigate:recap-0.17.2`. A new GHCR package is private by default, so `docker pull` of that tag fails until the package is made public. The `docker build` command above does not depend on that.
+
+## Performance
+
+Recap is meant for a small Intel machine that is also running detection. It does not load a second detector. Cutouts are motion against a background plate, on the CPU, with a short pause between events. Night objects reuse Frigate's snapshot, so their clips are not decoded at all. Output is 1280px wide H.264. One recap runs at a time, and the worker lowers its priority.
+
+Semantic search, when enabled, only looks at the nearest thumbnails Frigate already computed. It is skipped when semantic search is off.
+
+## Limitations
+
+- Filters hide labels and the event list. They do not erase ghosts already drawn into the video.
+- A parked car is shown only when Frigate tracked that stationary vehicle. A car the detector never saw cannot be labeled.
+- A vehicle parked through most of a background sample but never seen moving stays in the background. It can appear or disappear when the background is refreshed, about every 30 minutes.
+- Cutouts are weaker than a segmentation model on a cluttered background. A connected moving object is included. A shadow or a full-frame lighting change is not.
+- A snapshot held in place shows the object at its best moment, not its movement. Tap its time to play the clip.
+- The schedule is a single daily time, not a cron expression. If Frigate is down at that minute, that day's recap is skipped.
+- Label times and the nightly schedule use `ui.timezone`. The container clock is often UTC. If `ui.timezone` is unset, both fall back to the container's local time.
+- At most `max_events` events are processed (default 400). When a window has more, the newest are kept, after parked vehicles are set aside.
+- An archive URL alone cannot join multiple recording files. Mount `archive.path` for that.

@@ -3972,6 +3972,396 @@ paths:
       security:
         - frigateAdminAuth: []
       x-required-role: admin
+  /recap:
+    get:
+      tags:
+        - Recap
+      summary: List recaps
+      description: |-
+        **Access:** Any authenticated user.
+
+        Lists saved video synopses for cameras the user can view. Newest window end first, then newest creation time, across cameras and kinds. Includes older recaps stored on recap.archive when that is configured.
+      operationId: recap_list_recap_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+      security:
+        - frigateUserAuth: []
+      x-required-role: any
+  /recap/event/{event_id}:
+    get:
+      tags:
+        - Recap
+      summary: Resolve an event clip
+      description: |-
+        **Access:** Authenticated user with access to the referenced camera.
+
+        Tells the recap player where a time label's clip lives. Live recordings use the HLS VOD playlist Safari can play. Otherwise the configured archive is searched by event id.
+      operationId: recap_event_source_recap_event__event_id__get
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+            title: Event Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: camera
+  /recap/event/{event_id}/clip.mp4:
+    get:
+      tags:
+        - Recap
+      summary: Play an archived event clip
+      operationId: recap_event_clip_recap_event__event_id__clip_mp4_get
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+            title: Event Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: any
+      description: '**Access:** Any authenticated user.'
+  /recap/event/{event_id}/snapshot.jpg:
+    get:
+      tags:
+        - Recap
+      summary: Archived event snapshot
+      operationId: recap_event_snapshot_recap_event__event_id__snapshot_jpg_get
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+            title: Event Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: any
+      description: '**Access:** Any authenticated user.'
+  /recap/rolling/{camera_name}:
+    get:
+      tags:
+        - Recap
+      summary: Rolling recap status
+      description: |-
+        **Access:** Authenticated user with access to the referenced camera.
+
+        The camera's rolling recap (the last rolling_hours, rebuilt in place every rolling_interval_minutes when something changed), plus any refresh that is building.
+      operationId: recap_rolling_recap_rolling__camera_name__get
+      parameters:
+        - name: camera_name
+          in: path
+          required: true
+          schema:
+            anyOf:
+              - type: string
+              - type: 'null'
+            title: Camera Name
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: camera
+  /recap/rolling/{camera_name}/refresh:
+    post:
+      tags:
+        - Recap
+      summary: Refresh the rolling recap now
+      description: |-
+        **Access:** Authenticated user with access to the referenced camera.
+
+        Checks for new events and rebuilds the rolling recap ahead of scheduled work. Pass force=true to rebuild even when nothing changed.
+      operationId: 
+        recap_rolling_refresh_recap_rolling__camera_name__refresh_post
+      parameters:
+        - name: camera_name
+          in: path
+          required: true
+          schema:
+            anyOf:
+              - type: string
+              - type: 'null'
+            title: Camera Name
+        - name: force
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+            title: Force
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: camera
+  /recap/{camera_name}/start:
+    post:
+      tags:
+        - Recap
+      summary: Start a recap
+      description: |-
+        **Access:** Authenticated user with access to the referenced camera.
+
+        Queues a synopsis for the camera. Pass hours (for example 12 or 48) or an after/before epoch range. An explicit after and before that is one local midnight-to-midnight day uses the same kind as that day's nightly recap. Any other explicit range is its own kind and is not grouped as last-N hours. One recap runs at a time. Others wait, and a request already waiting or running is returned instead of being queued twice.
+      operationId: recap_start_recap__camera_name__start_post
+      parameters:
+        - name: camera_name
+          in: path
+          required: true
+          schema:
+            anyOf:
+              - type: string
+              - type: 'null'
+            title: Camera Name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecapStartBody'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: camera
+  /recap/{recap_id}:
+    get:
+      tags:
+        - Recap
+      summary: Get a recap
+      description: |-
+        **Access:** Any authenticated user.
+
+        Full manifest, including track timing so the UI can make time labels clickable.
+      operationId: recap_get_recap__recap_id__get
+      parameters:
+        - name: recap_id
+          in: path
+          required: true
+          schema:
+            type: string
+            title: Recap Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: any
+    delete:
+      tags:
+        - Recap
+      summary: Delete a recap
+      operationId: recap_delete_recap__recap_id__delete
+      parameters:
+        - name: recap_id
+          in: path
+          required: true
+          schema:
+            type: string
+            title: Recap Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: any
+      description: '**Access:** Any authenticated user.'
+  /recap/{recap_id}/cancel:
+    post:
+      tags:
+        - Recap
+      summary: Cancel a recap
+      operationId: recap_cancel_recap__recap_id__cancel_post
+      parameters:
+        - name: recap_id
+          in: path
+          required: true
+          schema:
+            type: string
+            title: Recap Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: any
+      description: '**Access:** Any authenticated user.'
+  /recap/{recap_id}/video.mp4:
+    get:
+      tags:
+        - Recap
+      summary: Play a recap
+      description: |-
+        **Access:** Any authenticated user.
+
+        Play a recap inline, or save it with ``?download=1&name=...``.
+      operationId: recap_video_recap__recap_id__video_mp4_get
+      parameters:
+        - name: recap_id
+          in: path
+          required: true
+          schema:
+            type: string
+            title: Recap Id
+        - name: download
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+            title: Download
+        - name: name
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - type: string
+              - type: 'null'
+            title: Name
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: any
+  /recap/{recap_id}/thumb.jpg:
+    get:
+      tags:
+        - Recap
+      summary: Recap thumbnail
+      operationId: recap_thumb_recap__recap_id__thumb_jpg_get
+      parameters:
+        - name: recap_id
+          in: path
+          required: true
+          schema:
+            type: string
+            title: Recap Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - frigateUserAuth: []
+      x-required-role: any
+      description: '**Access:** Any authenticated user.'
   /events:
     get:
       tags:
@@ -8693,6 +9083,29 @@ components:
         - end
       title: PreviewModel
       description: Model representing a single preview clip.
+    RecapStartBody:
+      properties:
+        hours:
+          anyOf:
+            - type: number
+              maximum: 168.0
+              exclusiveMinimum: 0.0
+            - type: 'null'
+          title: Hours
+        after:
+          anyOf:
+            - type: number
+            - type: 'null'
+          title: After
+        before:
+          anyOf:
+            - type: number
+            - type: 'null'
+          title: Before
+      type: object
+      title: RecapStartBody
+      description: On-demand window. Pass ``hours``, or ``after`` and ``before``
+        as epoch seconds.
     RegenerateDescriptionEnum:
       type: string
       enum:

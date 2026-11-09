@@ -23,6 +23,7 @@ from ..classification import (
     CameraLicensePlateRecognitionConfig,
     CameraSemanticSearchConfig,
 )
+from ..recap import RecapConfig
 from .audio import AudioConfig
 from .birdseye import BirdseyeCameraConfig
 from .detect import DetectConfig
@@ -131,6 +132,9 @@ class CameraConfig(FrigateBaseModel):
         default_factory=ReviewConfig,
         title="Review",
         description="Settings that control alerts, detections, and GenAI review summaries used by the UI and storage for this camera.",
+    )
+    recap: RecapConfig = Field(
+        default_factory=RecapConfig, title="Video synopsis (recap) configuration."
     )
     semantic_search: CameraSemanticSearchConfig = Field(
         default_factory=CameraSemanticSearchConfig,

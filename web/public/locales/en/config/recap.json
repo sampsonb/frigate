@@ -1,0 +1,125 @@
+{
+  "label": "Video synopsis (recap) configuration.",
+  "properties": {
+    "enabled": {
+      "label": "Enable recap generation."
+    },
+    "enabled_in_config": {
+      "label": "Keep track of original state of recap."
+    },
+    "schedule": {
+      "label": "Daily local time to generate a recap automatically (HH:MM).",
+      "description": "24-hour local time. Leave empty to generate recaps only on demand. Frigate must be running within a couple of minutes of this time."
+    },
+    "window_hours": {
+      "label": "Hours of footage each scheduled recap covers."
+    },
+    "max_window_hours": {
+      "label": "Longest time range an on-demand recap may cover."
+    },
+    "rolling_hours": {
+      "label": "Hours covered by the rolling recap that is kept ready."
+    },
+    "rolling_interval_minutes": {
+      "label": "Minutes between rolling recap refreshes. 0 turns the rolling recap off.",
+      "description": "The rolling recap is rebuilt in place on this interval. A refresh is skipped when no event in the window is new or changed."
+    },
+    "rolling_max_age_minutes": {
+      "label": "Rebuild the rolling recap after this long even with no new events.",
+      "description": "Drops events that have aged out of the window. 0 never forces a rebuild."
+    },
+    "rolling_keep_hours": {
+      "label": "Hours to keep replaced rolling recaps in the saved list. 0 deletes them on replace.",
+      "description": "When a new rolling recap is ready, the one it replaces is saved unless it held the same events. Saved copies older than this are removed. Nightly, custom, and manual recaps are not affected."
+    },
+    "interval_minutes": {
+      "label": "Minutes between automatic short recaps. 0 disables them.",
+      "description": "When set, Frigate builds a recap of the last this many minutes on that interval. The kind is rolling-<minutes>m, so the previous one is replaced when the new one is ready. A run is skipped while the previous one is still queued or rendering. This is separate from the rolling recap that stays ready."
+    },
+    "labels": {
+      "label": "Tracked labels to include."
+    },
+    "target_length": {
+      "label": "Target synopsis length in seconds."
+    },
+    "label_opacity": {
+      "label": "Opacity of the time-label background."
+    },
+    "max_labels": {
+      "label": "Maximum number of objects (and time labels) on screen at once."
+    },
+    "max_overlap": {
+      "label": "Most of an object's footprint another object may cover.",
+      "description": "When a busy window does not fit target_length, objects may overlap up to this share before the recap runs longer instead."
+    },
+    "min_object_area": {
+      "label": "Smallest vehicle shown, as a fraction of the frame.",
+      "description": "Measured on Frigate's snapshot box, the object's best view. People and animals use a third of this. 0 shows everything."
+    },
+    "min_label_gap": {
+      "label": "Minimum gap between labels, in pixels at 1080p."
+    },
+    "fade_seconds": {
+      "label": "Fade in and out duration for a ghost, its line, and its label."
+    },
+    "retain_days": {
+      "label": "Days to keep generated recaps. 0 keeps them until deleted."
+    },
+    "replace_superseded": {
+      "label": "Replace an older recap of the same kind when a new one is ready.",
+      "description": "Last-N-hours buttons group by that length. An explicit range that is one local midnight-to-midnight day groups with the nightly recap for that date. Any other explicit range is kept on its own. Running, failed, and archive copies are kept."
+    },
+    "output_fps": {
+      "label": "Frame rate of the synopsis video."
+    },
+    "sample_fps": {
+      "label": "Frames per second sampled from people and animals."
+    },
+    "vehicle_sample_fps": {
+      "label": "Frames per second sampled from vehicles so they stay readable."
+    },
+    "min_show_seconds": {
+      "label": "Shortest time a ghost stays on screen."
+    },
+    "max_object_seconds": {
+      "label": "Most source time kept for one object (loiterers are trimmed)."
+    },
+    "max_width": {
+      "label": "Maximum synopsis width. Frames are scaled down to this."
+    },
+    "font_scale": {
+      "label": "Label font scale at 1080p."
+    },
+    "max_events": {
+      "label": "Maximum events processed in one recap."
+    },
+    "parked_cars": {
+      "label": "Show a parked car when a person gets in or out of it."
+    },
+    "stationary_path": {
+      "label": "Path movement, as a fraction of the frame, below which a vehicle is parked."
+    },
+    "delivery_search": {
+      "label": "Tag deliveries with semantic search when Frigate+ labels are absent."
+    },
+    "delivery_distance": {
+      "label": "Maximum semantic-search distance to call an event a delivery."
+    },
+    "pause_seconds": {
+      "label": "Pause between events so live detection keeps the CPU."
+    },
+    "archive": {
+      "label": "Optional external archive of recordings, events, and recaps.",
+      "properties": {
+        "path": {
+          "label": "Filesystem path of the media archive mounted into Frigate.",
+          "description": "Root of a nightly copy that keeps Frigate's layout: recordings/YYYY-MM-DD/HH/<camera>/MM.SS.mp4, clips/, and recap/. Empty disables the filesystem archive."
+        },
+        "url": {
+          "label": "Base URL of the media archive.",
+          "description": "Used when the archive is not mounted, or to play a single archived file directly. No trailing slash. Empty disables URL access."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,2611 @@
+"""Recap layout, time labels, parked cars, cutouts, and archive lookup."""
+
+import asyncio
+import json
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
+
+import cv2
+import numpy as np
+
+from frigate.recap.archive import (
+    CLIP_GONE,
+    ArchiveLocation,
+    ArchiveSegment,
+    clear_archive_cache,
+    event_start_from_id,
+    lookup_playback,
+    parse_index_text,
+    present_local_segments,
+    recordings_covering,
+    rewrite_media_path,
+    safe_archive_path,
+)
+from frigate.recap.categories import CAT_COLOR
+from frigate.recap.clips import (
+    live_clip_urls,
+    playable_mp4_response,
+    render_faststart_mp4,
+)
+from frigate.recap.cutout import (
+    _attach,
+    _smooth_contour,
+    attach_motion,
+    build_cutouts,
+    solid_feather,
+)
+from frigate.recap.layout import (
+    MotionTrack,
+    ScheduledUnit,
+    _rects_hit,
+    assign_label_texts,
+    dedupe_tracks,
+    format_clock,
+    is_stationary,
+    link_parked_cars,
+    plan_label_rects,
+    repeat_for_min_show,
+    rolling_decision,
+    rolling_slot_key,
+    schedule_due,
+    schedule_units,
+)
+from frigate.recap.plates import (
+    PlateFade,
+    build_timed_plates,
+    cutout_is_visible,
+    frame_is_ir,
+    gap_sample_times,
+    label_should_draw,
+    mask_centroid,
+    plate_index_at,
+    prepare_cutout,
+    recede_plate,
+)
+from frigate.recap.render import (
+    GhostFrame,
+    Tube,
+    _text_size,
+    compose_frame,
+    draw_label,
+    leader_without_ghost,
+    smooth_points,
+)
+from frigate.recap.storage import list_visible_recaps, recap_kind, remove_superseded
+
+# A green and gray daytime tone. Flat gray reads as infrared.
+DAYLIGHT = (80, 140, 70)
+
+
+def _recap_config():
+    """Load RecapConfig without importing the full Frigate config package."""
+    package = "frigate.config"
+    if package not in sys.modules:
+        module = types.ModuleType(package)
+        module.__path__ = [str(Path("frigate/config").resolve())]
+        module.__package__ = package
+        sys.modules[package] = module
+    from frigate.config.recap import RecapConfig
+
+    return RecapConfig
+
+
+def _track(
+    track_id: str,
+    label: str,
+    category: str,
+    start: float,
+    boxes: list[tuple[float, float, float, float]],
+    step: float = 1.0,
+) -> MotionTrack:
+    times = [start + index * step for index in range(len(boxes))]
+    return MotionTrack(
+        id=track_id,
+        label=label,
+        category=category,
+        start=start,
+        end=times[-1],
+        boxes=boxes,
+        times=times,
+    )
+
+
+class TestRecapLabels(unittest.TestCase):
+    def test_seconds_only_when_a_minute_is_shared(self):
+        zone = ZoneInfo("America/Chicago")
+        first = datetime(2025, 10, 7, 17, 50, 12, tzinfo=zone).timestamp()
+        second = datetime(2025, 10, 7, 17, 50, 47, tzinfo=zone).timestamp()
+        alone = datetime(2025, 10, 7, 15, 16, 4, tzinfo=zone).timestamp()
+        texts = assign_label_texts(
+            [first, second, alone],
+            [None, "got out", None],
+            zone,
+        )
+        self.assertEqual(
+            texts,
+            ["5:50:12 PM", "5:50:47 PM got out", "3:16 PM"],
+        )
+        self.assertTrue(all("(2)" not in text for text in texts))
+
+    def test_a_single_label_omits_seconds(self):
+        zone = ZoneInfo("America/Chicago")
+        moment = datetime(2025, 10, 7, 15, 16, 4, tzinfo=zone).timestamp()
+        self.assertEqual(
+            assign_label_texts([moment], [None], zone),
+            ["3:16 PM"],
+        )
+
+    def test_config_is_off_and_archive_is_optional(self):
+        RecapConfig = _recap_config()
+        config = RecapConfig()
+        self.assertFalse(config.enabled)
+        self.assertAlmostEqual(config.fade_seconds, 0.2)
+        self.assertIsNone(config.interval_minutes)
+        self.assertIsNone(RecapConfig(interval_minutes=0).interval_minutes)
+        self.assertIsNone(RecapConfig(interval_minutes="").interval_minutes)
+        self.assertEqual(RecapConfig(interval_minutes=30).interval_minutes, 30)
+        self.assertTrue(config.replace_superseded)
+        self.assertFalse(RecapConfig(replace_superseded=False).replace_superseded)
+        self.assertIsNone(config.archive.path)
+        self.assertIsNone(config.archive.url)
+        self.assertIsNone(RecapConfig(schedule="").schedule)
+        self.assertEqual(RecapConfig(schedule="2:5").schedule, "02:05")
+        self.assertEqual(RecapConfig(labels="person, dog").labels, ["person", "dog"])
+        configured = RecapConfig(
+            archive={"path": "/mnt/archive", "url": "https://archive.example/frigate/"}
+        )
+        self.assertEqual(configured.archive.path, "/mnt/archive")
+        self.assertEqual(configured.archive.url, "https://archive.example/frigate")
+        with self.assertRaises(ValueError):
+            RecapConfig(archive={"url": "ftp://nope"})
+
+
+class TestParkedCars(unittest.TestCase):
+    def test_got_out_links_a_stationary_car(self):
+        car = _track(
+            "car-1",
+            "car",
+            "vehicle",
+            900,
+            [(400, 320, 760, 500)] * 4,
+            step=30,
+        )
+        person = _track(
+            "person-1",
+            "person",
+            "person",
+            1000,
+            [
+                (520, 360, 580, 450),
+                (500, 300, 570, 470),
+                (300, 280, 370, 450),
+                (180, 280, 250, 450),
+            ],
+        )
+        links = link_parked_cars([person], [car], 1280, 720)
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0].kind, "got out")
+        self.assertEqual(links[0].vehicle_id, "car-1")
+        self.assertEqual(links[0].person_id, "person-1")
+
+    def test_walked_past_is_not_a_link(self):
+        car = _track(
+            "car-1",
+            "car",
+            "vehicle",
+            900,
+            [(400, 320, 760, 500)] * 3,
+            step=30,
+        )
+        person = _track(
+            "person-1",
+            "person",
+            "person",
+            1000,
+            [
+                (520, 280, 590, 450),
+                (300, 280, 370, 450),
+                (80, 280, 150, 450),
+            ],
+        )
+        self.assertEqual(link_parked_cars([person], [car], 1280, 720), [])
+
+    def test_edge_and_moving_cars_are_skipped(self):
+        parked = _track(
+            "car-1",
+            "car",
+            "vehicle",
+            900,
+            [(400, 320, 760, 500)] * 3,
+            step=30,
+        )
+        moving = _track(
+            "car-2",
+            "car",
+            "vehicle",
+            900,
+            [
+                (100, 320, 460, 500),
+                (500, 320, 860, 500),
+                (800, 320, 1160, 500),
+            ],
+            step=5,
+        )
+        self.assertTrue(is_stationary(parked.boxes, 1280, 720))
+        self.assertFalse(is_stationary(moving.boxes, 1280, 720))
+        leaving = _track(
+            "person-1",
+            "person",
+            "person",
+            1000,
+            [
+                (0, 360, 40, 450),
+                (20, 300, 80, 470),
+                (300, 280, 370, 450),
+            ],
+        )
+        self.assertEqual(link_parked_cars([leaving], [parked], 1280, 720), [])
+        beside = _track(
+            "person-2",
+            "person",
+            "person",
+            1000,
+            [
+                (520, 360, 580, 450),
+                (500, 300, 570, 470),
+                (180, 280, 250, 450),
+            ],
+        )
+        self.assertEqual(link_parked_cars([beside], [moving], 1280, 720), [])
+
+
+class TestLayout(unittest.TestCase):
+    def test_duplicate_tracks_merge_and_side_by_side_tracks_stay(self):
+        left = _track(
+            "a",
+            "person",
+            "person",
+            10,
+            [(100, 100, 180, 260), (110, 100, 190, 260)],
+        )
+        copy = _track(
+            "b",
+            "person",
+            "person",
+            10.1,
+            [(102, 102, 170, 250), (112, 102, 180, 250)],
+        )
+        other = _track(
+            "c",
+            "person",
+            "person",
+            10,
+            [(400, 100, 480, 260), (410, 100, 490, 260)],
+        )
+        dropped = dedupe_tracks([left, copy, other])
+        self.assertIn(1, dropped)
+        self.assertNotIn(2, dropped)
+
+    def test_schedule_caps_simultaneous_labels_and_links_start_together(self):
+        units = [
+            ScheduledUnit(
+                event_id=str(index),
+                clip_event_id=str(index),
+                label="person",
+                category="person",
+                start_time=float(index),
+                boxes=[(10, 10, 80, 160)] * 6,
+            )
+            for index in range(4)
+        ]
+        starts, length = schedule_units(units, 320, 240, 1000, max_active=2)
+
+        def concurrent(frame: int) -> int:
+            return sum(
+                1
+                for start, unit in zip(starts, units, strict=True)
+                if start <= frame < start + len(unit.boxes)
+            )
+
+        self.assertTrue(all(concurrent(frame) <= 2 for frame in range(length)))
+        person = ScheduledUnit(
+            event_id="person",
+            clip_event_id="person",
+            label="person",
+            category="person",
+            start_time=1,
+            boxes=[(10, 10, 40, 80)] * 5,
+        )
+        parked = ScheduledUnit(
+            event_id="parked",
+            clip_event_id="car",
+            label="car",
+            category="parked",
+            start_time=1,
+            boxes=[(100, 100, 200, 160)] * 5,
+            suffix="got out",
+            link_index=0,
+        )
+        linked, _total = schedule_units([person, parked], 320, 240, 100)
+        self.assertEqual(linked[0], linked[1])
+
+    def test_labels_that_share_the_screen_keep_a_gap(self):
+        box = [(400.0, 400.0, 480.0, 560.0)]
+        units = [
+            ScheduledUnit(
+                event_id="a",
+                clip_event_id="a",
+                label="person",
+                category="person",
+                start_time=1,
+                boxes=box * 4,
+            ),
+            ScheduledUnit(
+                event_id="b",
+                clip_event_id="b",
+                label="person",
+                category="person",
+                start_time=1,
+                boxes=[(420.0, 420.0, 500.0, 580.0)] * 4,
+            ),
+        ]
+        rects = plan_label_rects(
+            units,
+            [0, 0],
+            1280,
+            720,
+            text_size={0: (80, 16), 1: (80, 16)},
+            header_h=28,
+            min_gap=12,
+        )
+        self.assertFalse(_rects_hit(rects[0], rects[1], 12))
+
+    def test_short_tracks_are_repeated_until_readable(self):
+        self.assertGreaterEqual(4 * repeat_for_min_show(4, 12, 2.5), 30)
+
+
+class TestCutout(unittest.TestCase):
+    def test_connected_cart_is_included_and_a_separate_blob_is_not(self):
+        height, width = 180, 280
+        background = np.full((height, width, 3), 90, np.uint8)
+        frame = background.copy()
+        frame[8:24, 8:24] = (30, 30, 220)
+        frame[78:130, 70:190] = (0, 210, 230)
+        frame[48:88, 110:150] = (220, 60, 40)
+        frame[32:46, 68:84] = (40, 40, 220)
+        _x, _y, mask = attach_motion(
+            frame, background, (108.0, 46.0, 152.0, 92.0), "person"
+        )
+        full = np.zeros((height, width), np.uint8)
+        full[_y : _y + mask.shape[0], _x : _x + mask.shape[1]] = mask
+        self.assertGreater(float(full[90:120, 80:170].mean()), 0.4)
+        self.assertGreater(float(full[50:80, 115:145].mean()), 0.4)
+        self.assertEqual(int(full[8:24, 8:24].sum()), 0)
+        self.assertEqual(int(full[32:46, 68:84].sum()), 0)
+
+    def test_a_head_above_the_box_stays_inside_the_cutout(self):
+        height, width = 220, 200
+        plate = np.full((height, width, 3), 90, np.uint8)
+        frame = plate.copy()
+        box = (80.0, 90.0, 130.0, 180.0)
+        frame[90:180, 92:118] = (40, 60, 210)
+        # Inside the 20% band above the box. A blob much higher is not.
+        frame[74:90, 96:114] = (30, 40, 200)
+        frame[8:22, 92:118] = (20, 20, 220)
+        x, y, mask = attach_motion(frame, plate, box, "person")
+        full = np.zeros((height, width), np.uint8)
+        full[y : y + mask.shape[0], x : x + mask.shape[1]] = mask
+        self.assertGreater(float(full[74:90, 96:114].mean()), 0.4)
+        self.assertEqual(int(full[8:22, 92:118].sum()), 0)
+
+    def test_a_moving_vehicles_nose_is_not_cropped(self):
+        height, width = 160, 420
+        plate = np.full((height, width, 3), DAYLIGHT, np.uint8)
+        frames = []
+        boxes = []
+        for index in range(5):
+            frame = plate.copy()
+            x = 30 + index * 36
+            frame[50:110, x : x + 64] = (0, 0, 220)
+            frames.append(frame)
+            boxes.append((float(x), 50.0, float(x + 50), 110.0))
+        ghosts = build_cutouts(frames, boxes, "vehicle")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        sample = ghosts[2]
+        alpha = np.asarray(sample["alpha"])
+        strong = alpha > 40
+        _ys, xs = np.nonzero(strong)
+        self.assertGreater(len(xs), 10)
+        self.assertGreater(int(xs.max() - xs.min()), 56)
+
+    def test_a_jagged_outline_is_simplified(self):
+        mask = np.zeros((80, 100), np.uint8)
+        cv2.rectangle(mask, (10, 10), (70, 70), 1, -1)
+        for y in range(12, 68):
+            if y % 2 == 0:
+                mask[y, 70:78] = 1
+        smooth = _smooth_contour(mask)
+        edge = smooth[14:66, 74]
+        changes = int(np.abs(np.diff(edge.astype(np.int16))).sum())
+        self.assertLess(changes, 6)
+        self.assertGreater(int(smooth[40, 40]), 0)
+
+    def test_moving_cart_survives_the_background_plate(self):
+        height, width = 160, 320
+        plate = np.full((height, width, 3), DAYLIGHT, np.uint8)
+        frames = []
+        boxes = []
+        for index in range(6):
+            frame = plate.copy()
+            x = 20 + index * 40
+            frame[70:120, x : x + 70] = (0, 210, 230)
+            frame[40:80, x + 20 : x + 45] = (220, 60, 40)
+            frames.append(frame)
+            boxes.append((float(x + 18), 36.0, float(x + 48), 82.0))
+        ghosts = build_cutouts(frames, boxes, "person")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        self.assertEqual(len(ghosts), len(frames))
+        sample = ghosts[len(ghosts) // 2]
+        alpha = sample["alpha"]
+        self.assertGreater(int(alpha.sum()), 200)
+
+    def test_stopped_car_still_gets_a_feathered_ghost(self):
+        height, width = 180, 320
+        frames = [np.full((height, width, 3), (40, 40, 40), np.uint8) for _ in range(4)]
+        box = (100.0, 40.0, 180.0, 110.0)
+        ghosts = build_cutouts(frames, [box] * 4, "vehicle")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        self.assertEqual(len(ghosts), 4)
+        for ghost in ghosts:
+            self.assertGreater(int(np.asarray(ghost["alpha"]).sum()), 0)
+
+    def test_vehicle_gap_is_repaired_from_a_neighbor(self):
+        height, width = 180, 320
+        plate = np.full((height, width, 3), DAYLIGHT, np.uint8)
+        car = np.array((0, 0, 220), np.uint8)
+        frames = []
+        boxes = []
+        for index in range(6):
+            frame = plate.copy()
+            x = 30 + index * 28
+            if index not in (2, 3):
+                frame[50:110, x : x + 50] = car
+            frames.append(frame)
+            boxes.append((float(x), 50.0, float(x + 50), 110.0))
+        ghosts = build_cutouts(frames, boxes, "vehicle")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        self.assertEqual(len(ghosts), 6)
+        for ghost in ghosts:
+            alpha = np.asarray(ghost["alpha"])
+            crop = np.asarray(ghost["crop"])
+            strong = alpha > 40
+            self.assertGreater(int(strong.sum()), 10)
+            self.assertGreater(float(crop[strong][:, 2].mean()), 150)
+
+    def test_low_contrast_vehicle_is_not_dropped(self):
+        plate = np.full((120, 200, 3), 90, np.uint8)
+        frame = plate.copy()
+        frame[40:90, 60:140] = 80
+        _x, _y, mask = attach_motion(frame, plate, (60.0, 40.0, 140.0, 90.0), "vehicle")
+        self.assertGreater(int(mask.sum()), 20)
+
+    def test_stable_vehicle_measures_motion_once(self):
+        height, width = 120, 200
+        plate = np.full((height, width, 3), 90, np.uint8)
+        box = (40.0, 30.0, 120.0, 90.0)
+        frames = []
+        for _index in range(8):
+            frame = plate.copy()
+            frame[32:88, 42:118] = (0, 0, 210)
+            frames.append(frame)
+        with patch("frigate.recap.cutout._attach", wraps=_attach) as spy:
+            ghosts = build_cutouts(frames, [box] * 8, "vehicle")
+        self.assertEqual(spy.call_count, 1)
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        self.assertEqual(len(ghosts), 8)
+        for ghost in ghosts:
+            alpha = np.asarray(ghost["alpha"])
+            crop = np.asarray(ghost["crop"])
+            strong = alpha > 40
+            self.assertGreater(int(strong.sum()), 10)
+            self.assertGreater(float(crop[strong][:, 2].mean()), 150)
+
+    def test_moving_vehicle_is_measured_on_each_frame(self):
+        height, width = 160, 320
+        plate = np.full((height, width, 3), DAYLIGHT, np.uint8)
+        frames = []
+        boxes = []
+        for index in range(4):
+            frame = plate.copy()
+            x = 20 + index * 40
+            frame[40:100, x : x + 50] = (0, 0, 210)
+            frames.append(frame)
+            boxes.append((float(x), 40.0, float(x + 50), 100.0))
+        with patch("frigate.recap.cutout._attach", wraps=_attach) as spy:
+            ghosts = build_cutouts(frames, boxes, "vehicle")
+        self.assertEqual(spy.call_count, 4)
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        for ghost in ghosts:
+            self.assertGreater(int(np.asarray(ghost["alpha"]).sum()), 0)
+
+    def test_large_and_tiny_vehicles_stay_visible(self):
+        plate = np.full((360, 640, 3), (80, 80, 80), np.uint8)
+        frames = []
+        boxes = []
+        for index in range(4):
+            frame = plate.copy()
+            x = 40 + index * 20
+            frame[70:270, x : x + 360] = (20, 20, 200)
+            frame[20:36, 20:38] = (0, 0, 200)
+            frames.append(frame)
+            boxes.append((float(x), 70.0, float(x + 360), 270.0))
+        ghosts = build_cutouts(frames, boxes, "vehicle")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        sample = ghosts[1]
+        alpha = np.asarray(sample["alpha"])
+        crop = np.asarray(sample["crop"])
+        strong = alpha > 40
+        self.assertGreater(int(strong.sum()), 1000)
+        self.assertGreater(float(crop[strong][:, 2].mean()), 150)
+
+        tiny_plate = np.full((180, 320, 3), 90, np.uint8)
+        tiny_frames = []
+        tiny_box = (40.0, 40.0, 62.0, 58.0)
+        for _index in range(4):
+            frame = tiny_plate.copy()
+            frame[40:58, 40:62] = (0, 0, 220)
+            tiny_frames.append(frame)
+        tiny = build_cutouts(tiny_frames, [tiny_box] * 4, "vehicle")
+        self.assertIsNotNone(tiny)
+        assert tiny is not None
+        for ghost in tiny:
+            alpha = np.asarray(ghost["alpha"])
+            crop = np.asarray(ghost["crop"])
+            strong = alpha > 40
+            self.assertGreater(int(strong.sum()), 10)
+            self.assertGreater(float(crop[strong][:, 2].mean()), 150)
+
+    def test_leader_is_not_drawn_without_a_ghost(self):
+        plate = np.zeros((180, 320, 3), np.uint8)
+        box = (100.0, 40.0, 180.0, 100.0)
+        unit = ScheduledUnit(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            boxes=[box],
+            text="5:50 PM",
+        )
+        empty = GhostFrame(
+            x=100,
+            y=40,
+            box=box,
+            crop=np.zeros((60, 80, 3), np.uint8),
+            alpha=np.zeros((60, 80), np.uint8),
+        )
+        tube = Tube(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            frames=[empty],
+        )
+        rect = (10, 10, 80, 36)
+        blank = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [rect],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        vehicle = np.array((40, 165, 255), np.uint8)
+        near_tip = blank[30:48, 130:150]
+        self.assertEqual(int((near_tip == vehicle).all(axis=2).sum()), 0)
+        strong = GhostFrame(
+            x=100,
+            y=40,
+            box=box,
+            crop=np.full((60, 80, 3), (0, 0, 200), np.uint8),
+            alpha=np.full((60, 80), 255, np.uint8),
+        )
+        tube.frames = [strong]
+        drawn = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [rect],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        # The leader lands on the mask centroid, not the top of the box.
+        anchor = mask_centroid(strong.alpha, strong.x, strong.y)
+        self.assertIsNotNone(anchor)
+        assert anchor is not None
+        self.assertTrue((drawn[anchor[1], anchor[0]] == vehicle).all())
+        self.assertFalse(
+            np.array_equal(drawn[anchor[1], anchor[0]], plate[anchor[1], anchor[0]])
+        )
+
+    def test_leader_without_ghost_counts_mismatches(self):
+        self.assertEqual(leader_without_ghost([True, False], [True, False]), 0)
+        self.assertEqual(leader_without_ghost([False], [True]), 1)
+
+
+class TestArchive(unittest.TestCase):
+    def setUp(self):
+        clear_archive_cache()
+
+    def test_index_formats_and_path_rewrite(self):
+        rows = parse_index_text(
+            json.dumps(
+                {
+                    "events": [
+                        {
+                            "event_id": "1.5-aaaaaa",
+                            "camera_name": "front",
+                            "object": "person",
+                            "start_time": 1.5,
+                            "end_time": 4,
+                            "files": [
+                                "/media/frigate/recordings/2026-10-07/15/front/50.00.mp4"
+                            ],
+                        }
+                    ]
+                }
+            )
+        )
+        self.assertEqual(rows[0]["event_id"], "1.5-aaaaaa")
+        self.assertEqual(
+            rewrite_media_path(
+                "/media/frigate/recordings/2026-10-07/15/front/50.00.mp4"
+            ),
+            "recordings/2026-10-07/15/front/50.00.mp4",
+        )
+        csv_rows = parse_index_text(
+            "id,camera,label,start,end,paths\n"
+            "1.5-aaaaaa,front,person,1.5,4,recordings/a.mp4|recordings/b.mp4\n"
+        )
+        self.assertEqual(len(csv_rows), 1)
+        normalized = parse_index_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "id": "1.5-aaaaaa",
+                            "camera": "front",
+                            "paths": ["clips/a.jpg"],
+                        }
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(normalized[0]["camera"], "front")
+
+    def test_lookup_uses_the_recording_tree_and_rejects_escape(self):
+        moment = datetime(2026, 10, 7, 15, 50, 5, tzinfo=UTC).timestamp()
+        event_id = f"{moment}-abc123"
+        self.assertEqual(event_start_from_id(event_id), moment)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "secret.txt"
+            outside.write_text("nope")
+            folder = root / "recordings" / "2026-10-07" / "15" / "front"
+            folder.mkdir(parents=True)
+            (folder / "50.00.mp4").write_bytes(b"a")
+            (folder / "50.10.mp4").write_bytes(b"b")
+            (folder / "49.00.mp4").write_bytes(b"c")
+            end = moment + 15
+            covered = recordings_covering(root, "front", moment, end)
+            names = [segment.path.name for segment in covered if segment.path]
+            self.assertEqual(names, ["50.00.mp4", "50.10.mp4"])
+            index = root / "index"
+            index.mkdir()
+            (index / "2026-10-07.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": event_id,
+                            "camera": "front",
+                            "label": "person",
+                            "start": moment,
+                            "end": end,
+                            "paths": [
+                                "../../secret.txt",
+                                "/media/frigate/recordings/2026-10-07/15/front/50.00.mp4",
+                            ],
+                            "snapshot": "clips/front-" + event_id + ".jpg",
+                        }
+                    ]
+                )
+            )
+            snap = root / "clips"
+            snap.mkdir()
+            (snap / f"front-{event_id}.jpg").write_bytes(b"jpg")
+            self.assertIsNone(safe_archive_path(root, "../../secret.txt"))
+            playback = lookup_playback([ArchiveLocation(path=root)], event_id)
+            self.assertIsNotNone(playback)
+            assert playback is not None
+            files = [segment.path.name for segment in playback.segments if segment.path]
+            self.assertEqual(files, ["50.00.mp4"])
+            self.assertTrue(
+                all("secret" not in str(segment.path) for segment in playback.segments)
+            )
+            self.assertIsNotNone(playback.snapshot)
+
+    def test_dated_database_rewrites_live_paths(self):
+        moment = datetime(2026, 10, 7, 15, 50, 5, tzinfo=UTC).timestamp()
+        event_id = f"{moment}-db1234"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            day = "2026-10-07"
+            database = root / "db"
+            database.mkdir()
+            db_path = database / f"frigate-{day}.db"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                "CREATE TABLE event (id TEXT, camera TEXT, label TEXT, start_time REAL, end_time REAL)"
+            )
+            connection.execute(
+                "CREATE TABLE recordings (path TEXT, camera TEXT, start_time REAL, end_time REAL)"
+            )
+            connection.execute(
+                "INSERT INTO event VALUES (?, ?, ?, ?, ?)",
+                (event_id, "front", "car", moment, moment + 20),
+            )
+            connection.execute(
+                "INSERT INTO recordings VALUES (?, ?, ?, ?)",
+                (
+                    "/media/frigate/recordings/2026-10-07/15/front/50.00.mp4",
+                    "front",
+                    moment - 5,
+                    moment + 5,
+                ),
+            )
+            connection.commit()
+            connection.close()
+            folder = root / "recordings" / day / "15" / "front"
+            folder.mkdir(parents=True)
+            (folder / "50.00.mp4").write_bytes(b"mp4")
+            playback = lookup_playback([ArchiveLocation(path=root)], event_id)
+            self.assertIsNotNone(playback)
+            assert playback is not None
+            self.assertEqual(playback.camera, "front")
+            self.assertEqual(
+                [segment.path.name for segment in playback.segments if segment.path],
+                ["50.00.mp4"],
+            )
+
+    def test_archive_recaps_are_listed_without_hiding_local_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local_root_holder = root / "unused"
+            local_root_holder.mkdir()
+            archive = root / "archive" / "recap" / "front" / "front_20261007_abcd"
+            archive.mkdir(parents=True)
+            manifest = {
+                "id": "front_20261007_abcd",
+                "camera": "front",
+                "status": "complete",
+                "created": 10,
+            }
+            (archive / "manifest.json").write_text(json.dumps(manifest))
+            listed = list_visible_recaps([root / "archive" / "recap"])
+            match = [item for item in listed if item["id"] == "front_20261007_abcd"]
+            self.assertEqual(len(match), 1)
+            self.assertEqual(match[0]["source"], "archive")
+            self.assertEqual(match[0]["categories"], [])
+            self.assertEqual(match[0]["reason"], "")
+
+    def test_summary_keeps_schedule_day_and_category_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "front" / "front_20261007_abcd"
+            folder.mkdir(parents=True)
+            manifest = {
+                "id": "front_20261007_abcd",
+                "camera": "front",
+                "status": "complete",
+                "created": 20,
+                "reason": "schedule",
+                "event_count": 4,
+                "before": 1_700_000_000,
+                "categories": [
+                    {
+                        "key": "person",
+                        "name": "People",
+                        "color": "#3cb9ff",
+                        "count": 3,
+                    },
+                    {
+                        "key": "vehicle",
+                        "name": "Vehicles",
+                        "color": "#ffa528",
+                        "count": "1",
+                    },
+                    "skip",
+                ],
+            }
+            (folder / "manifest.json").write_text(json.dumps(manifest))
+            listed = list_visible_recaps([root])
+            match = [item for item in listed if item["id"] == "front_20261007_abcd"]
+            self.assertEqual(len(match), 1)
+            self.assertEqual(match[0]["reason"], "schedule")
+            self.assertEqual(match[0]["event_count"], 4)
+            self.assertEqual(
+                match[0]["categories"],
+                [
+                    {
+                        "key": "person",
+                        "name": "People",
+                        "color": "#3cb9ff",
+                        "count": 3,
+                    },
+                    {
+                        "key": "vehicle",
+                        "name": "Vehicles",
+                        "color": "#ffa528",
+                        "count": 1,
+                    },
+                ],
+            )
+
+    def test_events_index_and_missing_files(self):
+        moment = datetime(2026, 10, 7, 15, 0, tzinfo=UTC).timestamp()
+        event_id = f"{moment}-abc123"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events = root / "events"
+            events.mkdir()
+            first = events / "review-1.mp4"
+            second = events / "review-1b.mp4"
+            first.write_bytes(b"a")
+            second.write_bytes(b"b")
+            (events / "review-1.jpg").write_bytes(b"jpg")
+            index = root / "index"
+            index.mkdir()
+            (index / "2026-10-07.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": event_id,
+                            "camera": "front",
+                            "label": "person",
+                            "start": moment,
+                            "end": moment + 20,
+                            "paths": ["events/review-1.mp4", "events/review-1b.mp4"],
+                            "snapshot": "events/review-1.jpg",
+                        }
+                    ]
+                )
+            )
+            location = ArchiveLocation(path=root, url=None)
+            playback = lookup_playback([location], event_id)
+            self.assertIsNotNone(playback)
+            assert playback is not None
+            names = [segment.path.name for segment in playback.segments if segment.path]
+            self.assertEqual(names, ["review-1.mp4", "review-1b.mp4"])
+            ready = present_local_segments(playback.segments)
+            self.assertIsNotNone(ready)
+            assert ready is not None
+            self.assertEqual(len(ready), 2)
+            second.unlink()
+            self.assertIsNone(present_local_segments(playback.segments))
+            first.unlink()
+            gone = lookup_playback([location], event_id)
+            self.assertIsNotNone(gone)
+            assert gone is not None
+            self.assertEqual(gone.segments, [])
+            self.assertEqual(gone.message, CLIP_GONE)
+            self.assertEqual(
+                rewrite_media_path("/media/frigate/events/review-1.mp4"),
+                "events/review-1.mp4",
+            )
+
+    def test_unreadable_index_does_not_raise(self):
+        moment = datetime(2026, 10, 7, 15, 0, tzinfo=UTC).timestamp()
+        event_id = f"{moment}-abc123"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index = root / "index"
+            index.mkdir()
+            (index / "2026-10-07.json").write_bytes(b"\xff\xfe not utf-8")
+            playback = lookup_playback([ArchiveLocation(path=root, url=None)], event_id)
+            self.assertIsNone(playback)
+            (index / "2026-10-07.json").write_text("{not json", encoding="utf-8")
+            clear_archive_cache()
+            playback = lookup_playback([ArchiveLocation(path=root, url=None)], event_id)
+            self.assertIsNone(playback)
+            rows = parse_index_text("{not json")
+            self.assertEqual(rows, [])
+
+
+class TestTimezone(unittest.TestCase):
+    def test_labels_and_schedule_use_ui_timezone_not_utc(self):
+        zone = ZoneInfo("America/New_York")
+        instant = datetime(2026, 7, 15, 6, 0, 30, tzinfo=UTC)
+        local = instant.astimezone(zone)
+        self.assertEqual(local.hour, 2)
+        self.assertEqual(
+            format_clock(instant.timestamp(), zone, seconds=False), "2:00 AM"
+        )
+        self.assertEqual(
+            format_clock(instant.timestamp(), UTC, seconds=False), "6:00 AM"
+        )
+        self.assertTrue(schedule_due(local, "02:00"))
+        self.assertFalse(schedule_due(instant, "02:00"))
+        later = local.replace(minute=1, second=31)
+        self.assertFalse(schedule_due(later, "02:00"))
+        self.assertTrue(schedule_due(local.replace(minute=1, second=30), "02:00"))
+
+
+class TestNullableEventRows(unittest.TestCase):
+    """Rows shaped like a real 0.17.2 database.
+
+    ``false_positive`` is NULL because the maintainer never writes it.
+    An event that has not ended has NULL ``end_time``.
+    """
+
+    def setUp(self):
+        from playhouse.sqlite_ext import SqliteExtDatabase
+
+        from frigate.models import Event, Recordings
+
+        self.Event = Event
+        self.Recordings = Recordings
+        self._event_db = Event._meta.database
+        self._recording_db = Recordings._meta.database
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = SqliteExtDatabase(str(Path(self._tmp.name) / "frigate.db"))
+        self.db.bind([Event, Recordings])
+        self.db.connect()
+        _create_nullable_table(self.db, Event)
+        _create_nullable_table(self.db, Recordings)
+        self.after = 1_000.0
+        self.before = 4_600.0
+        self.labels = ["person", "car"]
+
+    def tearDown(self):
+        self.db.close()
+        self.Event._meta.database = self._event_db
+        self.Recordings._meta.database = self._recording_db
+        self._tmp.cleanup()
+
+    def test_null_false_positive_and_open_events_are_included(self):
+        from frigate.recap.queries import live_recordings_exist, load_events
+
+        data = {
+            "box": [0.4, 0.3, 0.1, 0.2],
+            "region": [0.2, 0.1, 0.5, 0.6],
+            "score": 0.82,
+            "top_score": 0.91,
+            "attributes": None,
+            "path_data": [[[0.45, 0.5], 1050.0], [[0.5, 0.55], 1080.0]],
+            "type": "object",
+        }
+        self._event(
+            "1050.0-person",
+            label="person",
+            start=1050.0,
+            end=1200.0,
+            has_clip=1,
+            false_positive=None,
+            sub_label=None,
+            top_score=None,
+            zones=None,
+            data=data,
+        )
+        # Explicit false still counts as a real object.
+        self._event(
+            "1300.0-car00",
+            label="car",
+            start=1300.0,
+            end=1400.0,
+            has_clip=1,
+            false_positive=0,
+            data={"box": [0.1, 0.1, 0.2, 0.2], "top_score": None},
+        )
+        # Still in progress: end_time NULL, same as a live track.
+        self._event(
+            "2000.0-open01",
+            label="person",
+            start=2000.0,
+            end=None,
+            has_clip=1,
+            false_positive=None,
+            has_snapshot=None,
+            data=None,
+        )
+        # has_clip was never written. Do not treat that as "no clip".
+        self._event(
+            "2100.0-nullcl",
+            label="person",
+            start=2100.0,
+            end=2200.0,
+            has_clip=None,
+            false_positive=None,
+        )
+        self._event(
+            "1500.0-fp0001",
+            label="person",
+            start=1500.0,
+            end=1600.0,
+            has_clip=1,
+            false_positive=1,
+        )
+        self._event(
+            "1600.0-noclip",
+            label="person",
+            start=1600.0,
+            end=1700.0,
+            has_clip=0,
+            false_positive=None,
+        )
+        self._event(
+            "0100.0-ended",
+            label="person",
+            start=100.0,
+            end=500.0,
+            has_clip=1,
+            false_positive=None,
+        )
+        self._event(
+            "1800.0-back1",
+            label="person",
+            camera="back",
+            start=1800.0,
+            end=1900.0,
+            has_clip=1,
+            false_positive=None,
+        )
+
+        found = load_events("front", self.after, self.before, self.labels)
+        by_id = {row["id"]: row for row in found}
+        self.assertEqual(
+            set(by_id),
+            {"1050.0-person", "1300.0-car00", "2000.0-open01", "2100.0-nullcl"},
+        )
+        real = by_id["1050.0-person"]
+        self.assertIsNone(real["sub_label"])
+        self.assertEqual(real["data"]["box"], [0.4, 0.3, 0.1, 0.2])
+        self.assertIsNone(real["data"]["attributes"])
+        self.assertEqual(real["data"]["top_score"], 0.91)
+        open_event = by_id["2000.0-open01"]
+        self.assertEqual(open_event["end_time"], self.before)
+        self.assertEqual(open_event["data"], {})
+        self.assertIsInstance(by_id["1300.0-car00"]["end_time"], float)
+
+        stored = self.Event.get(self.Event.id == "2000.0-open01")
+        self.assertIsNone(stored.false_positive)
+        self.assertIsNone(stored.end_time)
+        self.assertIsNone(stored.top_score)
+        self.assertIsNone(stored.zones)
+        self._recording("rec-open", start=1900.0, end=None)
+        self.assertTrue(live_recordings_exist(stored, now=self.before))
+        no_clip = self.Event.get(self.Event.id == "1600.0-noclip")
+        self.assertFalse(live_recordings_exist(no_clip, now=self.before))
+
+    def test_open_recordings_overlap_the_window(self):
+        from frigate.recap.queries import load_recordings
+
+        self._recording("rec-closed", start=1000.0, end=1060.0)
+        self._recording("rec-open", start=4000.0, end=None)
+        self._recording("rec-old", start=100.0, end=200.0)
+        self._recording("rec-back", camera="back", start=1000.0, end=1100.0)
+        rows = load_recordings("front", self.after, self.before)
+        by_path = {row["path"]: row for row in rows}
+        self.assertEqual(set(by_path), {"rec-closed", "rec-open"})
+        self.assertEqual(by_path["rec-open"]["end"], self.before)
+        self.assertEqual(by_path["rec-closed"]["start"], 1000.0)
+
+    def test_archived_open_event_still_names_recordings(self):
+        moment = datetime(2026, 10, 7, 15, 50, 5, tzinfo=UTC).timestamp()
+        event_id = f"{moment:.0f}-open01"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "db"
+            database.mkdir()
+            db_path = database / "frigate-2026-10-07.db"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                "CREATE TABLE event (id TEXT, camera TEXT, label TEXT, "
+                "start_time REAL, end_time REAL, false_positive INTEGER)"
+            )
+            connection.execute(
+                "CREATE TABLE recordings (path TEXT, camera TEXT, "
+                "start_time REAL, end_time REAL)"
+            )
+            connection.execute(
+                "INSERT INTO event VALUES (?, ?, ?, ?, ?, ?)",
+                (event_id, "front", "person", moment, None, None),
+            )
+            connection.execute(
+                "INSERT INTO recordings VALUES (?, ?, ?, ?)",
+                (
+                    "/media/frigate/recordings/2026-10-07/15/front/50.00.mp4",
+                    "front",
+                    moment - 5,
+                    None,
+                ),
+            )
+            connection.commit()
+            connection.close()
+            folder = root / "recordings" / "2026-10-07" / "15" / "front"
+            folder.mkdir(parents=True)
+            (folder / "50.00.mp4").write_bytes(b"mp4")
+            playback = lookup_playback([ArchiveLocation(path=root)], event_id)
+            self.assertIsNotNone(playback)
+            assert playback is not None
+            self.assertEqual(
+                [segment.path.name for segment in playback.segments if segment.path],
+                ["50.00.mp4"],
+            )
+
+    def _event(
+        self,
+        event_id: str,
+        label: str,
+        start: float,
+        end: float | None,
+        has_clip: int | None,
+        false_positive: int | None,
+        camera: str = "front",
+        sub_label: str | None = None,
+        top_score: float | None = None,
+        zones: str | None = None,
+        has_snapshot: int | None = 1,
+        data: dict | None = None,
+    ) -> None:
+        _insert(
+            self.db,
+            "event",
+            {
+                "id": event_id,
+                "label": label,
+                "sub_label": sub_label,
+                "camera": camera,
+                "start_time": start,
+                "end_time": end,
+                "top_score": top_score,
+                "false_positive": false_positive,
+                "zones": zones,
+                "has_clip": has_clip,
+                "has_snapshot": has_snapshot,
+                "data": None if data is None else json.dumps(data),
+            },
+        )
+
+    def _recording(
+        self,
+        path: str,
+        start: float,
+        end: float | None,
+        camera: str = "front",
+    ) -> None:
+        _insert(
+            self.db,
+            "recordings",
+            {
+                "id": path,
+                "camera": camera,
+                "path": path,
+                "start_time": start,
+                "end_time": end,
+            },
+        )
+
+
+def _create_nullable_table(db, model) -> None:
+    columns = []
+    for field in model._meta.sorted_fields:
+        name = f'"{field.column_name}"'
+        if field.primary_key:
+            columns.append(f"{name} TEXT PRIMARY KEY")
+        else:
+            columns.append(name)
+    db.execute_sql(f'CREATE TABLE "{model._meta.table_name}" ({", ".join(columns)})')
+
+
+def _insert(db, table: str, values: dict) -> None:
+    names = ", ".join(f'"{name}"' for name in values)
+    placeholders = ", ".join("?" for _ in values)
+    db.execute_sql(
+        f'INSERT INTO "{table}" ({names}) VALUES ({placeholders})',
+        list(values.values()),
+    )
+
+
+class TestClipPlayback(unittest.TestCase):
+    def test_live_clip_uses_the_vod_playlist(self):
+        urls = live_clip_urls("front", 1728330612.5, 1728330640.0, "evt-1")
+        self.assertEqual(
+            urls["clip"],
+            "vod/front/start/1728330612.5/end/1728330640/index.m3u8",
+        )
+        self.assertEqual(urls["download"], "events/evt-1/clip.mp4")
+
+    def test_archive_clip_is_faststart_h264_and_ranged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "camera.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=red:s=160x120:d=1:r=12",
+                    "-c:v",
+                    "mpeg4",
+                    str(source),
+                ],
+                check=True,
+            )
+            rendered = render_faststart_mp4(
+                "ffmpeg",
+                [ArchiveSegment(path=source, url=None, start=0, end=1)],
+                None,
+                None,
+            )
+            self.addCleanup(rendered.unlink, missing_ok=True)
+            data = rendered.read_bytes()
+            self.assertLess(data.find(b"moov"), data.find(b"mdat"))
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "csv=p=0",
+                    str(rendered),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(probe.stdout.strip(), "h264")
+            response = playable_mp4_response(rendered, "clip.mp4")
+            self.assertEqual(response.media_type, "video/mp4")
+            self.assertIn("inline", response.headers["content-disposition"])
+            messages: list[dict] = []
+
+            async def receive():
+                return {"type": "http.request"}
+
+            async def send(message):
+                messages.append(message)
+
+            asyncio.run(
+                response(
+                    {
+                        "type": "http",
+                        "http_version": "1.1",
+                        "method": "GET",
+                        "scheme": "http",
+                        "path": "/clip.mp4",
+                        "raw_path": b"/clip.mp4",
+                        "query_string": b"",
+                        "headers": [(b"range", b"bytes=0-7")],
+                        "client": ("127.0.0.1", 123),
+                        "server": ("127.0.0.1", 80),
+                    },
+                    receive,
+                    send,
+                )
+            )
+            self.assertEqual(messages[0]["status"], 206)
+            headers = {
+                key.decode().lower(): value.decode()
+                for key, value in messages[0]["headers"]
+            }
+            self.assertTrue(headers["content-type"].startswith("video/mp4"))
+            self.assertTrue(headers["content-range"].startswith("bytes 0-7/"))
+
+
+def _write_recap(root: Path, camera: str, recap_id: str, **fields) -> None:
+    folder = root / camera / recap_id
+    folder.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": recap_id,
+        "camera": camera,
+        "status": "complete",
+        "message": "Ready",
+        "created": 1,
+        "after": 0.0,
+        "before": 3600.0,
+        "reason": "manual",
+    }
+    payload.update(fields)
+    (folder / "manifest.json").write_text(json.dumps(payload))
+
+
+class TestSupersededRecaps(unittest.TestCase):
+    def test_on_demand_kind_is_window_length(self):
+        zone = ZoneInfo("America/New_York")
+        self.assertEqual(recap_kind("manual", 0, 3600, zone), "last-1h")
+        self.assertEqual(recap_kind("manual", 0, 6 * 3600, zone), "last-6h")
+        self.assertEqual(recap_kind("manual", 0, 12 * 3600, zone), "last-12h")
+        self.assertEqual(recap_kind("manual", 0, 24 * 3600, zone), "last-24h")
+        self.assertEqual(recap_kind("", 0, 24 * 3600, zone), "last-24h")
+        self.assertEqual(recap_kind("manual", 0, 3600 + 30, zone), "last-1h")
+        self.assertEqual(recap_kind("manual", 0, 3600 + 90, zone), "last-1h")
+        self.assertEqual(recap_kind("manual", 0, 3600 + 91, zone), "last-62m")
+        self.assertEqual(recap_kind("manual", 0, 90 * 60, zone), "last-90m")
+
+    def test_nightly_kind_uses_the_ui_timezone_date(self):
+        zone = ZoneInfo("America/New_York")
+        # 03:00 UTC is still the previous evening in New York.
+        before = datetime(2026, 10, 8, 3, 0, tzinfo=UTC).timestamp()
+        after = before - 24 * 3600
+        self.assertEqual(recap_kind("schedule", after, before, zone), "day:2026-10-07")
+        self.assertEqual(recap_kind("backfill", after, before, zone), "day:2026-10-07")
+        self.assertEqual(recap_kind("manual", after, before, zone), "last-24h")
+
+    def test_ready_recap_replaces_older_completed_duplicates_only(self):
+        zone = ZoneInfo("UTC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local"
+            archive = Path(tmp) / "archive"
+            root.mkdir()
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(root, "front", "front_new", created=20, kind="last-1h")
+                _write_recap(root, "front", "front_old", created=10)
+                _write_recap(root, "front", "front_same_time", created=20)
+                _write_recap(root, "front", "front_newer", created=30, kind="last-1h")
+                _write_recap(root, "front", "front_six", created=5, before=6 * 3600)
+                _write_recap(root, "door", "door_old", created=5, kind="last-1h")
+                _write_recap(
+                    root,
+                    "front",
+                    "front_failed",
+                    created=5,
+                    status="failed",
+                    message="Recap failed. Check the Frigate logs",
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_running",
+                    created=5,
+                    status="running",
+                    message="Building a background",
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_archived",
+                    created=5,
+                    source="archive",
+                    kind="last-1h",
+                )
+                archive_copy = archive / "recap" / "front" / "front_archive_copy"
+                _write_recap(
+                    archive / "recap",
+                    "front",
+                    "front_archive_copy",
+                    created=5,
+                    kind="last-1h",
+                )
+                with self.assertLogs("frigate.recap.storage", level="INFO") as logs:
+                    removed = remove_superseded("front", "front_new", zone)
+                self.assertCountEqual(removed, ["front_old", "front_same_time"])
+                kept = {
+                    "front_new",
+                    "front_newer",
+                    "front_six",
+                    "door_old",
+                    "front_failed",
+                    "front_running",
+                    "front_archived",
+                }
+                for recap_id in kept:
+                    camera = "door" if recap_id.startswith("door") else "front"
+                    self.assertTrue(
+                        (root / camera / recap_id / "manifest.json").is_file(),
+                        recap_id,
+                    )
+                self.assertFalse((root / "front" / "front_old").exists())
+                self.assertFalse((root / "front" / "front_same_time").exists())
+                self.assertTrue(
+                    (archive_copy / "manifest.json").is_file(),
+                )
+                text = "\n".join(logs.output)
+                self.assertIn(
+                    "Removed superseded recap front_old for front (last-1h)", text
+                )
+                self.assertIn(
+                    "Removed superseded recap front_same_time for front (last-1h)",
+                    text,
+                )
+
+    def test_nothing_is_deleted_before_the_new_recap_is_ready(self):
+        zone = ZoneInfo("UTC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(
+                    root,
+                    "front",
+                    "front_new",
+                    created=20,
+                    status="running",
+                    message="Looking up events",
+                )
+                _write_recap(root, "front", "front_old", created=10)
+                self.assertEqual(remove_superseded("front", "front_new", zone), [])
+                self.assertTrue(
+                    (root / "front" / "front_old" / "manifest.json").is_file()
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_new",
+                    created=20,
+                    status="complete",
+                    message="Finishing",
+                )
+                self.assertEqual(remove_superseded("front", "front_new", zone), [])
+                self.assertTrue(
+                    (root / "front" / "front_old" / "manifest.json").is_file()
+                )
+
+    def test_flag_off_keeps_duplicates(self):
+        zone = ZoneInfo("UTC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(root, "front", "front_new", created=20, kind="last-1h")
+                _write_recap(root, "front", "front_old", created=10, kind="last-1h")
+                removed = remove_superseded("front", "front_new", zone, enabled=False)
+                self.assertEqual(removed, [])
+                self.assertTrue(
+                    (root / "front" / "front_old" / "manifest.json").is_file()
+                )
+
+    def test_nightly_replaces_the_same_local_day_only(self):
+        zone = ZoneInfo("America/New_York")
+        same = datetime(2026, 10, 8, 3, 0, tzinfo=UTC).timestamp()
+        previous = datetime(2026, 10, 7, 3, 0, tzinfo=UTC).timestamp()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(
+                    root,
+                    "front",
+                    "front_new",
+                    created=50,
+                    reason="schedule",
+                    after=same - 24 * 3600,
+                    before=same,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_same_day",
+                    created=10,
+                    reason="backfill",
+                    after=same - 24 * 3600,
+                    before=same,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_previous_day",
+                    created=5,
+                    reason="schedule",
+                    after=previous - 24 * 3600,
+                    before=previous,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_manual_day",
+                    created=8,
+                    reason="manual",
+                    after=same - 24 * 3600,
+                    before=same,
+                )
+                with self.assertLogs("frigate.recap.storage", level="INFO") as logs:
+                    removed = remove_superseded("front", "front_new", zone)
+                self.assertEqual(removed, ["front_same_day"])
+                self.assertFalse((root / "front" / "front_same_day").exists())
+                self.assertTrue(
+                    (root / "front" / "front_previous_day" / "manifest.json").is_file()
+                )
+                self.assertTrue(
+                    (root / "front" / "front_manual_day" / "manifest.json").is_file()
+                )
+                self.assertTrue(
+                    (root / "front" / "front_new" / "manifest.json").is_file()
+                )
+                self.assertIn("day:2026-10-07", "\n".join(logs.output))
+
+    def test_explicit_range_is_never_a_last_n_kind(self):
+        zone = ZoneInfo("America/New_York")
+        day_start = datetime(2026, 10, 7, 0, 0, tzinfo=zone).timestamp()
+        day_end = datetime(2026, 10, 8, 0, 0, tzinfo=zone).timestamp()
+        self.assertEqual(
+            recap_kind("manual", day_start, day_end, zone, explicit=True),
+            "day:2026-10-07",
+        )
+        self.assertEqual(recap_kind("manual", day_start, day_end, zone), "last-24h")
+        spring_start = datetime(2026, 3, 8, 0, 0, tzinfo=zone).timestamp()
+        spring_end = datetime(2026, 3, 9, 0, 0, tzinfo=zone).timestamp()
+        self.assertEqual(spring_end - spring_start, 23 * 3600)
+        self.assertEqual(
+            recap_kind("manual", spring_start, spring_end, zone, explicit=True),
+            "day:2026-03-08",
+        )
+        fall_start = datetime(2026, 11, 1, 0, 0, tzinfo=zone).timestamp()
+        fall_end = datetime(2026, 11, 2, 0, 0, tzinfo=zone).timestamp()
+        self.assertEqual(fall_end - fall_start, 25 * 3600)
+        self.assertEqual(
+            recap_kind("manual", fall_start, fall_end, zone, explicit=True),
+            "day:2026-11-01",
+        )
+        before = datetime(2026, 10, 8, 3, 0, tzinfo=UTC).timestamp()
+        after = before - 24 * 3600
+        shifted = recap_kind("manual", after, before, zone, explicit=True)
+        self.assertTrue(shifted.startswith("range:"))
+        self.assertNotIn("last-", shifted)
+        self.assertEqual(
+            recap_kind("manual", 0, 6 * 3600, zone, explicit=True),
+            "range:0-21600",
+        )
+        two_days = recap_kind(
+            "manual",
+            day_start,
+            datetime(2026, 10, 9, 0, 0, tzinfo=zone).timestamp(),
+            zone,
+            explicit=True,
+        )
+        self.assertTrue(two_days.startswith("range:"))
+        utc_start = datetime(2026, 10, 8, 0, 0, tzinfo=UTC).timestamp()
+        utc_end = datetime(2026, 10, 9, 0, 0, tzinfo=UTC).timestamp()
+        self.assertTrue(
+            recap_kind("manual", utc_start, utc_end, zone, explicit=True).startswith(
+                "range:"
+            )
+        )
+        self.assertEqual(
+            recap_kind("manual", utc_start, utc_end, UTC, explicit=True),
+            "day:2026-10-08",
+        )
+        self.assertTrue(
+            recap_kind(
+                "manual", day_start + 1, day_end, zone, explicit=True
+            ).startswith("range:")
+        )
+
+    def test_backfill_day_groups_with_the_calendar_day(self):
+        zone = ZoneInfo("America/New_York")
+        start = datetime(2026, 10, 7, 0, 0, tzinfo=zone).timestamp()
+        end = datetime(2026, 10, 8, 0, 0, tzinfo=zone).timestamp()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(
+                    root,
+                    "front",
+                    "front_day",
+                    created=40,
+                    reason="manual",
+                    explicit_range=True,
+                    after=start,
+                    before=end,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_hand",
+                    created=10,
+                    kind="backfill-day:2026-10-07",
+                    after=start,
+                    before=end,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_other_day",
+                    created=9,
+                    kind="backfill-day:2026-10-06",
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_last",
+                    created=8,
+                    kind="last-24h",
+                    after=end - 24 * 3600,
+                    before=end,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_partial",
+                    created=7,
+                    kind="range:1-21601",
+                    after=1,
+                    before=21601,
+                    explicit_range=True,
+                )
+                with self.assertLogs("frigate.recap.storage", level="INFO") as logs:
+                    removed = remove_superseded("front", "front_day", zone)
+                self.assertEqual(removed, ["front_hand"])
+                self.assertFalse((root / "front" / "front_hand").exists())
+                for recap_id in (
+                    "front_day",
+                    "front_other_day",
+                    "front_last",
+                    "front_partial",
+                ):
+                    self.assertTrue(
+                        (root / "front" / recap_id / "manifest.json").is_file(),
+                        recap_id,
+                    )
+                self.assertIn(
+                    "Removed superseded recap front_hand for front (day:2026-10-07)",
+                    "\n".join(logs.output),
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_night",
+                    created=60,
+                    reason="schedule",
+                    after=end - 24 * 3600,
+                    before=datetime(2026, 10, 7, 23, 0, tzinfo=zone).timestamp(),
+                )
+                removed = remove_superseded("front", "front_night", zone)
+                self.assertEqual(removed, ["front_day"])
+                self.assertTrue(
+                    (root / "front" / "front_last" / "manifest.json").is_file()
+                )
+
+    def test_explicit_range_does_not_replace_last_n_hours(self):
+        zone = ZoneInfo("UTC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(
+                    root,
+                    "front",
+                    "front_range",
+                    created=20,
+                    reason="manual",
+                    explicit_range=True,
+                    after=100,
+                    before=100 + 6 * 3600,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_last",
+                    created=5,
+                    kind="last-6h",
+                    after=0,
+                    before=6 * 3600,
+                )
+                self.assertEqual(
+                    remove_superseded("front", "front_range", zone),
+                    [],
+                )
+                self.assertTrue(
+                    (root / "front" / "front_last" / "manifest.json").is_file()
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_again",
+                    created=30,
+                    kind="range:100-21700",
+                    after=100,
+                    before=100 + 6 * 3600,
+                    explicit_range=True,
+                )
+                removed = remove_superseded("front", "front_again", zone)
+                self.assertEqual(removed, ["front_range"])
+                self.assertTrue(
+                    (root / "front" / "front_last" / "manifest.json").is_file()
+                )
+
+
+class TestRecapOrder(unittest.TestCase):
+    def test_window_end_then_creation_time_across_cameras(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local"
+            archive = Path(tmp) / "archive"
+            root.mkdir()
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(root, "door", "door_same_end", before=300, created=1)
+                _write_recap(root, "front", "front_same_end", before=300, created=9)
+                _write_recap(
+                    root, "front", "front_older_window", before=100, created=50
+                )
+                _write_recap(root, "yard", "yard_newest", before=400, created=2)
+                _write_recap(
+                    archive,
+                    "front",
+                    "front_archive_later",
+                    before=500,
+                    created=1,
+                )
+                listed = list_visible_recaps([archive])
+                self.assertEqual(
+                    [item["id"] for item in listed],
+                    [
+                        "front_archive_later",
+                        "yard_newest",
+                        "front_same_end",
+                        "door_same_end",
+                        "front_older_window",
+                    ],
+                )
+
+
+class TestIntervalRecap(unittest.TestCase):
+    def test_kind_is_the_interval_not_last_n_hours(self):
+        zone = ZoneInfo("America/New_York")
+        self.assertEqual(recap_kind("interval", 0, 30 * 60, zone), "rolling-30m")
+        self.assertEqual(recap_kind("interval", 0, 90 * 60, zone), "rolling-90m")
+        self.assertEqual(recap_kind("manual", 0, 30 * 60, zone), "last-30m")
+
+    def test_slot_follows_the_local_clock_and_does_not_queue(self):
+        zone = ZoneInfo("America/New_York")
+        ten = datetime(2026, 10, 9, 10, 0, tzinfo=zone)
+        self.assertEqual(rolling_slot_key(ten, 30), "2026-10-09:20")
+        self.assertEqual(
+            rolling_slot_key(ten.replace(minute=29, second=59), 30),
+            "2026-10-09:20",
+        )
+        self.assertEqual(rolling_slot_key(ten.replace(minute=30), 30), "2026-10-09:21")
+        self.assertEqual(
+            rolling_slot_key(ten.replace(hour=0, minute=0), 30),
+            "2026-10-09:0",
+        )
+        self.assertEqual(rolling_decision(False, False), "start")
+        self.assertEqual(rolling_decision(False, True), "skip")
+        self.assertEqual(rolling_decision(True, False), "wait")
+        self.assertEqual(rolling_decision(True, True), "wait")
+
+    def test_a_ready_interval_recap_replaces_only_that_kind(self):
+        zone = ZoneInfo("UTC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("frigate.recap.storage.RECAP_DIR", str(root)):
+                _write_recap(
+                    root,
+                    "front",
+                    "front_new",
+                    created=20,
+                    reason="interval",
+                    after=0,
+                    before=30 * 60,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_old",
+                    created=5,
+                    kind="rolling-30m",
+                    after=0,
+                    before=30 * 60,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_last",
+                    created=4,
+                    kind="last-30m",
+                    after=0,
+                    before=30 * 60,
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_hour",
+                    created=3,
+                    kind="rolling-60m",
+                )
+                _write_recap(
+                    root,
+                    "front",
+                    "front_standing",
+                    created=6,
+                    reason="rolling",
+                    kind="rolling",
+                    after=0,
+                    before=6 * 3600,
+                )
+                _write_recap(
+                    root,
+                    "door",
+                    "door_rolling",
+                    created=2,
+                    kind="rolling-30m",
+                )
+                removed = remove_superseded("front", "front_new", zone)
+                self.assertEqual(removed, ["front_old"])
+                for recap_id in (
+                    "front_new",
+                    "front_last",
+                    "front_hour",
+                    "front_standing",
+                    "door_rolling",
+                ):
+                    camera = "door" if recap_id.startswith("door") else "front"
+                    self.assertTrue(
+                        (root / camera / recap_id / "manifest.json").is_file(),
+                        recap_id,
+                    )
+
+
+def _color_frame(height: int, width: int, tone: tuple[int, int, int]) -> np.ndarray:
+    frame = np.zeros((height, width, 3), np.uint8)
+    frame[: height // 2] = (210, 140, 70)
+    frame[height // 2 :] = tone
+    return frame
+
+
+def _ir_frame(height: int, width: int, level: int) -> np.ndarray:
+    return np.full((height, width, 3), level, np.uint8)
+
+
+class TestLightingPlates(unittest.TestCase):
+    def test_color_and_infrared_are_not_mixed(self):
+        day = [
+            (0.0, _color_frame(40, 60, (40, 160, 40))),
+            (600.0, _color_frame(40, 60, (50, 170, 40))),
+            (1200.0, _color_frame(40, 60, (40, 150, 30))),
+        ]
+        night = [
+            (3600.0, _ir_frame(40, 60, 28)),
+            (4200.0, _ir_frame(40, 60, 32)),
+        ]
+        plates = build_timed_plates(day + night)
+        self.assertEqual([plate.is_ir for plate in plates], [False, True])
+        self.assertFalse(frame_is_ir(plates[0].image))
+        self.assertTrue(frame_is_ir(plates[1].image))
+        # The daytime plate keeps the green ground instead of the night gray.
+        self.assertGreater(int(plates[0].image[-1, -1, 1]), 100)
+
+    def test_plate_follows_the_lighting_period_then_the_nearest_time(self):
+        samples = []
+        for moment in (0, 600, 1200, 1800, 2400, 3000):
+            samples.append((float(moment), _color_frame(20, 30, (40, 150, 40))))
+        for moment in (3600, 4200, 4800):
+            samples.append((float(moment), _ir_frame(20, 30, 30)))
+        plates = build_timed_plates(samples)
+        self.assertGreaterEqual(len(plates), 3)
+        self.assertFalse(plates[plate_index_at(plates, 1000)].is_ir)
+        self.assertFalse(plates[plate_index_at(plates, 2000)].is_ir)
+        # Halfway between the last day sample (3000) and the first night (3600).
+        self.assertFalse(plates[plate_index_at(plates, 3200)].is_ir)
+        self.assertTrue(plates[plate_index_at(plates, 3400)].is_ir)
+        self.assertTrue(plates[plate_index_at(plates, 4600)].is_ir)
+        early = plate_index_at(plates, 200)
+        later = plate_index_at(plates, 2800)
+        self.assertLess(plates[early].time, plates[later].time)
+
+    def test_a_car_in_a_thin_half_hour_is_not_half_there(self):
+        # Recording holes left a half hour two samples, one with an SUV
+        # braking at the stop sign. Their mean was a see-through SUV, drawn
+        # for as long as that plate was.
+        road = _color_frame(20, 30, (40, 150, 40))
+        car = road.copy()
+        car[12:18, 10:20] = (0, 0, 220)
+        samples = [(0.0, road), (600.0, car)] + [
+            (float(moment), road) for moment in (1800, 2400, 3000)
+        ]
+        plates = build_timed_plates(samples)
+        self.assertEqual(len(plates), 1)
+        np.testing.assert_array_equal(plates[0].image[15, 15], road[15, 15])
+
+    def test_two_samples_are_never_blended(self):
+        road = _color_frame(20, 30, (40, 150, 40))
+        car = road.copy()
+        car[12:18, 10:20] = (0, 0, 220)
+        for first, second in ((road, car), (car, road)):
+            plates = build_timed_plates([(0.0, first), (600.0, second)])
+            np.testing.assert_array_equal(plates[0].image, first)
+
+    def test_an_even_count_leaves_the_odd_one_out(self):
+        road = _color_frame(20, 30, (40, 150, 40))
+        car = road.copy()
+        car[12:18, 10:20] = (0, 0, 220)
+        wet = road.copy()
+        wet[10:] = (30, 110, 30)
+        samples = [(0.0, road), (500.0, car), (1000.0, road), (1500.0, wet)]
+        plates = build_timed_plates(samples)
+        self.assertEqual(len(plates), 1)
+        pixel = plates[0].image[15, 15]
+        self.assertTrue(
+            any(np.array_equal(pixel, frame[15, 15]) for frame in (road, car, wet)),
+            pixel,
+        )
+
+    def test_lighting_gap_asks_for_the_midpoint(self):
+        samples = [
+            (0.0, _color_frame(16, 16, (40, 140, 40))),
+            (600.0, _ir_frame(16, 16, 20)),
+        ]
+        self.assertEqual(gap_sample_times(samples), [300.0])
+        self.assertEqual(
+            gap_sample_times(
+                [
+                    (0.0, _ir_frame(16, 16, 20)),
+                    (600.0, _ir_frame(16, 16, 25)),
+                ]
+            ),
+            [],
+        )
+
+    def test_plate_crossfade_covers_about_half_a_second(self):
+        fade = PlateFade(6)
+        self.assertEqual(fade.step(0), (0, None, 1.0))
+        current, previous, amount = fade.step(1)
+        self.assertEqual((current, previous), (1, 0))
+        self.assertAlmostEqual(amount, 1 / 6)
+        amounts = [amount]
+        for _ in range(5):
+            current, previous, amount = fade.step(1)
+            amounts.append(amount)
+            self.assertEqual(current, 1)
+        self.assertEqual(previous, 0)
+        self.assertAlmostEqual(amounts[-1], 1.0)
+        self.assertEqual(fade.step(1), (1, None, 1.0))
+
+    def test_color_cutout_on_an_infrared_plate_turns_gray_but_keeps_its_light(self):
+        crop = np.zeros((40, 50, 3), np.uint8)
+        crop[8:32, 10:40] = (30, 40, 220)
+        alpha = np.zeros((40, 50), np.uint8)
+        alpha[8:32, 10:40] = 255
+        fitted = prepare_cutout(crop, alpha, plate_is_ir=True)
+        body = fitted[8:32, 10:40].astype(np.int16)
+        # Gray: the three channels sit together, unlike the red source.
+        spread = int(np.max(body, axis=2).max() - np.min(body, axis=2).min())
+        self.assertLess(spread, 12)
+        # The brightness is the object's own. Matching it to a dark plate
+        # is what made night cars the same gray as the road.
+        own = float(cv2.cvtColor(crop[8:32, 10:40], cv2.COLOR_BGR2GRAY).mean())
+        self.assertAlmostEqual(float(body.mean()), own, delta=2)
+
+    def test_daylight_and_infrared_cutouts_are_drawn_as_recorded(self):
+        crop = np.full((40, 50, 3), (80, 150, 60), np.uint8)
+        crop[8:32, 10:40] = (40, 80, 200)
+        alpha = np.zeros((40, 50), np.uint8)
+        alpha[8:32, 10:40] = 255
+        self.assertTrue(
+            np.array_equal(prepare_cutout(crop, alpha, plate_is_ir=False), crop)
+        )
+        gray = np.full((40, 50, 3), 70, np.uint8)
+        gray[8:32, 10:40] = 160
+        self.assertTrue(
+            np.array_equal(prepare_cutout(gray, alpha, plate_is_ir=True), gray)
+        )
+
+    def test_empty_mask_and_edge_box_get_no_label(self):
+        plate = np.zeros((180, 320, 3), np.uint8)
+        box = (100.0, 40.0, 180.0, 120.0)
+        unit = ScheduledUnit(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            boxes=[box],
+            text="6:09 PM",
+        )
+        empty = GhostFrame(
+            x=100,
+            y=40,
+            box=box,
+            crop=np.zeros((80, 80, 3), np.uint8),
+            alpha=np.zeros((80, 80), np.uint8),
+        )
+        tube = Tube(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            frames=[empty],
+        )
+        rect = (10, 10, 90, 40)
+        vehicle = np.array((40, 165, 255), np.uint8)
+
+        def orange(image: np.ndarray) -> int:
+            return int((image == vehicle).all(axis=2).sum())
+
+        blank = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [rect],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        self.assertEqual(orange(blank), 0)
+        visible, _tip = cutout_is_visible(empty.alpha, box, 100, 40, 320, 180)
+        self.assertFalse(visible)
+
+        edge_box = (300.0, 40.0, 460.0, 140.0)
+        edge = GhostFrame(
+            x=300,
+            y=40,
+            box=edge_box,
+            crop=np.full((80, 20, 3), (20, 20, 20), np.uint8),
+            alpha=np.full((80, 20), 255, np.uint8),
+        )
+        unit.boxes = [edge_box]
+        tube.frames = [edge]
+        edged = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [rect],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        self.assertEqual(orange(edged), 0)
+
+    def test_night_cutout_has_no_outline_and_the_leader_hits_the_object(self):
+        plate = _ir_frame(180, 320, 30)
+        box = (80.0, 20.0, 200.0, 150.0)
+        alpha = np.zeros((90, 100), np.uint8)
+        # The detector box reaches into the top of the frame. The car itself
+        # is only the lower part of the crop, which is what the line must hit.
+        alpha[40:88, 10:90] = 255
+        crop = np.full((90, 100, 3), 25, np.uint8)
+        # The body has to differ from the plate. A mask that matches the
+        # plate is background and is not drawn.
+        crop[40:88, 10:90] = (110, 110, 110)
+        ghost = GhostFrame(x=90, y=30, box=box, crop=crop, alpha=alpha)
+        unit = ScheduledUnit(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            boxes=[box],
+            text="6:09 PM",
+        )
+        tube = Tube(
+            event_id="car",
+            clip_event_id="car",
+            label="car",
+            category="vehicle",
+            start_time=0.0,
+            frames=[ghost],
+        )
+        drawn = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [(8, 8, 80, 36)],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        edge = drawn[80:110, 96:100].astype(np.int16)
+        # Just left of the car body there is no colored outline any more
+        # (OUTLINE_STYLE "none"): the plate stays gray, red no stronger than blue.
+        self.assertLess(float(edge[:, :, 2].mean()), float(edge[:, :, 0].mean()) + 10)
+        # The old leader aimed at the box top (y=20). That row stays the plate.
+        canopy = drawn[16:24, 130:160].astype(np.int16)
+        self.assertLess(float(canopy[:, :, 2].mean()), 40)
+        # The dot sits on the car, at the centroid of the mask that was drawn.
+        anchor = mask_centroid(solid_feather(ghost.alpha), ghost.x, ghost.y)
+        self.assertIsNotNone(anchor)
+        assert anchor is not None
+        self.assertGreater(int(drawn[anchor[1], anchor[0], 2]), 70)
+        self.assertFalse(
+            np.array_equal(drawn[anchor[1], anchor[0]], plate[anchor[1], anchor[0]])
+        )
+
+    def test_a_mask_must_touch_the_box_but_may_extend_past_it(self):
+        alpha = np.zeros((80, 40), np.uint8)
+        alpha[10:70, 5:35] = 255
+        visible, tip = cutout_is_visible(
+            alpha, (10.0, 10.0, 50.0, 40.0), 10, 10, 200, 200
+        )
+        self.assertTrue(visible)
+        self.assertIsNotNone(tip)
+        missed = np.zeros((40, 40), np.uint8)
+        missed[5:35, 5:35] = 255
+        visible, tip = cutout_is_visible(
+            missed, (100.0, 100.0, 140.0, 140.0), 0, 0, 200, 200
+        )
+        self.assertFalse(visible)
+        self.assertIsNone(tip)
+
+    def test_cutout_interior_is_opaque_and_the_plate_recedes(self):
+        soft = np.zeros((80, 80), np.uint8)
+        soft[20:60, 20:60] = 90
+        hardened = solid_feather(soft)
+        self.assertEqual(int(hardened[40, 40]), 255)
+        self.assertEqual(int(hardened[10, 40]), 0)
+        # The ramp stays on the rim, not across the whole car.
+        self.assertEqual(int(hardened[28, 40]), 255)
+        self.assertLess(int(hardened[18, 40]), 255)
+
+        plate = np.full((180, 320, 3), (80, 160, 70), np.uint8)
+        quiet = recede_plate(plate)
+        src_luma = float(cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY).mean())
+        dst_luma = float(cv2.cvtColor(quiet, cv2.COLOR_BGR2GRAY).mean())
+        self.assertAlmostEqual(dst_luma / src_luma, 0.82, delta=0.05)
+        src_sat = float(cv2.cvtColor(plate, cv2.COLOR_BGR2HSV)[..., 1].mean())
+        dst_sat = float(cv2.cvtColor(quiet, cv2.COLOR_BGR2HSV)[..., 1].mean())
+        self.assertAlmostEqual(dst_sat / src_sat, 0.82, delta=0.06)
+
+        box = (100.0, 40.0, 180.0, 120.0)
+        crop = np.full((80, 80, 3), (40, 90, 210), np.uint8)
+        # People were 0.84, vehicles 0.72, and parked cars 0.95. Bikes are
+        # vehicles. All of them have to land fully opaque, not just cars.
+        for category, label in (
+            ("person", "person"),
+            ("animal", "dog"),
+            ("delivery", "package"),
+            ("vehicle", "bicycle"),
+            ("parked", "car"),
+        ):
+            ghost = GhostFrame(
+                x=100,
+                y=40,
+                box=box,
+                crop=crop,
+                alpha=np.full((80, 80), 100, np.uint8),
+            )
+            unit = ScheduledUnit(
+                event_id=label,
+                clip_event_id=label,
+                label=label,
+                category=category,
+                start_time=0.0,
+                boxes=[box],
+                text="4:40 PM",
+            )
+            tube = Tube(
+                event_id=label,
+                clip_event_id=label,
+                label=label,
+                category=category,
+                start_time=0.0,
+                frames=[ghost],
+            )
+            drawn = compose_frame(
+                plate,
+                [unit],
+                [tube],
+                [0],
+                [(8, 8, 90, 36)],
+                0,
+                header="",
+                header_h=0,
+                fade_frames=1,
+                label_opacity=0.5,
+                font_scale=1.0,
+                repeats=[1],
+            )
+            center = drawn[70, 140].astype(int)
+            self.assertGreater(int(center[2]), 180, category)
+            self.assertLess(int(center[0]), 80, category)
+            self.assertTrue(np.array_equal(drawn[170, 300], quiet[170, 300]), category)
+
+    def test_off_frame_box_does_not_become_a_cutout(self):
+        frame = _ir_frame(100, 160, 80)
+        box = (140.0, 20.0, 220.0, 90.0)
+        ghosts = build_cutouts([frame.copy() for _ in range(4)], [box] * 4, "vehicle")
+        self.assertIsNotNone(ghosts)
+        assert ghosts is not None
+        for ghost in ghosts:
+            self.assertEqual(int(np.asarray(ghost["alpha"]).sum()), 0)
+
+    def test_day_vehicle_mask_is_not_rewritten(self):
+        # A daylight box that includes road must stay the stored mask.
+        # Infrared tightening is what turned these into pale ovals.
+        plate = np.full((180, 320, 3), (70, 140, 60), np.uint8)
+        box = (80.0, 40.0, 200.0, 140.0)
+        crop = np.full((100, 120, 3), (70, 140, 60), np.uint8)
+        crop[30:80, 20:90] = (40, 80, 210)
+        alpha = np.full(crop.shape[:2], 255, np.uint8)
+        ghost = GhostFrame(x=80, y=40, box=box, crop=crop, alpha=alpha)
+        drawn = _frame(plate, ghost, box, "vehicle", "car")
+        quiet = recede_plate(plate)
+        # Road inside the stored mask is still painted, not stripped.
+        self.assertFalse(np.array_equal(drawn[50, 90], quiet[50, 90]))
+        # The car body stays solid red, not a washed difference blob.
+        self.assertGreater(int(drawn[90, 140, 2]), 150)
+
+
+def _frame(
+    plate: np.ndarray,
+    ghost: GhostFrame,
+    box: tuple[float, float, float, float],
+    category: str = "vehicle",
+    label: str = "car",
+) -> np.ndarray:
+    unit = ScheduledUnit(
+        event_id=label,
+        clip_event_id=label,
+        label=label,
+        category=category,
+        start_time=0.0,
+        boxes=[box],
+        text="8:19 PM",
+    )
+    tube = Tube(
+        event_id=label,
+        clip_event_id=label,
+        label=label,
+        category=category,
+        start_time=0.0,
+        frames=[ghost],
+    )
+    return compose_frame(
+        plate,
+        [unit],
+        [tube],
+        [0],
+        [(8, 8, 80, 36)],
+        0,
+        header="",
+        header_h=0,
+        fade_frames=1,
+        label_opacity=0.5,
+        font_scale=1.0,
+        repeats=[1],
+    )
+
+
+def _vehicle_frame(
+    plate: np.ndarray,
+    ghost: GhostFrame,
+    box: tuple[float, float, float, float],
+) -> np.ndarray:
+    return _frame(plate, ghost, box)
+
+
+def _checker(height: int, width: int, dark: int, light: int) -> np.ndarray:
+    """A car body with edges, so it is not rejected as lit ground."""
+    image = np.full((height, width, 3), dark, np.uint8)
+    image[::2, ::2] = light
+    return image
+
+
+class TestLeaders(unittest.TestCase):
+    def test_a_jittering_end_point_glides(self):
+        jitter = [
+            (100 + 4 * index, 50 + (12 if index % 2 else -12)) for index in range(15)
+        ]
+        smooth = smooth_points(jitter, 3)
+        steps = [abs(b[1] - a[1]) for a, b in zip(smooth[3:-3], smooth[4:-3])]
+        self.assertLessEqual(max(steps), 4)
+
+    def test_a_steady_walk_is_not_moved(self):
+        walk = [(100 + 4 * index, 50 + 2 * index) for index in range(15)]
+        self.assertEqual(smooth_points(walk, 3)[3:-3], walk[3:-3])
+
+    def test_frames_without_a_mask_stay_empty(self):
+        points = [(10, 10), None, (14, 10)]
+        # Nearer points weigh more.
+        self.assertEqual(smooth_points(points, 3), [(11, 10), None, (13, 10)])
+
+
+class TestDrawOrder(unittest.TestCase):
+    def test_the_person_nearer_the_camera_is_drawn_on_top(self):
+        # She walked in front of him: her box reaches lower in the frame. He
+        # started first, and drawn last he covered her.
+        plate = np.full((180, 320, 3), (80, 140, 70), np.uint8)
+        units, tubes = [], []
+        for name, box, color in (
+            ("woman", (110.0, 60.0, 170.0, 150.0), (200, 0, 0)),
+            ("man", (100.0, 30.0, 160.0, 90.0), (0, 0, 200)),
+        ):
+            units.append(
+                ScheduledUnit(
+                    event_id=name,
+                    clip_event_id=name,
+                    label="person",
+                    category="person",
+                    start_time=0.0,
+                    boxes=[box],
+                    text="5:50 PM",
+                )
+            )
+            tubes.append(
+                Tube(
+                    event_id=name,
+                    clip_event_id=name,
+                    label="person",
+                    category="person",
+                    start_time=0.0,
+                    frames=[
+                        GhostFrame(
+                            x=int(box[0]),
+                            y=int(box[1]),
+                            box=box,
+                            crop=np.full(
+                                (int(box[3] - box[1]), int(box[2] - box[0]), 3),
+                                color,
+                                np.uint8,
+                            ),
+                            alpha=np.full(
+                                (int(box[3] - box[1]), int(box[2] - box[0])),
+                                255,
+                                np.uint8,
+                            ),
+                        )
+                    ],
+                )
+            )
+        frame = compose_frame(
+            plate,
+            units,
+            tubes,
+            [0, 0],
+            [(10, 10, 80, 36), (200, 10, 270, 36)],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1, 1],
+        )
+        # Where the two overlap, the pixel is hers.
+        self.assertGreater(int(frame[75, 140][0]), 150)
+        self.assertLess(int(frame[75, 140][2]), 60)
+
+    def test_no_object_gets_a_rectangle(self):
+        plate = np.full((180, 320, 3), (80, 140, 70), np.uint8)
+        box = (100.0, 40.0, 140.0, 120.0)
+        unit = ScheduledUnit(
+            event_id="walker",
+            clip_event_id="walker",
+            label="person",
+            category="person",
+            start_time=0.0,
+            boxes=[box],
+            text="5:50 PM",
+        )
+        tube = Tube(
+            event_id="walker",
+            clip_event_id="walker",
+            label="person",
+            category="person",
+            start_time=0.0,
+            frames=[
+                GhostFrame(
+                    x=100,
+                    y=40,
+                    box=box,
+                    crop=np.full((80, 40, 3), (40, 40, 40), np.uint8),
+                    alpha=np.full((80, 40), 255, np.uint8),
+                )
+            ],
+        )
+        frame = compose_frame(
+            plate,
+            [unit],
+            [tube],
+            [0],
+            [(200, 10, 270, 36)],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1],
+        )
+        # Where the rectangle used to be, 4 px outside the cutout at mid-height,
+        # the background shows, the same as far from the walker, and nothing in
+        # the person color (Sampson, 2026-10-14: no boxes, OUTLINE_STYLE "none").
+        color = np.array(CAT_COLOR["person"], np.int16)
+        edge = frame[80, 96].astype(np.int16)
+        background = frame[150, 20].astype(np.int16)
+        self.assertLess(int(np.abs(edge - background).max()), 10)
+        self.assertGreater(int(np.abs(edge - color).max()), 60)
+
+
+class TestNightAndLabels(unittest.TestCase):
+    def test_a_night_ghost_close_to_the_plate_keeps_its_label(self):
+        # A dark car on a dark road used to lose its label and leader.
+        plate = _ir_frame(180, 320, 40)
+        box = (80.0, 40.0, 200.0, 140.0)
+        crop = plate[40:140, 80:200].copy()
+        crop[30:80, 20:100] = 52
+        alpha = np.full(crop.shape[:2], 255, np.uint8)
+        ghost = GhostFrame(x=80, y=40, box=box, crop=crop, alpha=alpha, window=True)
+        drawn = _vehicle_frame(plate, ghost, box)
+        vehicle = np.array((40, 165, 255), np.uint8)
+        self.assertGreater(int((drawn == vehicle).all(axis=2).sum()), 20)
+
+    def test_day_person_is_not_tightened(self):
+        plate = np.full((180, 320, 3), (80, 150, 70), np.uint8)
+        box = (100.0, 40.0, 180.0, 140.0)
+        crop = plate[40:140, 100:180].copy()
+        crop[20:90, 15:65] = (40, 70, 210)
+        alpha = np.full(crop.shape[:2], 255, np.uint8)
+        ghost = GhostFrame(x=100, y=40, box=box, crop=crop, alpha=alpha)
+        drawn = _frame(plate, ghost, box, "person", "person")
+        quiet = recede_plate(plate)
+        # Plate-colored corners of the stored mask are still painted.
+        self.assertFalse(np.array_equal(drawn[50, 110], quiet[50, 110]))
+        self.assertGreater(int(drawn[70, 125, 2]), 150)
+
+    def test_a_faint_cutout_keeps_its_label_and_a_speck_does_not(self):
+        plate = np.full((180, 320, 3), (80, 140, 70), np.uint8)
+        vehicle = np.array((40, 165, 255), np.uint8)
+        faint_box = (80.0, 40.0, 150.0, 110.0)
+        faint_crop = np.full((70, 70, 3), (82, 142, 74), np.uint8)
+        faint_alpha = np.full((70, 70), 255, np.uint8)
+        self.assertTrue(label_should_draw(faint_alpha))
+        faint = GhostFrame(
+            x=80, y=40, box=faint_box, crop=faint_crop, alpha=faint_alpha
+        )
+        drawn = _vehicle_frame(plate, faint, faint_box)
+        self.assertGreater(int((drawn == vehicle).all(axis=2).sum()), 20)
+        # A few dozen pixels is a speck. It can be drawn, but no label
+        # points at it. Objects too small to see are left out earlier.
+        self.assertFalse(label_should_draw(np.full((6, 7), 255, np.uint8)))
+
+    def test_label_text_is_drawn_once(self):
+        image = np.full((100, 400, 3), 18, np.uint8)
+        text = "6:45:18 AM"
+        rect = (16, 20, 280, 78)
+        scale, thickness = 0.6, 1
+        draw_label(image, text, rect, (40, 165, 255), scale, thickness, 0.8, "vehicle")
+        gray = image.max(axis=2)
+        icon = max(8, (rect[3] - rect[1]) - 6)
+        tx = rect[0] + icon + 8
+        text_w, _text_h = _text_size(text, scale, thickness)
+        body = gray[rect[1] : rect[3], tx : tx + text_w]
+        self.assertGreater(int((body > 180).sum()), 30)
+        # Past the measured string, the chip stays dark. A second "AM"
+        # would light this strip.
+        tail = gray[rect[1] + 6 : rect[3] - 6, tx + text_w + 4 : rect[2] - 4]
+        self.assertLess(int((tail > 80).sum()), 4)
+
+    def test_label_anchor_lies_on_the_rendered_mask(self):
+        plate = np.full((180, 320, 3), (90, 150, 80), np.uint8)
+        # Trees fill the top of the box. The car is only the lower mask.
+        box = (70.0, 10.0, 190.0, 150.0)
+        crop = plate[20:140, 80:180].copy()
+        crop[:30] = (40, 90, 50)
+        alpha = np.zeros(crop.shape[:2], np.uint8)
+        alpha[40:110, 15:85] = 255
+        crop[40:110, 15:85] = (30, 40, 210)
+        ghost = GhostFrame(x=80, y=20, box=box, crop=crop, alpha=alpha)
+        drawn = _vehicle_frame(plate, ghost, box)
+        quiet = recede_plate(plate)
+        anchor = mask_centroid(solid_feather(alpha), ghost.x, ghost.y)
+        self.assertIsNotNone(anchor)
+        assert anchor is not None
+        self.assertFalse(
+            np.array_equal(drawn[anchor[1], anchor[0]], quiet[anchor[1], anchor[0]])
+        )
+        # The old leader ended in the trees at the top of the box.
+        self.assertTrue(np.array_equal(drawn[24, 130], quiet[24, 130]))
+        # A second, empty-street cutout does not get a label either.
+        distant_box = (20.0, 20.0, 27.0, 26.0)
+        distant = GhostFrame(
+            x=20,
+            y=20,
+            box=distant_box,
+            crop=np.full((6, 7, 3), (20, 20, 200), np.uint8),
+            alpha=np.full((6, 7), 255, np.uint8),
+        )
+        both = compose_frame(
+            plate,
+            [
+                ScheduledUnit(
+                    event_id="near",
+                    clip_event_id="near",
+                    label="car",
+                    category="vehicle",
+                    start_time=0.0,
+                    boxes=[box],
+                    text="4:59 PM",
+                ),
+                ScheduledUnit(
+                    event_id="far",
+                    clip_event_id="far",
+                    label="car",
+                    category="vehicle",
+                    start_time=0.0,
+                    boxes=[distant_box],
+                    text="5:03 PM",
+                ),
+            ],
+            [
+                Tube(
+                    event_id="near",
+                    clip_event_id="near",
+                    label="car",
+                    category="vehicle",
+                    start_time=0.0,
+                    frames=[ghost],
+                ),
+                Tube(
+                    event_id="far",
+                    clip_event_id="far",
+                    label="car",
+                    category="vehicle",
+                    start_time=0.0,
+                    frames=[distant],
+                ),
+            ],
+            [0, 0],
+            [(8, 8, 80, 36), (200, 8, 280, 36)],
+            0,
+            header="",
+            header_h=0,
+            fade_frames=1,
+            label_opacity=0.5,
+            font_scale=1.0,
+            repeats=[1, 1],
+        )
+        self.assertFalse(
+            np.array_equal(both[anchor[1], anchor[0]], quiet[anchor[1], anchor[0]])
+        )
+        self.assertTrue(np.array_equal(both[24, 130], quiet[24, 130]))
+        # The far label chip would be orange. That corner stays the plate.
+        self.assertTrue(np.array_equal(both[16, 230], quiet[16, 230]))
+
+
+if __name__ == "__main__":
+    unittest.main()

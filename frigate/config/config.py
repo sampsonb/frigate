@@ -69,6 +69,7 @@ from .mqtt import MqttConfig
 from .network import NetworkingConfig
 from .profile import ProfileDefinitionConfig
 from .proxy import ProxyConfig
+from .recap import RecapConfig
 from .telemetry import TelemetryConfig
 from .tls import TlsConfig
 from .ui import UIConfig
@@ -563,6 +564,9 @@ class FrigateConfig(FrigateBaseModel):
         title="Review",
         description="Settings that control alerts, detections, and GenAI review summaries used by the UI and storage.",
     )
+    recap: RecapConfig = Field(
+        default_factory=RecapConfig, title="Video synopsis (recap) configuration."
+    )
     snapshots: SnapshotsConfig = Field(
         default_factory=SnapshotsConfig,
         title="Snapshots",
@@ -712,6 +716,7 @@ class FrigateConfig(FrigateBaseModel):
                 "live": ...,
                 "objects": ...,
                 "review": ...,
+                "recap": ...,
                 "motion": ...,
                 "notifications": ...,
                 "detect": ...,
@@ -882,6 +887,7 @@ class FrigateConfig(FrigateBaseModel):
             camera_config.review.genai.enabled_in_config = (
                 camera_config.review.genai.enabled
             )
+            camera_config.recap.enabled_in_config = camera_config.recap.enabled
 
             if camera_config.audio.filters is None:
                 camera_config.audio.filters = {}

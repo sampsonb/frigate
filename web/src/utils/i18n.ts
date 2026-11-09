@@ -61,6 +61,7 @@ i18n
       "views/search",
       "views/settings",
       "views/system",
+      "views/recap",
       "config/cameras",
       "config/global",
       "config/groups",

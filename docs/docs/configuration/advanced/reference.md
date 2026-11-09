@@ -870,6 +870,55 @@ timestamp_style:
   #           "shadow" (shadow for font)
   effect: None
 
+# Optional: Video synopsis (recap)
+# NOTE: Can be overridden at the camera level. Off by default.
+recap:
+  # Optional: Enable recap generation (default: shown below)
+  enabled: False
+  # Optional: Daily local time to generate a recap automatically, HH:MM (default: none)
+  # schedule: "02:00"
+  # Optional: Build a recap of the last N minutes on that interval (default: off).
+  # Kind is rolling-<minutes>m. Skipped while the previous one is still
+  # queued or rendering. 0 disables it. Separate from rolling_hours.
+  # interval_minutes: 30
+  # Optional: Hours of footage each scheduled recap covers (default: shown below)
+  window_hours: 24
+  # Optional: Longest on-demand range, in hours (default: shown below)
+  max_window_hours: 48
+  # Optional: Tracked labels to include (default: person, vehicles, common animals, delivery names)
+  # labels:
+  #   - person
+  #   - car
+  #   - dog
+  # Optional: Target synopsis length in seconds (default: shown below)
+  target_length: 120
+  # Optional: Opacity of the time-label background (default: shown below)
+  label_opacity: 0.5
+  # Optional: Maximum number of objects, and time labels, on screen at once (default: shown below)
+  max_labels: 4
+  # Optional: Most of an object's footprint other objects may cover before
+  # a busy recap runs longer instead (default: shown below)
+  max_overlap: 0.3
+  # Optional: Smallest vehicle shown, as a fraction of the frame, measured on
+  # Frigate's snapshot box. People and animals use a third of it. 0 shows
+  # everything (default: shown below)
+  min_object_area: 0.0012
+  # Optional: Fade in and out, in seconds (default: shown below)
+  fade_seconds: 0.2
+  # Optional: Days to keep generated recaps. 0 keeps them until deleted (default: shown below)
+  retain_days: 14
+  # Optional: Delete older completed recaps of the same camera and kind once
+  # a new one is Ready (default: shown below). Last-N-hours buttons group by
+  # that length. An explicit midnight-to-midnight day groups with the nightly
+  # recap for that date. Any other explicit range is its own kind.
+  # Running, failed, and archive copies are kept.
+  replace_superseded: True
+  # Optional: External archive. Leave unset to disable.
+  # The path is a mount with Frigate's media layout. The url is an HTTP base.
+  # archive:
+  #   path: /mnt/frigate-archive
+  #   url: https://archive.example/frigate
+
 # Required
 cameras:
   # Required: name of the camera
