@@ -56,6 +56,7 @@ import { EmptyCard } from "@/components/card/EmptyCard";
 import { BsFillCameraVideoOffFill } from "react-icons/bs";
 import { AuthContext } from "@/context/auth-context";
 import { useIsAdmin } from "@/hooks/use-is-admin";
+import LiveRecapStrip from "./LiveRecapStrip";
 
 type LiveDashboardViewProps = {
   cameras: CameraConfig[];
@@ -487,6 +488,8 @@ export default function LiveDashboardView({
               <ScrollBar orientation="horizontal" />
             </ScrollArea>
           )}
+
+          {!fullscreen && <LiveRecapStrip cameras={cameras} />}
 
           {!cameraGroup || cameraGroup == "default" || isMobileOnly ? (
             <>

@@ -1,0 +1,922 @@
+"""Pure layout for a recap: time labels, parked cars, dedupe, scheduling.
+
+Nothing in this module reads video or talks to Frigate. The generator and
+the unit tests both call these functions.
+"""
+
+from __future__ import annotations
+
+import bisect
+import math
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, tzinfo
+
+import numpy as np
+
+# A vehicle whose path moves less than this fraction of the frame is parked
+# and is left out of the synopsis, unless someone gets in or out of it.
+DEFAULT_STATIONARY = 0.015
+
+
+@dataclass
+class MotionTrack:
+    """One tracked object, boxes in pixel xyxy, oldest first."""
+
+    id: str
+    label: str
+    category: str
+    start: float
+    end: float
+    boxes: list[tuple[float, float, float, float]]
+    times: list[float]
+    zone_note: str = ""
+    # Seconds added to recording times to get ``times`` (detector times).
+    # Cutouts show the recording, so objects that play together are lined
+    # up on it (see ``crossings``).
+    shift: float = 0.0
+
+
+@dataclass
+class ParkedLink:
+    """A person getting into or out of a stationary vehicle."""
+
+    person_id: str
+    vehicle_id: str | None
+    kind: str
+    ts: float
+    car_box: tuple[float, float, float, float]
+
+
+@dataclass
+class ScheduledUnit:
+    """One label on the synopsis timeline."""
+
+    event_id: str
+    clip_event_id: str
+    label: str
+    category: str
+    start_time: float
+    boxes: list[tuple[float, float, float, float]]
+    suffix: str | None = None
+    link_index: int | None = None
+    text: str = ""
+    member_ids: list[str] = field(default_factory=list)
+    # Earlier units this one waits for, each with the share of that unit's
+    # clip that plays first (see ``follows``).
+    after: list[tuple[int, float]] = field(default_factory=list)
+    # An earlier unit this one plays alongside, and how many frames into it
+    # this one starts: two objects that were on screen together.
+    together: tuple[int, int] | None = None
+
+
+# An object that comes into view where another one is or just was, at most
+# this many seconds later, waits for it in the synopsis.
+FOLLOW_SECONDS = 60.0
+# A box this close to the edge of the frame (share of the frame) is coming
+# in from, or going out of, the picture.
+EDGE_MARGIN = 0.02
+
+
+def _near(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> bool:
+    """True when two boxes are within about one and a half object lengths."""
+    reach = 1.5 * max(
+        math.hypot(left[2] - left[0], left[3] - left[1]),
+        math.hypot(right[2] - right[0], right[3] - right[1]),
+    )
+    left_center = _center(left)
+    right_center = _center(right)
+    return (
+        math.hypot(left_center[0] - right_center[0], left_center[1] - right_center[1])
+        <= reach
+    )
+
+
+def _mid_frame(
+    box: tuple[float, float, float, float], width: float, height: float
+) -> bool:
+    """True when the box keeps clear of every edge of the frame."""
+    return (
+        box[0] > EDGE_MARGIN * width
+        and box[1] > EDGE_MARGIN * height
+        and box[2] < (1 - EDGE_MARGIN) * width
+        and box[3] < (1 - EDGE_MARGIN) * height
+    )
+
+
+def follows(
+    shown: Sequence[MotionTrack],
+    paths: Sequence[MotionTrack],
+    width: float,
+    height: float,
+) -> list[list[tuple[int, float]]]:
+    """For each shown track, the earlier ones it has to wait for.
+
+    ``shown`` holds what each unit plays, in schedule order, and ``paths``
+    the same objects' whole paths. An object that comes into view in the
+    middle of the picture, next to where another one is or just was, at
+    most ``FOLLOW_SECONDS`` later, waits until the other has played up to
+    that moment. The people who get out of a truck then appear once it has
+    pulled in, not while it is still down the street, and a car someone got
+    into drives off after they reach it. Cars passing each other at the
+    edge of the picture keep their own pace.
+
+    Each entry is the earlier unit's index and the share of its clip that
+    plays first, 0 to 1.
+    """
+    result: list[list[tuple[int, float]]] = [[] for _ in shown]
+    for later, (track, path) in enumerate(zip(shown, paths, strict=True)):
+        if not track.boxes or not track.times:
+            continue
+        begin = track.times[0]
+        firsts = [track.boxes[0], *path.boxes[:1]]
+        for earlier in range(later):
+            other = shown[earlier]
+            count = min(len(other.boxes), len(other.times))
+            if not count:
+                continue
+            if not other.times[0] <= begin <= other.times[count - 1] + FOLLOW_SECONDS:
+                continue
+            played = bisect.bisect_left(other.times, begin, 0, count)
+            there = other.boxes[max(0, played - 1)]
+            if not any(_near(there, first) for first in firsts):
+                continue
+            if not (
+                _mid_frame(there, width, height)
+                or any(_mid_frame(first, width, height) for first in firsts)
+            ):
+                continue
+            result[later].append((earlier, played / count))
+    return result
+
+
+# Frames two shown objects' boxes have to overlap, at the same moment, for
+# them to be played at their real offset (see ``crossings``), and how much
+# of the smaller box the overlap has to cover.
+CROSS_FRAMES = 5
+CROSS_SHARE = 0.1
+# Seconds apart two samples may be and still count as the same moment.
+CROSS_SLACK = 0.5
+
+
+def _overlap_share(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    """Overlap of two boxes over the smaller one's area."""
+    ix = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+    iy = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
+    smaller = min(
+        max(1.0, (left[2] - left[0]) * (left[3] - left[1])),
+        max(1.0, (right[2] - right[0]) * (right[3] - right[1])),
+    )
+    return ix * iy / smaller
+
+
+def crossings(shown: Sequence[MotionTrack]) -> list[list[tuple[int, float]]]:
+    """For each shown track, the earlier ones whose box it overlapped.
+
+    Two people who passed close to each other share pixels: each cutout
+    holds a piece of the other. Played at another offset than in the
+    recording, the man's cutout showed the woman's face beside her own.
+    Played at the real offset, the piece lines up with her. Each entry is
+    the earlier unit's index and the share of its clip played when this one
+    starts, as in ``follows``.
+    """
+    result: list[list[tuple[int, float]]] = [[] for _ in shown]
+    # On the recording's own clock: each track's detector times carry its own
+    # estimate of the recording's drift. A jogger whose estimate failed was
+    # played a second away from the man he passed, who showed him twice.
+    clock = [[moment - track.shift for moment in track.times] for track in shown]
+    for later, track in enumerate(shown):
+        count_later = min(len(track.boxes), len(track.times))
+        if not count_later:
+            continue
+        mine = clock[later]
+        begin = mine[0]
+        for earlier in range(later):
+            other = shown[earlier]
+            theirs = clock[earlier]
+            count = min(len(other.boxes), len(theirs))
+            if count < 2 or not theirs[0] <= begin <= theirs[count - 1]:
+                continue
+            touching = 0
+            for box, moment in zip(
+                track.boxes[:count_later], mine[:count_later], strict=True
+            ):
+                if moment > theirs[count - 1] + CROSS_SLACK:
+                    break
+                index = min(count - 1, bisect.bisect_left(theirs, moment, 0, count))
+                if index > 0 and abs(theirs[index - 1] - moment) < abs(
+                    theirs[index] - moment
+                ):
+                    index -= 1
+                if abs(theirs[index] - moment) > CROSS_SLACK:
+                    continue
+                if _overlap_share(box, other.boxes[index]) >= CROSS_SHARE:
+                    touching += 1
+            if touching >= CROSS_FRAMES:
+                played = bisect.bisect_left(theirs, begin, 0, count)
+                result[later].append((earlier, played / count))
+    return result
+
+
+def format_clock(timestamp: float, zone: tzinfo, *, seconds: bool) -> str:
+    """Local clock time. Seconds are included only when requested.
+
+    ``5:50 PM`` or ``5:50:12 PM``. The hour has no leading zero.
+    ``zone`` is ``ui.timezone``. Do not pass the container zone when that
+    setting is set: the container clock is often UTC.
+    """
+    moment = datetime.fromtimestamp(timestamp, zone)
+    pattern = "%-I:%M:%S %p" if seconds else "%-I:%M %p"
+    return moment.strftime(pattern)
+
+
+def schedule_due(now: datetime, schedule: str, *, window_seconds: float = 90) -> bool:
+    """Whether ``HH:MM`` should fire for ``now``.
+
+    ``now`` has to already be in ``ui.timezone``. ``02:00`` means 2 AM in
+    that zone, not 02:00 UTC, even when the container clock is UTC.
+    The job is due from that minute through ``window_seconds``.
+    """
+    hour_text, minute_text = schedule.split(":")
+    scheduled = now.replace(
+        hour=int(hour_text),
+        minute=int(minute_text),
+        second=0,
+        microsecond=0,
+    )
+    if now < scheduled:
+        return False
+    return (now - scheduled).total_seconds() <= window_seconds
+
+
+def rolling_slot_key(now: datetime, interval_minutes: int) -> str:
+    """Clock bucket for ``recap.interval_minutes``.
+
+    ``now`` is already in ``ui.timezone``. A 30 minute interval is
+    ``date:0`` from 00:00 through 00:29 and ``date:1`` from 00:30.
+    """
+    if interval_minutes < 1:
+        raise ValueError("interval_minutes must be at least 1")
+    minutes = now.hour * 60 + now.minute
+    slot = minutes // interval_minutes
+    return f"{now.date().isoformat()}:{slot}"
+
+
+def rolling_decision(slot_seen: bool, busy: bool) -> str:
+    """Whether this camera should start an interval recap for the current slot.
+
+    ``wait`` means the slot was already handled. ``skip`` means one is
+    still queued or rendering, so the slot is consumed and nothing is
+    added to the queue. ``start`` means begin the one recap for the slot.
+    """
+    if slot_seen:
+        return "wait"
+    if busy:
+        return "skip"
+    return "start"
+
+
+def assign_label_texts(
+    timestamps: Sequence[float],
+    suffixes: Sequence[str | None],
+    zone: tzinfo,
+) -> list[str]:
+    """Build the on-screen label for each timestamp.
+
+    Times omit seconds. When two or more labels fall in the same clock
+    minute, each of those labels shows seconds instead of a count such
+    as ``(2)``.
+    """
+    if len(timestamps) != len(suffixes):
+        raise ValueError("timestamps and suffixes must be the same length")
+    minutes = [format_clock(ts, zone, seconds=False) for ts in timestamps]
+    counts = Counter(minutes)
+    texts: list[str] = []
+    for timestamp, minute, suffix in zip(timestamps, minutes, suffixes, strict=True):
+        show_seconds = counts[minute] > 1
+        text = format_clock(timestamp, zone, seconds=show_seconds)
+        if suffix:
+            text = f"{text} {suffix}"
+        texts.append(text)
+    return texts
+
+
+def path_displacement(
+    boxes: Sequence[tuple[float, float, float, float]],
+    width: float,
+    height: float,
+) -> float:
+    """Largest travel of the box center, as a fraction of the frame."""
+    if len(boxes) < 2 or width <= 0 or height <= 0:
+        return 0.0
+    centers = [
+        ((box[0] + box[2]) / 2 / width, (box[1] + box[3]) / 2 / height) for box in boxes
+    ]
+    span = 0.0
+    for left in centers:
+        for right in centers:
+            span = max(span, math.hypot(left[0] - right[0], left[1] - right[1]))
+    return span
+
+
+def is_stationary(
+    boxes: Sequence[tuple[float, float, float, float]],
+    width: float,
+    height: float,
+    threshold: float = DEFAULT_STATIONARY,
+) -> bool:
+    """True when the track barely moves (a parked vehicle re-trigger)."""
+    return path_displacement(boxes, width, height) < threshold
+
+
+def _height(box: tuple[float, float, float, float]) -> float:
+    return max(1.0, box[3] - box[1])
+
+
+def _center(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+
+
+def _overlap_fraction(
+    inner: tuple[float, float, float, float],
+    outer: tuple[float, float, float, float],
+) -> float:
+    """Fraction of ``inner`` covered by ``outer``."""
+    ix = max(0.0, min(inner[2], outer[2]) - max(inner[0], outer[0]))
+    iy = max(0.0, min(inner[3], outer[3]) - max(inner[1], outer[1]))
+    area = max(1.0, (inner[2] - inner[0]) * (inner[3] - inner[1]))
+    return ix * iy / area
+
+
+def _nearest_index(times: Sequence[float], target: float) -> int:
+    return min(range(len(times)), key=lambda index: abs(times[index] - target))
+
+
+def _pace(track: MotionTrack, kind: str) -> tuple[float, float]:
+    """Return (pace at the junction, occlusion) in body-heights.
+
+    Pace is how far the person moves over about one second at the start
+    (got out) or the end (got in), in body heights per second. Occlusion
+    is how much shorter the person is at the junction than their median
+    height: someone ducking into a car gets shorter.
+    """
+    boxes = track.boxes
+    times = track.times
+    heights = [_height(box) for box in boxes]
+    median_h = float(np.median(heights))
+    if kind == "got out":
+        junction = boxes[0]
+        ref = boxes[_nearest_index(times, times[0] + 1.0)]
+    else:
+        junction = boxes[-1]
+        ref = boxes[_nearest_index(times, times[-1] - 1.0)]
+    person_h = _height(junction)
+    moved = math.hypot(_center(ref)[0] - _center(junction)[0], ref[3] - junction[3])
+    pace = moved / person_h
+    occlusion = 1.0 - person_h / max(1.0, median_h)
+    return pace, occlusion
+
+
+def _time_near(vehicle: MotionTrack, moment: float, slack: float = 90.0) -> bool:
+    return vehicle.start - slack <= moment <= vehicle.end + slack
+
+
+def link_parked_cars(
+    people: Sequence[MotionTrack],
+    vehicles: Sequence[MotionTrack],
+    width: float,
+    height: float,
+    stationary_threshold: float = DEFAULT_STATIONARY,
+) -> list[ParkedLink]:
+    """Link a person to a parked car they get out of or into.
+
+    Stationary vehicles are not otherwise shown. A link is created when
+    the person's track starts (got out) or ends (got in) against a
+    stationary vehicle, they actually leave or approach it, and they are
+    not still walking at full stride (that is someone passing the car).
+    """
+    parked = [
+        vehicle
+        for vehicle in vehicles
+        if vehicle.category == "vehicle"
+        and vehicle.label != "bicycle"
+        and is_stationary(vehicle.boxes, width, height, stationary_threshold)
+        and vehicle.boxes
+    ]
+    links: list[ParkedLink] = []
+    for person in people:
+        if person.label != "person" or len(person.boxes) < 2 or not person.times:
+            continue
+        for kind in ("got out", "got in"):
+            junction = person.boxes[0] if kind == "got out" else person.boxes[-1]
+            far = person.boxes[-1] if kind == "got out" else person.boxes[0]
+            person_h = _height(junction)
+            if (
+                junction[0] < 0.01 * width
+                or junction[2] > 0.99 * width
+                or junction[3] > 0.985 * height
+            ):
+                continue
+            away = math.hypot(
+                _center(far)[0] - _center(junction)[0],
+                _center(far)[1] - _center(junction)[1],
+            )
+            if away < 1.2 * person_h:
+                continue
+            pace, occlusion = _pace(person, kind)
+            best: tuple[float, tuple[float, float, float, float], str] | None = None
+            for car in parked:
+                moment = person.start if kind == "got out" else person.end
+                if not _time_near(car, moment):
+                    continue
+                car_box = car.boxes[len(car.boxes) // 2]
+                car_w = car_box[2] - car_box[0]
+                car_h = car_box[3] - car_box[1]
+                if car_w < 0.8 * person_h or car_w < 0.05 * width:
+                    continue
+                person_w = junction[2] - junction[0]
+                pad_x = max(0.12 * car_w, 0.8 * person_w)
+                expanded = (
+                    car_box[0] - pad_x,
+                    car_box[1] - 0.1 * car_h,
+                    car_box[2] + pad_x,
+                    car_box[3] + 0.1 * car_h,
+                )
+                overlap = _overlap_fraction(junction, expanded)
+                foot_ok = (
+                    car_box[1] + 0.2 * car_h <= junction[3] <= car_box[3] + 0.3 * car_h
+                )
+                if overlap >= 0.2 and foot_ok and (best is None or overlap > best[0]):
+                    best = (overlap, car_box, car.id)
+            if best is None:
+                continue
+            # Still at a full walking pace and fully visible: they walked past.
+            if pace > 1.2 and occlusion < 0.4:
+                continue
+            moment = person.start if kind == "got out" else person.end
+            links.append(
+                ParkedLink(
+                    person_id=person.id,
+                    vehicle_id=best[2],
+                    kind=kind,
+                    ts=moment,
+                    car_box=best[1],
+                )
+            )
+    return links
+
+
+def _iou(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    ix = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+    iy = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
+    inter = ix * iy
+    area = (left[2] - left[0]) * (left[3] - left[1])
+    area += (right[2] - right[0]) * (right[3] - right[1])
+    area -= inter
+    if area <= 0:
+        return 0.0
+    return inter / area
+
+
+def _area(box: tuple[float, float, float, float]) -> float:
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+# Seconds between one track's last sighting and the next one's first under
+# which, at the same spot, the second takes over from the first.
+HANDOVER_SECONDS = 1.5
+
+
+def _foot(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    return (box[0] + box[2]) / 2, box[3]
+
+
+def _same_spot(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+    vehicle: bool,
+) -> bool:
+    """True when two boxes are one object.
+
+    Boxes that cover each other are. A vehicle also is when its foot is in
+    the same place and its size is close: Frigate's sizes come from a few
+    timeline samples, so two tracks of one van can disagree on size while
+    their path points agree. People keep the strict test, so two people
+    side by side stay two.
+    """
+    if _iou(left, right) > 0.45:
+        return True
+    if not vehicle:
+        return False
+    ratio = _area(left) / max(1.0, _area(right))
+    if not 0.4 <= ratio <= 2.5:
+        return False
+    left_foot, right_foot = _foot(left), _foot(right)
+    reach = 0.3 * max(
+        math.hypot(left[2] - left[0], left[3] - left[1]),
+        math.hypot(right[2] - right[0], right[3] - right[1]),
+    )
+    return (
+        math.hypot(left_foot[0] - right_foot[0], left_foot[1] - right_foot[1]) <= reach
+    )
+
+
+def dedupe_tracks(tracks: Sequence[MotionTrack]) -> dict[int, int]:
+    """Drop a second track of the same physical object.
+
+    Returns ``{dropped index: kept index}``. Parked-car synthetics are
+    not passed in here. Two people sitting side by side are kept: only
+    tracks whose boxes cover each other are merged.
+
+    Frigate also splits one object into several events: it loses it for a
+    moment, or changes its label (a delivery van seen as a car, then a bus).
+    A short track that hands over to a longer one at the same spot, within
+    ``HANDOVER_SECONDS``, is that object too, and the short one is dropped.
+    """
+    dropped: dict[int, int] = {}
+    order = sorted(range(len(tracks)), key=lambda index: tracks[index].start)
+    for position, left_i in enumerate(order):
+        if left_i in dropped:
+            continue
+        left = tracks[left_i]
+        left_last = left.times[-1] if left.times else left.end
+        for right_i in order[position + 1 :]:
+            if right_i in dropped:
+                continue
+            right = tracks[right_i]
+            if right.start > max(left.end, left_last + HANDOVER_SECONDS):
+                break
+            if left.category == "parked" or right.category == "parked":
+                continue
+            if not left.boxes or not right.boxes:
+                continue
+            vehicle = left.category == "vehicle" and right.category == "vehicle"
+            right_first = right.times[0] if right.times else right.start
+            if right_first > left_last:
+                if (
+                    right_first - left_last <= HANDOVER_SECONDS
+                    and left.category == right.category
+                    and _same_spot(left.boxes[-1], right.boxes[0], vehicle)
+                ):
+                    left_span = left_last - (
+                        left.times[0] if left.times else left.start
+                    )
+                    right_span = (
+                        right.times[-1] if right.times else right.end
+                    ) - right_first
+                    if min(left_span, right_span) < 0.35 * max(left_span, right_span):
+                        keep, lose = (
+                            (left_i, right_i)
+                            if left_span >= right_span
+                            else (right_i, left_i)
+                        )
+                        dropped[lose] = keep
+                        if lose == left_i:
+                            break
+                continue
+            # Walk the shorter track: a half-second detection is sampled as
+            # densely as a long drive, so walking the long one finds only a
+            # sample or two inside it.
+            left_span = left_last - (left.times[0] if left.times else left.start)
+            right_span = (right.times[-1] if right.times else right.end) - right_first
+            brief, other = (left, right) if left_span <= right_span else (right, left)
+            compared = 0
+            same = 0
+            for box, moment in zip(brief.boxes, brief.times, strict=True):
+                other_i = _nearest_index(other.times, moment)
+                if abs(other.times[other_i] - moment) > 0.4:
+                    continue
+                compared += 1
+                if _same_spot(box, other.boxes[other_i], vehicle):
+                    same += 1
+            if compared >= 0.4 * len(brief.boxes) and same >= 0.6 * compared:
+                # The one seen longer, so the clip keeps the whole drive; of
+                # two about as long, the bigger box, which holds all of it.
+                if min(left_span, right_span) < 0.7 * max(left_span, right_span):
+                    left_wins = left_span >= right_span
+                else:
+                    left_wins = float(
+                        np.mean([_area(box) for box in left.boxes])
+                    ) >= float(np.mean([_area(box) for box in right.boxes]))
+                keep, lose = (left_i, right_i) if left_wins else (right_i, left_i)
+                dropped[lose] = keep
+                if lose == left_i:
+                    break
+    return dropped
+
+
+def repeat_for_min_show(count: int, output_fps: int, min_show_seconds: float) -> int:
+    """How many times to repeat each source frame so the ghost is readable."""
+    if count <= 0:
+        return 1
+    need = max(1, int(math.ceil(min_show_seconds * output_fps)))
+    return max(1, int(math.ceil(need / count)))
+
+
+def schedule_units(
+    units: Sequence[ScheduledUnit],
+    width: int,
+    height: int,
+    target_frames: int,
+    *,
+    cell: int = 24,
+    max_delay: int = 30,
+    max_active: int = 8,
+    max_overlap: float = 0.1,
+) -> tuple[list[int], int]:
+    """Place units on the synopsis timeline with little spatial overlap.
+
+    Linked units (a parked car tied to a person) start on the same frame
+    as the person. Returns ``(start frame per unit, total frames)``.
+
+    When the objects do not fit in ``target_frames`` without touching,
+    some overlap is allowed, but never more than ``max_overlap`` of an
+    object's own footprint. Past that the video runs longer instead.
+    Stacking cars on the same stretch of road is what made a busy
+    afternoon unreadable.
+    """
+    if not units:
+        return [], 1
+    grid_w = max(1, math.ceil(width / cell))
+    grid_h = max(1, math.ceil(height / cell))
+    cells: list[list[tuple[int, int, int, int]]] = []
+    for unit in units:
+        occupied = []
+        for box in unit.boxes:
+            x0 = max(0, int(box[0] // cell))
+            y0 = max(0, int(box[1] // cell) - 2)
+            x1 = min(grid_w, int(box[2] // cell) + 1)
+            y1 = min(grid_h, int(box[3] // cell) + 1)
+            if x1 <= x0:
+                x1 = min(grid_w, x0 + 1)
+            if y1 <= y0:
+                y1 = min(grid_h, y0 + 1)
+            occupied.append((y0, y1, x0, x1))
+        cells.append(occupied)
+
+    horizon = sum(len(unit.boxes) for unit in units) * 2 + 10 + max_delay * 2
+    horizon = max(horizon, target_frames + max_delay + 5)
+    link = [unit.link_index for unit in units]
+    weight = [
+        1 + sum(1 for other in link if other == index) for index in range(len(units))
+    ]
+
+    def place(threshold: float) -> tuple[list[int], int]:
+        occupancy = np.zeros((horizon, grid_h, grid_w), np.uint16)
+        active = np.zeros(horizon, np.int32)
+        starts: list[int] = []
+        last = 0
+        for index, occupied in enumerate(cells):
+            length = len(occupied)
+            partner = link[index]
+            together = units[index].together
+            if together is not None and together[0] < len(starts):
+                start = starts[together[0]] + together[1]
+                # Order wins over company: it must not start before what it
+                # waits for. Most often the partner waited for the same thing.
+                if any(
+                    0 <= prior < len(starts)
+                    and start
+                    < starts[prior] + int(math.ceil(share * len(cells[prior])))
+                    for prior, share in units[index].after
+                ):
+                    together = None
+            if together is not None and together[0] < len(starts):
+                start = starts[together[0]] + together[1]
+                if start + length >= horizon:
+                    start = max(0, horizon - length - 1)
+                end = min(horizon, start + length)
+                active[start:end] += weight[index]
+                for step, bounds in enumerate(occupied):
+                    if start + step >= horizon:
+                        break
+                    occupancy[
+                        start + step, bounds[0] : bounds[1], bounds[2] : bounds[3]
+                    ] += 1
+                starts.append(start)
+                last = max(last, start)
+                continue
+            if partner is not None and partner < len(starts):
+                start = starts[partner]
+                if start + length >= horizon:
+                    start = max(0, horizon - length - 1)
+                for step, bounds in enumerate(occupied):
+                    occupancy[
+                        start + step, bounds[0] : bounds[1], bounds[2] : bounds[3]
+                    ] += 1
+                starts.append(start)
+                continue
+            area = sum((b[1] - b[0]) * (b[3] - b[2]) for b in occupied) or 1
+            limit = threshold * area
+            start0 = last
+            for prior, share in units[index].after:
+                if 0 <= prior < len(starts):
+                    start0 = max(
+                        start0,
+                        starts[prior] + int(math.ceil(share * len(cells[prior]))),
+                    )
+            if max_active:
+                while (
+                    start0 + length < horizon
+                    and int(active[start0 : start0 + length].max())
+                    > max_active - weight[index]
+                ):
+                    start0 += 1
+            best_start = start0
+            best_cost: int | None = None
+            for start in range(start0, min(horizon - length, start0 + max_delay + 1)):
+                if (
+                    max_active
+                    and int(active[start : start + length].max())
+                    > max_active - weight[index]
+                ):
+                    continue
+                cost = 0
+                for step, bounds in enumerate(occupied):
+                    cost += int(
+                        occupancy[
+                            start + step, bounds[0] : bounds[1], bounds[2] : bounds[3]
+                        ].sum()
+                    )
+                    if best_cost is not None and cost >= best_cost:
+                        break
+                if best_cost is None or cost < best_cost:
+                    best_start, best_cost = start, cost
+                if cost <= limit:
+                    best_start = start
+                    break
+            start = best_start
+            end = min(horizon, start + length)
+            active[start:end] += weight[index]
+            for step, bounds in enumerate(occupied):
+                if start + step >= horizon:
+                    break
+                occupancy[
+                    start + step, bounds[0] : bounds[1], bounds[2] : bounds[3]
+                ] += 1
+            starts.append(start)
+            last = start
+        length = max(
+            (
+                start + len(occupied)
+                for start, occupied in zip(starts, cells, strict=True)
+            ),
+            default=1,
+        )
+        return starts, min(length, horizon)
+
+    starts, length = place(0.0)
+    cap = max(0.0, float(max_overlap))
+    if length <= target_frames or cap <= 0:
+        return starts, length
+    placed = place(cap)
+    if placed[1] > target_frames:
+        return placed
+    low, high, best = 0.0, cap, placed
+    for _ in range(6):
+        mid = (low + high) / 2
+        trial = place(mid)
+        if trial[1] <= target_frames:
+            high, best = mid, trial
+        else:
+            low = mid
+    return best
+
+
+def _rects_hit(
+    left: tuple[int, int, int, int],
+    right: tuple[int, int, int, int],
+    margin: int = 0,
+) -> bool:
+    return (
+        left[0] - margin < right[2]
+        and right[0] - margin < left[2]
+        and left[1] - margin < right[3]
+        and right[1] - margin < left[3]
+    )
+
+
+def plan_label_rects(
+    units: Sequence[ScheduledUnit],
+    starts: Sequence[int],
+    width: int,
+    height: int,
+    *,
+    text_size: dict[int, tuple[int, int]],
+    header_h: int,
+    min_gap: int,
+) -> list[tuple[int, int, int, int]]:
+    """One stationary rectangle per unit. Rectangles of units that are
+    on screen together do not overlap, and they stay ``min_gap`` apart.
+    """
+    gap = max(0, min_gap)
+    info: list[dict[str, object]] = []
+    for index, unit in enumerate(units):
+        text_w, text_h = text_size.get(index, (80, 16))
+        label_h = text_h + 12
+        label_w = text_w + 14 + label_h
+        boxes = (
+            np.array(unit.boxes, np.float32)
+            if unit.boxes
+            else np.zeros((1, 4), np.float32)
+        )
+        info.append(
+            {
+                "lw": label_w,
+                "lh": label_h,
+                "boxes": boxes,
+                "start": starts[index],
+                "end": starts[index] + len(unit.boxes),
+            }
+        )
+    placed: dict[int, tuple[int, int, int, int]] = {}
+    order = sorted(range(len(units)), key=lambda index: starts[index])
+    for index in order:
+        item = info[index]
+        label_w = int(item["lw"])
+        label_h = int(item["lh"])
+        boxes = item["boxes"]
+        assert isinstance(boxes, np.ndarray)
+        start = int(item["start"])
+        end = int(item["end"])
+        conflicts = [
+            other
+            for other in placed
+            if int(info[other]["start"]) < end + 3
+            and start < int(info[other]["end"]) + 3
+        ]
+        heads_x = (boxes[:, 0] + boxes[:, 2]) / 2
+        xs: set[int] = set()
+        count = len(boxes)
+        for fraction in (0.0, 0.5, 1.0):
+            head_x = float(heads_x[int(fraction * (count - 1))])
+            for shift in (0.0, -0.6 * label_w, 0.6 * label_w):
+                xs.add(
+                    int(
+                        min(
+                            max(head_x + shift, label_w / 2 + 2),
+                            width - label_w / 2 - 2,
+                        )
+                    )
+                )
+        top = float(boxes[:, 1].min())
+        bottom = float(boxes[:, 3].max())
+        ys: list[int] = []
+        for band in range(14):
+            y1 = top - 10 - band * (label_h + gap)
+            if y1 - label_h >= header_h + 4:
+                ys.append(int(y1))
+        above = len(ys)
+        for band in range(4):
+            y1 = bottom + 10 + label_h + band * (label_h + gap)
+            if y1 <= height - 4:
+                ys.append(int(y1))
+        best: tuple[int, int, int, int] | None = None
+        best_cost: float | None = None
+        for center_x in xs:
+            for y_index, y1 in enumerate(ys):
+                rect = (
+                    int(center_x - label_w / 2),
+                    int(y1 - label_h),
+                    int(center_x + label_w / 2),
+                    int(y1),
+                )
+                hard = sum(
+                    1 for other in conflicts if _rects_hit(rect, placed[other], gap)
+                )
+                cost = 1e5 * hard + (80 if y_index >= above else 0)
+                cost += 400 * sum(
+                    1
+                    for box in boxes[:: max(1, count // 6)]
+                    if _rects_hit(rect, tuple(int(v) for v in box))
+                )
+                if best_cost is None or cost < best_cost:
+                    best, best_cost = rect, cost
+                if hard == 0 and y_index < above:
+                    best = rect
+                    best_cost = cost
+                    break
+            if best_cost is not None and best_cost < 1:
+                break
+        if best is None:
+            head_x = float(heads_x[0])
+            head_y = float(boxes[0, 1])
+            y0 = int(max(header_h + 4, head_y - 10 - label_h))
+            best = (
+                int(head_x - label_w / 2),
+                y0,
+                int(head_x + label_w / 2),
+                y0 + label_h,
+            )
+        placed[index] = best
+    return [placed[index] for index in range(len(units))]

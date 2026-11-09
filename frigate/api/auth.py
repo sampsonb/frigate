@@ -100,6 +100,7 @@ def require_admin_by_default():
         "/cases",
         "/exports",
         "/jobs/export",
+        "/recap",
     }
 
     # Path prefixes that should be exempt (for paths with parameters)
@@ -115,6 +116,7 @@ def require_admin_by_default():
         "/cases/",  # /cases/{case_id}
         "/exports/",  # /exports/{export_id}
         "/jobs/export/",  # /jobs/export/{export_id}
+        "/recap/",  # /recap/{camera}/start, /recap/{id}, video and thumb
         "/vod/",  # /vod/{camera_name}/...
         "/notifications/",  # /notifications/pubkey, /notifications/register
     )

@@ -1,0 +1,258 @@
+"""Load Frigate events and recordings for a recap window.
+
+Real 0.17.2 rows leave several columns NULL. ``false_positive`` is never
+written, so it is unset rather than false. An event that is still in
+progress has ``end_time`` NULL. SQLite ``=`` does not match NULL, which
+used to drop every object. Review segments are not queried here.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Any
+
+from frigate.models import Event, Recordings, Timeline
+
+logger = logging.getLogger(__name__)
+
+
+def load_events(
+    camera: str, after: float, before: float, labels: list[str]
+) -> list[dict[str, Any]]:
+    """Events for one camera that overlap ``[after, before]``.
+
+    NULL ``false_positive`` counts as not a false positive. NULL
+    ``has_clip`` counts as unknown and is kept; an explicit false is
+    dropped. An in-progress event (NULL ``end_time``) runs through
+    ``before``. ``sub_label``, ``top_score``, ``zones``, and
+    ``has_snapshot`` are not filters. ``data`` is always a dict.
+    """
+    if not labels:
+        return []
+    query = (
+        Event.select()
+        .where(Event.camera == camera)
+        .where(Event.label.in_(labels))
+        .where(
+            (Event.has_clip.is_null(True)) | (Event.has_clip == True)  # noqa: E712
+        )
+        .where(
+            (Event.false_positive.is_null(True)) | (Event.false_positive == False)  # noqa: E712
+        )
+        .where(Event.start_time < before)
+        .where((Event.end_time.is_null(True)) | (Event.end_time > after))
+        .order_by(Event.start_time.asc())
+    )
+    events: list[dict[str, Any]] = []
+    for event in query:
+        row = _event_row(event, before)
+        if row is not None:
+            events.append(row)
+    return events
+
+
+def attach_timeline(events: list[dict[str, Any]], chunk: int = 400) -> None:
+    """Add each event's timeline boxes as ``event["timeline"]``.
+
+    Frigate writes a timeline row with the exact detector box when an
+    object is first seen, enters a zone, stops or starts, and is last
+    seen. ``path_data`` only has the foot point, and only after the object
+    moved far enough, so these rows are the only exact sizes. The last
+    row is also the only record of when the object left: the event stays
+    open a few seconds longer. Each entry is
+    ``[timestamp, class_type, [x, y, w, h]]`` in normalized units.
+    """
+    found: dict[str, list[list[Any]]] = {str(event["id"]): [] for event in events}
+    ids = list(found)
+    for first in range(0, len(ids), max(1, chunk)):
+        query = (
+            Timeline.select(
+                Timeline.source_id,
+                Timeline.timestamp,
+                Timeline.class_type,
+                Timeline.data,
+            )
+            .where(Timeline.source_id.in_(ids[first : first + chunk]))
+            .order_by(Timeline.timestamp.asc())
+        )
+        for row in query:
+            box = _event_data(row.data).get("box")
+            if not isinstance(box, (list, tuple)) or len(box) < 4:
+                continue
+            try:
+                entry = [
+                    float(row.timestamp),
+                    str(row.class_type or ""),
+                    [float(value) for value in box[:4]],
+                ]
+            except (TypeError, ValueError):
+                continue
+            found.setdefault(str(row.source_id), []).append(entry)
+    for event in events:
+        event["timeline"] = found.get(str(event["id"]), [])
+
+
+def event_fingerprint(
+    camera: str, after: float, before: float, labels: list[str]
+) -> dict[str, float | None]:
+    """``{event id: end_time}`` for the window, without loading event data.
+
+    The rolling recap compares this with the map saved at its last build.
+    A new id, or an end time that changed (an event that was still open),
+    means the recap is out of date. It uses the same filters as
+    ``load_events``.
+    """
+    if not labels:
+        return {}
+    query = (
+        Event.select(Event.id, Event.end_time)
+        .where(Event.camera == camera)
+        .where(Event.label.in_(labels))
+        .where(
+            (Event.has_clip.is_null(True)) | (Event.has_clip == True)  # noqa: E712
+        )
+        .where(
+            (Event.false_positive.is_null(True)) | (Event.false_positive == False)  # noqa: E712
+        )
+        .where(Event.start_time < before)
+        .where((Event.end_time.is_null(True)) | (Event.end_time > after))
+        .tuples()
+    )
+    found: dict[str, float | None] = {}
+    for event_id, end_time in query:
+        try:
+            found[str(event_id)] = (
+                None if end_time is None else round(float(end_time), 2)
+            )
+        except (TypeError, ValueError):
+            found[str(event_id)] = None
+    return found
+
+
+def fingerprint_changed(
+    previous: dict[str, float | None] | None, current: dict[str, float | None]
+) -> bool:
+    """True when ``current`` has an event that is new or whose end time moved.
+
+    Events that only aged out of the window do not count.
+    """
+    if previous is None:
+        return True
+    for event_id, end_time in current.items():
+        if event_id not in previous:
+            return True
+        if previous[event_id] != end_time:
+            return True
+    return False
+
+
+def load_recordings(camera: str, after: float, before: float) -> list[dict[str, Any]]:
+    """Recording files overlapping the window.
+
+    A segment with NULL ``end_time`` is treated as still open and is
+    closed at ``before`` so later math always sees a number.
+    """
+    query = (
+        Recordings.select(Recordings.path, Recordings.start_time, Recordings.end_time)
+        .where(Recordings.camera == camera)
+        .where(Recordings.start_time < before)
+        .where((Recordings.end_time.is_null(True)) | (Recordings.end_time > after))
+        .order_by(Recordings.start_time.asc())
+    )
+    rows: list[dict[str, Any]] = []
+    for row in query:
+        if row.start_time is None or not row.path:
+            continue
+        try:
+            start = float(row.start_time)
+            end = float(before if row.end_time is None else row.end_time)
+        except (TypeError, ValueError):
+            logger.debug("Skipped recording %s with unreadable times", row.path)
+            continue
+        rows.append({"path": row.path, "start": start, "end": end})
+    return rows
+
+
+def recordings_overlap(
+    camera: str, start: float, end: float, now: float | None = None
+) -> bool:
+    """True when a recording file overlaps ``[start, end]``.
+
+    ``end`` may be None for an event that is still in progress. The
+    search then runs through ``now``. A recording with NULL ``end_time``
+    still counts.
+    """
+    if not camera:
+        return False
+    bound = now if now is not None else time.time()
+    try:
+        start_epoch = float(start)
+        end_epoch = bound if end is None else float(end)
+    except (TypeError, ValueError):
+        return False
+    return (
+        Recordings.select()
+        .where(Recordings.camera == camera)
+        .where(Recordings.start_time < end_epoch)
+        .where(
+            (Recordings.end_time.is_null(True)) | (Recordings.end_time > start_epoch)
+        )
+        .exists()
+    )
+
+
+def live_recordings_exist(event: Any, now: float | None = None) -> bool:
+    """True when this event should play from Frigate's recordings.
+
+    Explicit ``has_clip`` false means the clip was removed. NULL means
+    the flag was never written. NULL ``end_time`` means the event is
+    still open.
+    """
+    if getattr(event, "has_clip", None) is False:
+        return False
+    camera = getattr(event, "camera", None)
+    start = getattr(event, "start_time", None)
+    if not camera or start is None:
+        return False
+    return recordings_overlap(str(camera), start, getattr(event, "end_time", None), now)
+
+
+def _event_row(event: Any, before: float) -> dict[str, Any] | None:
+    if event.start_time is None:
+        return None
+    try:
+        start = float(event.start_time)
+        end = float(before if event.end_time is None else event.end_time)
+    except (TypeError, ValueError):
+        logger.debug("Skipped event %s with unreadable times", event.id)
+        return None
+    if end <= start:
+        end = start + 0.5
+    return {
+        "id": event.id,
+        "label": event.label,
+        "sub_label": event.sub_label,
+        "start_time": start,
+        "end_time": end,
+        "data": _event_data(event.data),
+    }
+
+
+def _event_data(value: Any) -> dict[str, Any]:
+    """JSON object from the event row, or an empty dict.
+
+    The column is NULL when nothing was stored. A driver may also hand
+    back the raw text. Lists and other shapes are ignored.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}

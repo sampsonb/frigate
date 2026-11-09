@@ -298,6 +298,13 @@ export interface CameraConfig {
   type: string;
   ui: UiConfig;
   webui_url: string | null;
+  recap?: {
+    enabled: boolean;
+    schedule?: string | null;
+    interval_minutes?: number | null;
+    window_hours?: number;
+    max_window_hours?: number;
+  };
   zones: {
     [zoneName: string]: {
       coordinates: string;
@@ -580,6 +587,18 @@ export interface FrigateConfig {
 
   proxy: {
     logout_url?: string;
+  };
+
+  recap?: {
+    enabled: boolean;
+    schedule?: string | null;
+    interval_minutes?: number | null;
+    window_hours?: number;
+    max_window_hours?: number;
+    archive?: {
+      path?: string | null;
+      url?: string | null;
+    };
   };
 
   record: {

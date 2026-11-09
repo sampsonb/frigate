@@ -25,6 +25,7 @@ from frigate.api import (
     motion_search,
     notification,
     preview,
+    recap,
     record,
     review,
 )
@@ -41,6 +42,7 @@ from frigate.debug_replay import DebugReplayManager, debug_replay_auto_stop_watc
 from frigate.embeddings import EmbeddingsContext
 from frigate.genai import GenAIClientManager
 from frigate.ptz.onvif import OnvifController
+from frigate.recap.manager import RecapManager
 from frigate.stats.emitter import StatsEmitter
 from frigate.storage import StorageMaintainer
 
@@ -76,6 +78,7 @@ def create_fastapi_app(
     profile_manager: ProfileManager | None = None,
     enforce_default_admin: bool = True,
     config_holder: ConfigHolder | None = None,
+    recap_manager: RecapManager | None = None,
 ):
     logger.info("Starting FastAPI app")
     app = FastAPI(
@@ -145,6 +148,7 @@ def create_fastapi_app(
     app.include_router(preview.router)
     app.include_router(notification.router)
     app.include_router(export.router)
+    app.include_router(recap.router)
     app.include_router(event.router)
     app.include_router(media.router)
     app.include_router(motion_search.router)
@@ -167,6 +171,7 @@ def create_fastapi_app(
     app.dispatcher = dispatcher
     app.profile_manager = profile_manager
     app.config_holder = config_holder
+    app.recap_manager = recap_manager
 
     if frigate_config.auth.enabled:
         secret = get_jwt_secret()

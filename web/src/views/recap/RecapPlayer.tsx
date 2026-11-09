@@ -1,0 +1,588 @@
+import { baseUrl } from "@/api/baseUrl";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { resolveCameraName } from "@/hooks/use-camera-friendly-name";
+import { FrigateConfig } from "@/types/frigateConfig";
+import { RecapClipSource, RecapManifest, RecapTrack } from "@/types/recap";
+import axios from "axios";
+import Hls from "hls.js";
+import {
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useTranslation } from "react-i18next";
+import { LuDownload, LuLoaderCircle, LuShare } from "react-icons/lu";
+import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
+import useSWR from "swr";
+import {
+  DownloadState,
+  recapDownloadUrl,
+  recapFileName,
+  recapSpanLabel,
+  recapVideoUrl,
+  safeFileName,
+  useRecapDownload,
+} from "./recapDownload";
+import { useRecapTime } from "./recapUtils";
+
+type RecapPlayerProps = {
+  recap: RecapManifest;
+  // Changes when a recap is rebuilt in place, so the browser fetches the new file.
+  version?: number;
+  autoPlay?: boolean;
+  onEnded?: () => void;
+  header?: ReactNode;
+};
+
+type ContentRect = { x: number; y: number; w: number; h: number };
+
+type OpenClip = {
+  track: RecapTrack;
+  clip?: string;
+  download?: string;
+  hls?: boolean;
+  snapshot?: string;
+  source?: string;
+  message?: string;
+};
+
+// Speed buttons above the recap (Sampson, 2026-10-16: "Can there be playback speed options?"). The choice is kept in
+// localStorage, so every recap opens at the last speed picked.
+const PLAYBACK_RATES = [1, 1.5, 2];
+const PLAYBACK_RATE_KEY = "recapPlaybackRate";
+
+function storedPlaybackRate() {
+  try {
+    const value = Number(window.localStorage.getItem(PLAYBACK_RATE_KEY));
+    return PLAYBACK_RATES.includes(value) ? value : 1;
+  } catch {
+    return 1;
+  }
+}
+
+const FALLBACK_COLORS: Record<string, string> = {
+  person: "#3cb9ff",
+  vehicle: "#ffa528",
+  delivery: "#eb50d7",
+  animal: "#5ad750",
+  parked: "#00afb9",
+};
+
+function mediaUrl(value?: string | null) {
+  if (!value) {
+    return undefined;
+  }
+  if (value.startsWith("http://") || value.startsWith("https://")) {
+    return value;
+  }
+  const path = value.replace(/^\//, "");
+  // VOD playlists are served by nginx, not the /api router.
+  if (path.startsWith("vod/")) {
+    return `${baseUrl}${path}`;
+  }
+  return `${baseUrl}api/${path}`;
+}
+
+function isHls(value?: string | null) {
+  return Boolean(value && (value.includes(".m3u8") || value.includes("/vod/")));
+}
+
+function RecapClipVideo({ src, hls }: { src: string; hls: boolean }) {
+  const ref = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    const video = ref.current;
+    if (!video) {
+      return;
+    }
+    let player: Hls | undefined;
+    const nativeHls =
+      hls && video.canPlayType("application/vnd.apple.mpegurl") !== "";
+    if (!hls || nativeHls) {
+      video.src = src;
+      video.load();
+    } else if (Hls.isSupported()) {
+      player = new Hls({ maxBufferLength: 10 });
+      player.loadSource(src);
+      player.attachMedia(video);
+    } else {
+      video.src = src;
+      video.load();
+    }
+    const start = () => {
+      video.play().catch(() => undefined);
+    };
+    video.addEventListener("loadeddata", start);
+    return () => {
+      video.removeEventListener("loadeddata", start);
+      player?.destroy();
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [hls, src]);
+
+  return (
+    <video
+      ref={ref}
+      className="max-h-[70dvh] w-full rounded-lg bg-black"
+      controls
+      autoPlay
+      muted
+      playsInline
+    />
+  );
+}
+
+export function DownloadButton({
+  state,
+  onClick,
+  label,
+  className,
+}: {
+  state: DownloadState;
+  onClick: () => void;
+  label: string;
+  className?: string;
+}) {
+  const { t } = useTranslation(["views/recap"]);
+  const Icon =
+    state === "preparing"
+      ? LuLoaderCircle
+      : state === "ready"
+        ? LuShare
+        : LuDownload;
+  return (
+    <Button
+      size="sm"
+      variant="outline"
+      className={className}
+      disabled={state === "preparing"}
+      onClick={onClick}
+    >
+      <Icon
+        className={`mr-1 size-4 ${state === "preparing" ? "animate-spin" : ""}`}
+      />
+      {state === "preparing"
+        ? t("downloadPreparing")
+        : state === "ready"
+          ? t("downloadSave")
+          : label}
+    </Button>
+  );
+}
+
+export default function RecapPlayer({
+  recap,
+  version,
+  autoPlay = false,
+  onEnded,
+  header,
+}: RecapPlayerProps) {
+  const { t } = useTranslation(["views/recap"]);
+  const navigate = useNavigate();
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const frameRef = useRef<HTMLDivElement | null>(null);
+  const [current, setCurrent] = useState(0);
+  const [content, setContent] = useState<ContentRect>({
+    x: 0,
+    y: 0,
+    w: 0,
+    h: 0,
+  });
+  const [enabled, setEnabled] = useState<Record<string, boolean>>({});
+  const [open, setOpen] = useState<OpenClip>();
+  const [rate, setRate] = useState<number>(storedPlaybackRate);
+  const { data: config } = useSWR<FrigateConfig>("config");
+  const times = useRecapTime();
+  const downloads = useRecapDownload();
+  const cameraName = resolveCameraName(config, recap.camera);
+  const fileName = recapFileName(
+    cameraName,
+    recapSpanLabel(times, recap.after, recap.before, recap.created),
+  );
+  const fileKey = `${recap.id}:${version ?? recap.finished ?? 0}`;
+  const saveRecap = () =>
+    downloads.download({
+      key: fileKey,
+      url: recapDownloadUrl(recap.id, fileName, version ?? recap.finished),
+      name: fileName,
+      openUrl: recapVideoUrl(recap.id, version ?? recap.finished),
+    });
+
+  const categories = useMemo(() => recap.categories ?? [], [recap.categories]);
+  const tracks = useMemo(() => recap.tracks ?? [], [recap.tracks]);
+  const fps = recap.fps || 12;
+
+  useEffect(() => {
+    const next: Record<string, boolean> = {};
+    (recap.categories ?? []).forEach((category) => {
+      next[category.key] = true;
+    });
+    (recap.tracks ?? []).forEach((track) => {
+      if (next[track.cat] === undefined) {
+        next[track.cat] = true;
+      }
+    });
+    setEnabled(next);
+  }, [recap]);
+
+  const measure = useCallback(() => {
+    const video = videoRef.current;
+    const frame = frameRef.current;
+    if (!video || !frame) {
+      return;
+    }
+    const bounds = frame.getBoundingClientRect();
+    const videoWidth = video.videoWidth || recap.width || 16;
+    const videoHeight = video.videoHeight || recap.height || 9;
+    const scale = Math.min(
+      bounds.width / videoWidth,
+      bounds.height / videoHeight,
+    );
+    const width = videoWidth * scale;
+    const height = videoHeight * scale;
+    setContent({
+      x: (bounds.width - width) / 2,
+      y: (bounds.height - height) / 2,
+      w: width,
+      h: height,
+    });
+  }, [recap.height, recap.width]);
+
+  // defaultPlaybackRate carries the speed across a new src load; the video element is replaced when the recap changes.
+  const applyRate = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    video.defaultPlaybackRate = rate;
+    video.playbackRate = rate;
+  }, [rate]);
+
+  useEffect(() => {
+    applyRate();
+    try {
+      window.localStorage.setItem(PLAYBACK_RATE_KEY, String(rate));
+    } catch {
+      // private browsing: the speed still applies, it just isn't remembered
+    }
+  }, [applyRate, rate, recap.id, version]);
+
+  useEffect(() => {
+    measure();
+    const frame = frameRef.current;
+    if (!frame) {
+      return;
+    }
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(frame);
+    return () => observer.disconnect();
+  }, [measure, recap.id]);
+
+  const colorFor = useCallback(
+    (key: string) =>
+      categories.find((category) => category.key === key)?.color ||
+      FALLBACK_COLORS[key] ||
+      "#ffffff",
+    [categories],
+  );
+
+  const visibleTracks = useMemo(
+    () => tracks.filter((track) => enabled[track.cat] !== false),
+    [enabled, tracks],
+  );
+
+  const activeTracks = useMemo(() => {
+    return visibleTracks.filter((track) => {
+      const start = track.out_start / fps;
+      const end = (track.out_start + Math.max(track.length, 1)) / fps;
+      return current >= start && current < end;
+    });
+  }, [current, fps, visibleTracks]);
+
+  const pauseAt = (track: RecapTrack) => {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    video.pause();
+    video.currentTime = track.out_start / fps;
+    setCurrent(track.out_start / fps);
+  };
+
+  const openClip = async (track: RecapTrack) => {
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+    }
+    const eventId = track.clip_event_id || track.event_id;
+    try {
+      const response = await axios.get<RecapClipSource>(
+        `recap/event/${encodeURIComponent(eventId)}`,
+      );
+      const data = response.data;
+      if (!data.clip && !data.snapshot) {
+        toast.error(data.message || t("clipMissing"), {
+          position: "top-center",
+        });
+        return;
+      }
+      const hls = isHls(data.clip);
+      setOpen({
+        track,
+        clip: mediaUrl(data.clip),
+        download: mediaUrl(data.download || (hls ? undefined : data.clip)),
+        hls,
+        snapshot: mediaUrl(data.snapshot),
+        source: data.source,
+        message: data.message,
+      });
+    } catch {
+      toast.error(t("clipMissing"), { position: "top-center" });
+    }
+  };
+
+  const openHistory = () => {
+    if (!open) {
+      return;
+    }
+    navigate("/review", {
+      state: {
+        severity: "detection",
+        recording: {
+          camera: recap.camera,
+          startTime: open.track.start_time,
+          severity: "detection",
+        },
+      },
+    });
+  };
+
+  const clipIndex = open
+    ? visibleTracks.findIndex((track) => track.event_id === open.track.event_id)
+    : -1;
+
+  const stepClip = (delta: number) => {
+    if (clipIndex < 0) {
+      return;
+    }
+    const next = visibleTracks[clipIndex + delta];
+    if (next) {
+      openClip(next);
+    }
+  };
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3 xl:flex-row">
+      <div className="flex min-w-0 flex-1 flex-col gap-2">
+        {header}
+        <div className="flex flex-wrap items-center gap-3">
+          {categories.map((category) => (
+            <label
+              key={category.key}
+              className="flex items-center gap-2 text-sm"
+            >
+              <Checkbox
+                checked={enabled[category.key] !== false}
+                onCheckedChange={(checked) =>
+                  setEnabled((currentEnabled) => ({
+                    ...currentEnabled,
+                    [category.key]: Boolean(checked),
+                  }))
+                }
+              />
+              <span
+                className="inline-block size-2.5 rounded-full"
+                style={{ backgroundColor: category.color }}
+              />
+              {category.name}
+              <span className="text-muted-foreground">{category.count}</span>
+            </label>
+          ))}
+          <div className="ml-auto flex items-center gap-2">
+            <div
+              role="group"
+              aria-label={t("playbackSpeed")}
+              className="flex items-center gap-1"
+            >
+              {PLAYBACK_RATES.map((value) => (
+                <Button
+                  key={value}
+                  size="sm"
+                  variant={rate === value ? "select" : "outline"}
+                  className="h-8 px-2"
+                  aria-pressed={rate === value}
+                  onClick={() => setRate(value)}
+                >
+                  {`${value}x`}
+                </Button>
+              ))}
+            </div>
+            <DownloadButton
+              className="h-8"
+              state={downloads.stateOf(fileKey)}
+              label={t("downloadRecap")}
+              onClick={saveRecap}
+            />
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground">{t("clickHint")}</p>
+        <div
+          ref={frameRef}
+          className="relative aspect-video max-h-[46vh] w-full overflow-hidden rounded-lg bg-black lg:max-h-[62vh]"
+        >
+          <video
+            ref={videoRef}
+            key={`${recap.id}-${version ?? 0}`}
+            className="size-full object-contain"
+            src={`${baseUrl}api/recap/${recap.id}/video.mp4${version ? `?v=${version}` : ""}`}
+            controls
+            playsInline
+            autoPlay={autoPlay}
+            muted={autoPlay}
+            onEnded={() => onEnded?.()}
+            onLoadedMetadata={(event) => {
+              measure();
+              applyRate();
+              setCurrent(event.currentTarget.currentTime);
+            }}
+            onTimeUpdate={(event) =>
+              setCurrent(event.currentTarget.currentTime)
+            }
+            onPause={(event) => setCurrent(event.currentTarget.currentTime)}
+            onSeeked={(event) => setCurrent(event.currentTarget.currentTime)}
+          />
+          <div className="pointer-events-none absolute inset-0">
+            {content.w > 0 &&
+              activeTracks.map((track) => {
+                const [x0, y0, x1, y1] = track.label_box;
+                const boxWidth = Math.max(44, (x1 - x0) * content.w);
+                const boxHeight = Math.max(44, (y1 - y0) * content.h);
+                return (
+                  <button
+                    key={track.event_id}
+                    type="button"
+                    aria-label={track.text}
+                    className="pointer-events-auto absolute touch-manipulation bg-transparent"
+                    style={{
+                      left: content.x + ((x0 + x1) / 2) * content.w,
+                      top: content.y + ((y0 + y1) / 2) * content.h,
+                      width: boxWidth,
+                      height: boxHeight,
+                      transform: "translate(-50%, -50%)",
+                    }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openClip(track);
+                    }}
+                  >
+                    <span className="sr-only">{track.text}</span>
+                  </button>
+                );
+              })}
+          </div>
+        </div>
+      </div>
+      <div className="flex max-h-[40vh] w-full flex-col gap-1 overflow-y-auto xl:max-h-none xl:w-64">
+        <div className="text-sm font-medium">{t("eventList")}</div>
+        {visibleTracks.length === 0 && (
+          <p className="text-sm text-muted-foreground">{t("noEvents")}</p>
+        )}
+        {visibleTracks.map((track) => {
+          const start = track.out_start / fps;
+          const end = (track.out_start + Math.max(track.length, 1)) / fps;
+          const active = current >= start && current < end;
+          return (
+            <button
+              key={track.event_id}
+              type="button"
+              className={`rounded-md px-2 py-1 text-left text-sm ${active ? "bg-secondary" : "hover:bg-secondary/60"}`}
+              onClick={() => {
+                pauseAt(track);
+                openClip(track);
+              }}
+            >
+              <span style={{ color: colorFor(track.cat) }}>{track.text}</span>
+            </button>
+          );
+        })}
+      </div>
+      <Dialog
+        open={open !== undefined}
+        onOpenChange={(isOpen) => {
+          if (!isOpen) {
+            setOpen(undefined);
+          }
+        }}
+      >
+        <DialogContent className="max-h-[95dvh] sm:max-w-xl md:max-w-4xl">
+          <DialogTitle>{open?.track.text}</DialogTitle>
+          {open?.source === "archive" && (
+            <p className="text-sm text-muted-foreground">
+              {open.message || t("fromArchive")}
+            </p>
+          )}
+          {open?.clip ? (
+            <RecapClipVideo
+              key={open.clip}
+              src={open.clip}
+              hls={Boolean(open.hls)}
+            />
+          ) : (
+            open?.snapshot && (
+              <img
+                src={open.snapshot}
+                alt={open.track.text}
+                className="max-h-[70dvh] w-full rounded-lg object-contain"
+              />
+            )
+          )}
+          {!open?.clip && open?.snapshot && (
+            <p className="text-sm text-muted-foreground">{t("snapshotOnly")}</p>
+          )}
+          <div className="flex flex-wrap gap-2">
+            {open?.download && (
+              <DownloadButton
+                state={downloads.stateOf(open.download)}
+                label={t("download")}
+                onClick={() =>
+                  open.download &&
+                  downloads.download({
+                    key: open.download,
+                    url: open.download,
+                    name: safeFileName(
+                      `${cameraName} ${open.track.label} ${open.track.text}`,
+                    ),
+                  })
+                }
+              />
+            )}
+            <Button
+              variant="outline"
+              disabled={clipIndex <= 0}
+              onClick={() => stepClip(-1)}
+            >
+              {t("previous")}
+            </Button>
+            <Button
+              variant="outline"
+              disabled={clipIndex < 0 || clipIndex >= visibleTracks.length - 1}
+              onClick={() => stepClip(1)}
+            >
+              {t("next")}
+            </Button>
+            <Button variant="outline" onClick={openHistory}>
+              {t("openHistory")}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

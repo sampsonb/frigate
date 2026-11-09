@@ -16,3 +16,4 @@ class Tags(Enum):
     preview = "Preview"
     recordings = "Recordings"
     review = "Review"
+    recap = "Recap"
