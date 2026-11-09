@@ -29,7 +29,10 @@ fi
 
 BACKUP_DIR=$1
 shift || true
-source /root/frigate-recap-deploy/common.sh
+source /root/frigate-recap-deploy/common.sh || {
+  echo "ABORT: cannot read /root/frigate-recap-deploy/common.sh" >&2
+  exit 1
+}
 
 if docker image inspect frigate:recap-0.18.2 >/dev/null 2>&1; then
   DEFAULT_IMAGE=frigate:recap-0.18.2
@@ -120,6 +123,13 @@ restore_db() {
   else
     log "WARNING: no database copy in $SNAP"
   fi
+  # 0.18 copies the database beside itself before migrations 033-035.
+  # Keep that file with the snapshot so it does not stay on the container disk.
+  pre_migrate="${DB%/*}/backup.db"
+  if [[ -f "$pre_migrate" ]]; then
+    mv -f "$pre_migrate" "$SNAP/backup.db.from-018-boot"
+    log "moved 0.18 pre-migration backup.db into $SNAP"
+  fi
 }
 
 rollback() {
@@ -136,10 +146,10 @@ rollback() {
     log "ROLLBACK FAILED: could not start $LIVE_TAG. Config and database were restored. Image line: $(grep -E '^[[:space:]]+image:' "$COMPOSE" || true)"
     exit 1
   fi
-  if wait_api 300 >/dev/null; then
-    log "rolled back, API up ($(curl -fs --max-time 3 "$API/api/version" || true))"
+  if rolled=$(wait_api 300) && [[ "$rolled" == *0.17.2* ]]; then
+    log "rolled back, API up ($rolled)"
   else
-    log "ROLLBACK FAILED: $LIVE_TAG was started but the API did not answer. Config and database were restored."
+    log "ROLLBACK FAILED: API answered '${rolled:-nothing}', expected $LIVE_TAG. Config and database were restored. Image line: $(grep -E '^[[:space:]]+image:' "$COMPOSE" || true)"
     exit 1
   fi
 }
@@ -161,6 +171,19 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+live_lines=$(grep -cE "^[[:space:]]*image:[[:space:]]*[\"']?${LIVE_TAG}[\"']?[[:space:]]*$" "$COMPOSE" || true)
+if [[ "$live_lines" != "1" ]]; then
+  log "ABORT: compose does not have exactly one image line for $LIVE_TAG (found ${live_lines:-0}). Nothing was stopped."
+  log "If an earlier run already left 0.18 in place, restore that run's snapshot by hand. This run will not snapshot the upgraded files and call it a rollback."
+  exit 1
+fi
+if [[ -f "$DB" ]]; then
+  migrated=$(sqlite3 "$DB" "SELECT name FROM migratehistory WHERE name GLOB '03[345]_*' ORDER BY name LIMIT 1;" 2>/dev/null || true)
+  if [[ -n "$migrated" ]]; then
+    log "ABORT: database already has 0.18 migration $migrated. Nothing was stopped."
+    exit 1
+  fi
+fi
 log "stopping frigate so the snapshot matches the database 0.17 leaves behind"
 if ! compose stop frigate; then
   log "ABORT: could not stop frigate. The image line was not changed."
@@ -232,6 +255,10 @@ if changed != 1:
     )
 Path(path).write_text("".join(out))
 PY
+if [[ $? -ne 0 ]]; then
+  log "ABORT: compose was not retagged. The image line was left unchanged."
+  exit 1
+fi
 log "compose image -> $(grep -E '^[[:space:]]+image:' "$COMPOSE" | tr '\n' ' ')"
 SWAPPED=1
 compose config -q || { log "ABORT: compose invalid"; cp -a "$SNAP/docker-compose.yml" "$COMPOSE"; SWAPPED=0; exit 1; }
