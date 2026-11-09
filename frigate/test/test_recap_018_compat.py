@@ -20,7 +20,7 @@ from unittest.mock import patch
 from frigate.config import FrigateConfig
 from frigate.recap import cutcache
 from frigate.recap.manager import RecapMaintainer, RecapManager
-from frigate.recap.storage import list_visible_recaps
+from frigate.recap.storage import list_visible_recaps, purge_expired, safe_id
 from frigate.util.config import migrate_frigate_config
 
 # Live sections from the 2026-11-09 install, plus the prepared snippet's
@@ -291,6 +291,38 @@ class TestExistingRecapFiles(unittest.TestCase):
             interval = json.loads((root / ".interval.json").read_text())
             self.assertTrue(schedule["front:2026-11-09:01:37"])
             self.assertIn("aqara:2026-11-09-09:00", interval)
+
+    def test_retention_cannot_walk_out_of_the_recap_directory(self) -> None:
+        self.assertFalse(safe_id(".."))
+        self.assertFalse(safe_id("."))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            recording = (
+                root / "recordings" / "2026-11-09" / "12" / "front" / "00.00.mp4"
+            )
+            recording.parent.mkdir(parents=True)
+            recording.write_bytes(b"recording-bytes")
+            # Stored under a normal folder. The manifest names a parent path.
+            _write_manifest(
+                root / "recap",
+                "front",
+                "evil",
+                id="recordings",
+                created=1,
+            )
+            manifest = json.loads(
+                (root / "recap" / "front" / "evil" / "manifest.json").read_text()
+            )
+            manifest["camera"] = ".."
+            manifest["id"] = "recordings"
+            (root / "recap" / "front" / "evil" / "manifest.json").write_text(
+                json.dumps(manifest)
+            )
+            with patch("frigate.recap.storage.RECAP_DIR", str(root / "recap")):
+                removed = purge_expired({"..": 14, "front": 14}, now=10**12)
+            self.assertEqual(removed, 0)
+            self.assertTrue(recording.is_file())
+            self.assertEqual(recording.read_bytes(), b"recording-bytes")
 
 
 class TestRecapFollowsConfigHolder(unittest.TestCase):
